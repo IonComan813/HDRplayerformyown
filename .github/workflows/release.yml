@@ -69,6 +69,46 @@ jobs:
           if (-not (Test-Path publish/libmpv-2.dll)) { throw "压缩包里没有 libmpv-2.dll" }
           "$($archive.Name)" | Out-File -Encoding utf8 publish/libmpv-version.txt
 
+      # ---- 自动同步字幕：ffsubsync（https://github.com/smacke/ffsubsync）+ ffmpeg，放在 publish/tools 下 ----
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 打包 ffsubsync（PyInstaller）
+        shell: pwsh
+        # 固定版本，避免上游更新改了命令行参数或日志格式（程序会解析 offset / framerate 两行日志）
+        run: |
+          python -m pip install --disable-pip-version-check "ffsubsync==0.5.1" "pyinstaller>=6.10"
+          if ($LASTEXITCODE -ne 0) { throw "pip install 失败" }
+          pyinstaller --noconfirm --log-level WARN --onedir --console --name ffsubsync `
+            --collect-all ffsubsync --collect-all webrtcvad --copy-metadata ffsubsync `
+            --distpath build-ffs/dist --workpath build-ffs/work --specpath build-ffs installer/ffsubsync_entry.py
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller 失败" }
+          New-Item -ItemType Directory -Force publish/tools | Out-Null
+          Copy-Item -Recurse build-ffs/dist/ffsubsync publish/tools/ffsubsync
+          & publish/tools/ffsubsync/ffsubsync.exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "ffsubsync.exe 无法运行" }
+
+      - name: 下载 ffmpeg（BtbN/FFmpeg-Builds 最新稳定分支，LGPL 动态库版）
+        shell: pwsh
+        # ffsubsync 用 ffmpeg 解出音轨、用 ffprobe 读流信息；只需要解码器，LGPL 版就够了
+        run: |
+          $names = gh release view latest --repo BtbN/FFmpeg-Builds --json assets -q ".assets[].name"
+          $zip = $names | Where-Object { $_ -match '^ffmpeg-n(\d+)\.(\d+)-latest-win64-lgpl-shared-[\d.]+\.zip$' } |
+            Sort-Object { $m = [regex]::Match($_, '^ffmpeg-n(\d+)\.(\d+)'); [int]$m.Groups[1].Value * 1000 + [int]$m.Groups[2].Value } |
+            Select-Object -Last 1
+          if (-not $zip) { throw "没有找到 ffmpeg 压缩包" }
+          Write-Host "ffmpeg: $zip"
+          gh release download latest --repo BtbN/FFmpeg-Builds --pattern $zip --dir ffmpeg-dl
+          Expand-Archive "ffmpeg-dl/$zip" -DestinationPath ffmpeg-dl/x -Force
+          $bin = Get-ChildItem ffmpeg-dl/x -Recurse -Directory -Filter bin | Select-Object -First 1
+          New-Item -ItemType Directory -Force publish/tools/ffmpeg | Out-Null
+          Copy-Item "$($bin.FullName)/ffmpeg.exe", "$($bin.FullName)/ffprobe.exe" publish/tools/ffmpeg/
+          Copy-Item "$($bin.FullName)/*.dll" publish/tools/ffmpeg/
+          & publish/tools/ffmpeg/ffprobe.exe -version | Select-Object -First 1
+          if ($LASTEXITCODE -ne 0) { throw "ffprobe 无法运行" }
+          "$zip" | Out-File -Encoding utf8 publish/tools/ffmpeg/version.txt
+
       - name: 打包
         id: pack
         shell: pwsh

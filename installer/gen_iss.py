@@ -57,9 +57,11 @@ s=s[:i]+reg+'\n'+s[j:]
 
 run='''[Run]
 Filename: "{app}\\{#AppExe}"; Description: "启动 HdrPlayer"; Flags: nowait postinstall skipifsilent
-; 勾选了后缀时默认打开 Windows“默认应用”里 HdrPlayer 的页面，点顶部的“设为默认值”完成绑定
-; （Windows 11 直接跳到该页面；Windows 10 打开默认应用总页面，选“按应用设置默认值”→ HdrPlayer）
-Filename: "ms-settings:defaultapps?registeredAppUser={#AppName}"; Description: "打开 Windows“默认应用”设置，点“设为默认值”完成文件关联"; Flags: shellexec nowait postinstall skipifsilent; Check: AnyAssocSelected
+; 一键设为默认：以管理员身份运行 HdrPlayer 写 Windows 的“默认关联配置文件”策略（微软给企业管理员的正规机制，
+; 由 Windows 在每次登录时应用；注销重新登录后生效）。详见 DefaultApps.cs
+Filename: "{app}\\{#AppExe}"; Parameters: "--apply-default-assoc ""{code:SelectedExts}"""; Description: "一键设为勾选后缀的默认播放器（需要管理员权限，注销重新登录后生效）"; Verb: "runas"; Flags: shellexec waituntilterminated postinstall skipifsilent; Check: AnyAssocSelected
+; 手动方式：打开 Windows“默认应用”里 HdrPlayer 的页面（Windows 10 打开默认应用总页面）
+Filename: "ms-settings:defaultapps?registeredAppUser={#AppName}"; Description: "打开 Windows“默认应用”设置（手动设置）"; Flags: shellexec nowait postinstall skipifsilent unchecked; Check: AnyAssocSelected
 
 '''
 i,j=section('Run'); s=s[:i]+run+s[j:]
@@ -97,19 +99,52 @@ begin
   end;
 end;
 
+// 勾选的后缀，逗号分隔（给 --apply-default-assoc）
+function SelectedExts(Param: String): String;
+var
+  Rest, Ext: String;
+  P: Integer;
+begin
+  Result := '';
+  Rest := AssocExts + ' ';
+  while Length(Rest) > 0 do
+  begin
+    P := Pos(' ', Rest);
+    Ext := Copy(Rest, 1, P - 1);
+    Delete(Rest, 1, P);
+    if (Ext <> '') and WizardIsTaskSelected('assoc\\x' + Ext) then
+    begin
+      if Result <> '' then Result := Result + ',';
+      Result := Result + '.' + Ext;
+    end;
+  end;
+end;
+
 procedure CurPageChanged(CurPageID: Integer);
 begin
   if (CurPageID = wpFinished) and AnyAssocSelected then
   begin
     WizardForm.FinishedLabel.Caption :=
       'HdrPlayer 已安装。' + #13#10 + #13#10 +
-      'Windows 不允许安装程序直接修改默认程序，还差最后一步：点“完成”后会打开 HdrPlayer 的“默认应用”页面，' +
-      '点页面顶部的“设为默认值”，刚才勾选的视频后缀就都会用 HdrPlayer 打开。' + #13#10 + #13#10 +
-      'Windows 10 上请在打开的页面选“按应用设置默认值”→ HdrPlayer → 管理。';
+      '勾选下面的“一键设为默认播放器”并点“完成”，确认管理员权限后，注销并重新登录（或重启），' +
+      '刚才勾选的视频后缀就都会用 HdrPlayer 打开。之后可在 设置 → 操作 里取消。' + #13#10 + #13#10 +
+      '（Windows 家庭版官方不支持这种方式，可改用“打开 Windows 默认应用设置”手动设置。）';
     // 文字变长了：让标签按内容增高，并把下面的勾选列表往下挪，免得被挡住
     WizardForm.FinishedLabel.AdjustHeight;
     WizardForm.RunList.Top := WizardForm.FinishedLabel.Top + WizardForm.FinishedLabel.Height + ScaleY(12);
   end;
+end;
+
+// 卸载时撤销“默认关联配置文件”策略（只在它指向 HdrPlayer 写的文件时；需要管理员权限，会弹 UAC）
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Cur: String;
+  ErrCode: Integer;
+begin
+  if (CurUninstallStep = usUninstall) and
+     RegQueryStringValue(HKLM, 'SOFTWARE\\Policies\\Microsoft\\Windows\\System', 'DefaultAssociationsConfiguration', Cur) and
+     (CompareText(Cur, ExpandConstant('{commonappdata}\\HdrPlayer\\DefaultAssociations.xml')) = 0) then
+    ShellExec('runas', ExpandConstant('{app}\\{#AppExe}'), '--remove-default-assoc', '', SW_HIDE, ewWaitUntilTerminated, ErrCode);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

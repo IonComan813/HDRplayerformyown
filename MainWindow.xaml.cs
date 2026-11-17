@@ -48,8 +48,9 @@ public partial class MainWindow : FluentWindow
         ("Ctrl+o", "open"), (".", "frame-step"), (",", "frame-back"), ("F5", "reload"), ("HOME", "restart"),
     };
 
-    /// <summary>双击判定时间，和 mpv 的 input-doubleclick-time 保持一致。单击画面要等这么久确认不是双击才暂停。</summary>
-    private const int DoubleClickMs = 300;
+    /// <summary>双击判定时间：跟随系统设置（画面的双击由 Windows 判定），mpv 的 input-doubleclick-time 也设成一样。
+    /// 单击画面要等这么久确认不是双击才暂停。</summary>
+    private static readonly int DoubleClickMs = (int)Math.Clamp(Native.GetDoubleClickTime(), 200u, 900u);
 
     /// <summary>鼠标静止多久后隐藏悬浮控制栏（mpv 的鼠标指针也同时隐藏）。</summary>
     private const int BarHideMs = 2000;
@@ -61,6 +62,8 @@ public partial class MainWindow : FluentWindow
     private readonly string[] _startupFiles;
     private readonly ControlBar _bar;
     private readonly Thumbnailer _thumbs = new();
+    private readonly SubSync _subSync = new();
+    private DispatcherTimer? _subSyncOsd;
     private readonly DispatcherTimer _uiTimer;
     private InfoWindow? _infoWindow;
     private IntPtr _hwnd;
@@ -144,6 +147,13 @@ public partial class MainWindow : FluentWindow
         _bar.SizeChanged += (_, _) => PositionBar();
         _bar.MouseRightButtonUp += (_, e) => { ShowContextMenu(); e.Handled = true; };
 
+        // ---- 画面上的鼠标 ----（mpv 嵌入时自己的窗口被禁用，收不到鼠标，见 VideoHost 的说明）
+        Video.LeftClick += OnVideoClick;
+        Video.LeftDoubleClick += () => DoAction("dblclick");
+        Video.RightClick += ShowContextMenu;
+        Video.MiddleClick += () => { if (!_idle) DoAction("pause"); };
+        Video.Wheel += delta => DoAction(delta > 0 ? "vol-up" : "vol-down");
+
         // ---- 播放列表 ----
         BtnPlAdd.Click += (_, _) => OpenFiles();
         BtnPlRemove.Click += (_, _) => RemoveSelected();
@@ -159,7 +169,7 @@ public partial class MainWindow : FluentWindow
                 PlaySelected();
         };
 
-        // 画面上的拖放由 mpv 自己处理；播放列表、标题栏和控制栏上的拖放由这里处理
+        // 拖放都由这里处理（画面上也是：mpv 嵌入时窗口被禁用，系统把拖放交给上层的 WPF 窗口）
         DragOver += OnFileDragOver;
         Drop += OnFileDrop;
         PreviewKeyDown += OnPreviewKeyDown;
@@ -820,6 +830,7 @@ public partial class MainWindow : FluentWindow
             case "sub-delay-reset": m.SetProperty("sub-delay", 0.0); m.ShowText("字幕延迟：0 ms"); break;
             case "reveal": RevealFile(m.GetString("path")); break;
             case "load-sub": LoadSubtitle(); break;
+            case "sub-sync": StartSubSync(); break;
             case "load-audio": LoadAudioTrack(); break;
             case "settings": OpenSettings(); break;
             case "quit": Close(); break;
@@ -1024,6 +1035,137 @@ public partial class MainWindow : FluentWindow
     }
 
     // =====================================================================
+    //  自动同步字幕（ffsubsync）
+    // =====================================================================
+
+    private static readonly HashSet<string> TextSubCodecs = new(StringComparer.OrdinalIgnoreCase)
+        { "subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text" };
+    private static readonly HashSet<string> SyncableSubExts = new(StringComparer.OrdinalIgnoreCase)
+        { ".srt", ".ass", ".ssa", ".vtt", ".sub" };
+
+    /// <summary>
+    /// 用 ffsubsync 把当前字幕对齐到当前音轨的人声，生成“原名.synced.后缀”并切换过去（再选一次菜单项取消）。
+    /// 当前字幕是外挂文件就同步那个文件；是内嵌文字字幕就先提取出来；没有选字幕就让用户选一个文件。
+    /// </summary>
+    private async void StartSubSync()
+    {
+        var m = _mpv;
+        if (m == null || _idle) return;
+        if (_subSync.Running) { _subSync.Cancel(); return; }
+        if (SubSync.FindExe() == null)
+        {
+            await Dialogs.ShowAsync(this, "自动同步字幕",
+                "没有找到 ffsubsync。\n\n发布版（安装版 / 便携版）自带，在程序目录的 tools\\ffsubsync 里。" +
+                "自己编译的话可以 pip install ffsubsync，并把 ffmpeg / ffprobe 放进 PATH。");
+            return;
+        }
+        string? video = m.GetString("path");
+        if (video == null || !File.Exists(video)) { m.ShowText("只能同步本地文件的字幕"); return; }
+
+        var tracks = (m.GetNode("track-list") as List<object?>)?.OfType<Dictionary<string, object?>>().ToList() ?? new();
+        static string Str(Dictionary<string, object?> t, string k) => t.GetValueOrDefault(k) as string ?? "";
+        static long Id(Dictionary<string, object?> t) => t.GetValueOrDefault("id") is long l ? l : 0;
+        static bool Is(Dictionary<string, object?> t, string k) => t.GetValueOrDefault(k) is true;
+        // mpv 的内嵌轨按流的顺序编号，所以“同类内嵌轨里排第几”就是 ffmpeg 的 0:a:N / 0:s:N
+        int RelIndex(Dictionary<string, object?> t) =>
+            tracks.Count(o => Str(o, "type") == Str(t, "type") && !Is(o, "external") && Id(o) < Id(t));
+
+        // 参照音轨：当前选中的（外挂音轨就用那个音频文件）
+        var audio = tracks.FirstOrDefault(t => Str(t, "type") == "audio" && Is(t, "selected"));
+        if (audio == null) { m.ShowText("当前没有音轨，无法按人声同步字幕", 3000); return; }
+        string reference = video, audioStream;
+        if (Is(audio, "external") && File.Exists(Str(audio, "external-filename")))
+            (reference, audioStream) = (Str(audio, "external-filename"), "0:a:0");
+        else
+            audioStream = $"0:a:{RelIndex(audio)}";
+
+        // 要同步的字幕
+        var sub = tracks.FirstOrDefault(t => Str(t, "type") == "sub" && Is(t, "selected"));
+        string? subFile = null, embedded = null, lang = sub == null ? null : Str(sub, "lang");
+        string ext;
+        if (sub == null)
+        {
+            var picked = PickFiles(SubFilter, "选择要同步的字幕", false);
+            if (picked.Length == 0) return;
+            subFile = picked[0];
+            ext = Path.GetExtension(subFile);
+        }
+        else if (Is(sub, "external"))
+        {
+            subFile = Str(sub, "external-filename");
+            if (!File.Exists(subFile)) { m.ShowText("当前字幕不是本地文件，无法同步", 3000); return; }
+            ext = Path.GetExtension(subFile);
+        }
+        else
+        {
+            string codec = Str(sub, "codec");
+            if (!TextSubCodecs.Contains(codec)) { m.ShowText($"当前是图形字幕（{codec}），只能同步文字字幕", 3000); return; }
+            embedded = $"0:s:{RelIndex(sub)}";
+            ext = codec is "ass" or "ssa" ? ".ass" : ".srt";
+        }
+        if (!SyncableSubExts.Contains(ext)) { m.ShowText($"不支持同步 {ext} 字幕（支持 srt / ass / ssa / vtt）", 3000); return; }
+
+        // 输出：字幕旁边的“原名.synced.后缀”（内嵌字幕放在视频旁边）；目录不可写时放到 %LOCALAPPDATA%\HdrPlayer\synced
+        string baseName = subFile != null
+            ? Path.GetFileNameWithoutExtension(subFile)
+            : Path.GetFileNameWithoutExtension(video) + (string.IsNullOrEmpty(lang) ? "" : "." + lang);
+        if (baseName.EndsWith(".synced", StringComparison.OrdinalIgnoreCase)) baseName = baseName[..^".synced".Length];
+        string dir = Path.GetDirectoryName(subFile ?? video) ?? "";
+        if (!DirectoryWritable(dir))
+        {
+            dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HdrPlayer", "synced");
+            Directory.CreateDirectory(dir);
+        }
+        string output = Path.Combine(dir, baseName + ".synced" + ext.ToLowerInvariant());
+
+        string status = "正在同步字幕…";
+        var started = DateTime.UtcNow;
+        void ShowProgress() => m.ShowText($"{status}　{(DateTime.UtcNow - started).TotalSeconds:0} 秒\n（右键 → 字幕 → 取消自动同步）", 1500);
+        _subSyncOsd?.Stop();
+        _subSyncOsd = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        _subSyncOsd.Tick += (_, _) => ShowProgress();
+        _subSyncOsd.Start();
+        ShowProgress();
+
+        var res = await _subSync.RunAsync(video, reference, audioStream, subFile, embedded, output,
+            msg => Dispatcher.InvokeAsync(() => { status = msg; ShowProgress(); }));
+        _subSyncOsd.Stop();
+        if (_shuttingDown || _mpv == null) return;
+        if (!res.Ok) { m.ShowText(res.Message, 5000); return; }
+        if (m.GetString("path") != video)
+        {
+            m.ShowText("字幕已同步，保存为 " + Path.GetFileName(output), 4000);
+            return;
+        }
+
+        // 同名文件之前已经加载过（再次同步覆盖了它）：先移除旧的轨，避免出现两条一样的
+        if (m.GetNode("track-list") is List<object?> now)
+            foreach (var t in now.OfType<Dictionary<string, object?>>())
+                if (Str(t, "type") == "sub" && Is(t, "external") &&
+                    string.Equals(Str(t, "external-filename"), output, StringComparison.OrdinalIgnoreCase))
+                    m.Command("sub-remove", Id(t).ToString(Inv));
+        m.Command("sub-add", output, "select", "自动同步", lang ?? "");
+        // 偏移已经写进字幕文件，之前手动调的字幕延迟要清零，否则会叠加
+        m.SetProperty("sub-delay", 0.0);
+        string scale = Math.Abs(res.Scale - 1) > 0.0005 ? $"，帧率校正 ×{res.Scale.ToString("0.0000", Inv)}" : "";
+        m.ShowText($"字幕已同步：整体偏移 {res.Offset.ToString("+0.00;-0.00;0.00", Inv)} 秒{scale}\n已保存为 {Path.GetFileName(output)}", 5000);
+    }
+
+    private static bool DirectoryWritable(string dir)
+    {
+        try
+        {
+            string probe = Path.Combine(dir, $".hdrplayer-write-test-{Guid.NewGuid():N}");
+            using (File.Create(probe, 1, FileOptions.DeleteOnClose)) { }
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // =====================================================================
     //  右键菜单
     // =====================================================================
 
@@ -1070,6 +1212,10 @@ public partial class MainWindow : FluentWindow
                 (type == "audio" ? audio : subs).Add(entry);
             }
         }
+        subs.Add(Sep);
+        subs.Add(_subSync.Running
+            ? new MenuEntry("取消自动同步", Hp("sub-sync"))
+            : new MenuEntry("自动同步字幕（ffsubsync）…", Hp("sub-sync"), Enabled: path != null && File.Exists(path)));
         items.Add(new MenuEntry("音轨", Sub: audio, Enabled: audio.Count > 0));
         items.Add(new MenuEntry("字幕", Sub: subs, Enabled: playing));
 
@@ -1105,43 +1251,17 @@ public partial class MainWindow : FluentWindow
     }
 
     /// <summary>
-    /// 弹出右键菜单。优先用 mpv 自带的原生菜单（menu-data + context-menu，mpv 0.40+）：
-    /// 它在 mpv 自己的窗口线程里用系统菜单弹出，不存在 WPF 菜单从别的线程的窗口上弹出时抢不到鼠标 / 焦点、
-    /// 一弹出就关掉的问题（之前右键画面没有菜单就是这个原因）。libmpv 太旧时退回 WPF 菜单。
+    /// 弹出右键菜单（WPF 菜单，样式和播放列表的菜单一致）。
+    /// 画面上的右键由 VideoHost 在松开时直接通知（它和 WPF 同一个线程，菜单能正常拿到鼠标和焦点）。
+    /// 以前的两个版本都依赖 mpv 的 MBTN_RIGHT 绑定，但嵌入时 mpv 的窗口被禁用、根本收不到鼠标，
+    /// 所以无论 WPF 菜单还是 mpv 的原生菜单（它也挂在那个被禁用的窗口上）都弹不出来。
     /// </summary>
     private void ShowContextMenu()
     {
-        var m = _mpv;
-        if (m == null) return;
+        if (_mpv == null || _shuttingDown) return;
         var items = BuildContextMenu();
-        if (m.SetPropertyNode("menu-data", ToMpvMenu(items)) >= 0 && m.Command("context-menu") >= 0) return;
-        ShowWpfMenu(items);
-    }
-
-    private static List<object?> ToMpvMenu(List<MenuEntry> items) => items.Select(e =>
-    {
-        if (e.IsSeparator) return (object?)new Dictionary<string, object?> { ["type"] = "separator" };
-        // Win32 菜单里 & 是快捷键前缀，要写成 &&
-        var d = new Dictionary<string, object?> { ["title"] = e.Title.Replace("&", "&&") };
-        if (e.Sub != null) { d["type"] = "submenu"; d["submenu"] = ToMpvMenu(e.Sub); }
-        if (e.Cmd != null) d["cmd"] = e.Cmd;
-        if (e.Shortcut != null) d["shortcut"] = e.Shortcut;
-        var state = new List<object?>();
-        if (e.Checked) state.Add("checked");
-        if (!e.Enabled) state.Add("disabled");
-        if (state.Count > 0) d["state"] = state;
-        return d;
-    }).ToList();
-
-    /// <summary>旧版 libmpv 没有原生菜单时的后备：WPF 菜单，等右键松开后再弹（按住期间鼠标归 mpv 的窗口）。</summary>
-    private void ShowWpfMenu(List<MenuEntry> items)
-    {
-        var start = DateTime.UtcNow;
-        var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(15) };
-        t.Tick += (_, _) =>
+        void Open()
         {
-            if (Native.IsRightButtonDown() && (DateTime.UtcNow - start).TotalSeconds < 3) return;
-            t.Stop();
             if (_shuttingDown) return;
             var menu = new ContextMenu();
             foreach (var mi in ToWpfMenu(items)) menu.Items.Add(mi);
@@ -1150,7 +1270,18 @@ public partial class MainWindow : FluentWindow
             menu.Placement = PlacementMode.MousePoint;
             Activate();
             _menuOpen = true;
+            Video.HideCursor = false;
             menu.IsOpen = true;
+        }
+        if (!Native.IsRightButtonDown()) { Open(); return; }
+        // 保险：如果是从 mpv 的 MBTN_RIGHT 绑定来的（按下时就触发），等右键松开再弹，否则松开的那一下会把菜单关掉
+        var start = DateTime.UtcNow;
+        var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(15) };
+        t.Tick += (_, _) =>
+        {
+            if (Native.IsRightButtonDown() && (DateTime.UtcNow - start).TotalSeconds < 3) return;
+            t.Stop();
+            Open();
         };
         t.Start();
     }
@@ -1299,6 +1430,8 @@ public partial class MainWindow : FluentWindow
         {
             _bar.Conceal();
         }
+        // 控制栏淡出时画面上的鼠标指针也隐藏
+        Video.HideCursor = !keep;
     }
 
     private static string FormatTime(double sec)
@@ -1580,6 +1713,8 @@ public partial class MainWindow : FluentWindow
             SavePlaylistState();
 
             _uiTimer.Stop();
+            _subSyncOsd?.Stop();
+            _subSync.KillNow();
             _infoWindow?.Close();
             _bar.HideNow();
             Hide();
