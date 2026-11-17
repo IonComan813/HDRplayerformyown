@@ -1,0 +1,22 @@
+<Application
+    x:Class="HdrPlayer.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+    ShutdownMode="OnMainWindowClose">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ui:ThemesDictionary Theme="Dark" />
+                <ui:ControlsDictionary />
+            </ResourceDictionary.MergedDictionaries>
+
+            <!-- HDR 按钮“开”时的颜色 -->
+            <SolidColorBrush x:Key="HdrOnBrush" Color="#FFC400" />
+            <!-- 悬浮控制栏底色（半透明，压在视频上） -->
+            <SolidColorBrush x:Key="OverlayCardBrush" Color="#E61C1C1F" />
+            <SolidColorBrush x:Key="OverlayStrokeBrush" Color="#33FFFFFF" />
+            <FontFamily x:Key="MonoFont">Sarasa Mono SC, Cascadia Mono, Consolas, Microsoft YaHei UI</FontFamily>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

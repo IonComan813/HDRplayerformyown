@@ -1,3 +1,4 @@
+using System.IO;
 using System.Text.Json;
 
 namespace HdrPlayer;
@@ -6,7 +7,8 @@ namespace HdrPlayer;
 internal sealed class AppSettings
 {
     // ---- HDR ----
-    public bool HdrEnabled { get; set; } = true;
+    // HDR 输出的开 / 关不再保存：每次启动都跟随 Windows 当前的“使用 HDR”状态，启动时不会去改系统设置。
+    /// <summary>手动切换 HDR（H 键 / 按钮）时，同时切换 Windows 的“使用 HDR”。</summary>
     public bool AutoSwitchWindowsHdr { get; set; } = true;
     public bool RestoreWindowsHdrOnExit { get; set; } = true;
     /// <summary>0 = 自动读取显示器 EDID 上报的峰值亮度</summary>
