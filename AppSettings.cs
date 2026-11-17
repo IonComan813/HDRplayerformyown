@@ -1,0 +1,87 @@
+using System.Text.Json;
+
+namespace HdrPlayer;
+
+/// <summary>所有用户设置，保存在 %APPDATA%\HdrPlayer\settings.json。</summary>
+internal sealed class AppSettings
+{
+    // ---- HDR ----
+    public bool HdrEnabled { get; set; } = true;
+    public bool AutoSwitchWindowsHdr { get; set; } = true;
+    public bool RestoreWindowsHdrOnExit { get; set; } = true;
+    /// <summary>0 = 自动读取显示器 EDID 上报的峰值亮度</summary>
+    public int TargetPeakNits { get; set; } = 0;
+    public string ToneMapping { get; set; } = "auto";
+    public bool Hdr10PlusUseMetadata { get; set; } = true;
+    public string HdrComputePeak { get; set; } = "auto";
+    public string GamutMapping { get; set; } = "auto";
+
+    // ---- 解码 / 渲染 ----
+    public string Hwdec { get; set; } = "d3d11va";
+    public string GpuApi { get; set; } = "d3d11";
+    public string Scale { get; set; } = "ewa_lanczossharp";
+    public string Dscale { get; set; } = "mitchell";
+    public bool Deband { get; set; } = false;
+    public string VideoSync { get; set; } = "audio";
+    public bool Interpolation { get; set; } = false;
+    public bool ExactSeek { get; set; } = true;
+
+    // ---- 音频 ----
+    public string AudioDevice { get; set; } = "auto";
+    public bool DownmixToStereo { get; set; } = true;
+    public bool NormalizeDownmix { get; set; } = false;
+    public string AudioLanguages { get; set; } = "";
+    public double Volume { get; set; } = 100;
+
+    // ---- 字幕 ----
+    public string SubFont { get; set; } = "Microsoft YaHei";
+    public int SubFontSize { get; set; } = 44;
+    public string SubAuto { get; set; } = "fuzzy";
+    public string SubLanguages { get; set; } = "chi,zho,chs,zh,zh-Hans,eng,en";
+
+    // ---- 操作 ----
+    public double SeekStep { get; set; } = 5;
+    public double SeekStepLarge { get; set; } = 30;
+    public double VolumeStep { get; set; } = 5;
+    public int SubDelayStepMs { get; set; } = 100;
+    public bool DebugLog { get; set; } = false;
+
+    // ---- 窗口 ----
+    public int WinX { get; set; } = -1;
+    public int WinY { get; set; } = -1;
+    public int WinW { get; set; } = 1600;
+    public int WinH { get; set; } = 960;
+    public bool WinMaximized { get; set; } = false;
+    public bool PlaylistVisible { get; set; } = false;
+
+    public static string Dir =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "HdrPlayer");
+
+    private static string FilePath => Path.Combine(Dir, "settings.json");
+
+    private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = true };
+
+    public static AppSettings Load()
+    {
+        try
+        {
+            if (File.Exists(FilePath))
+                return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath)) ?? new AppSettings();
+        }
+        catch { /* 设置文件损坏时使用默认值 */ }
+        return new AppSettings();
+    }
+
+    public void Save()
+    {
+        try
+        {
+            Directory.CreateDirectory(Dir);
+            File.WriteAllText(FilePath, JsonSerializer.Serialize(this, JsonOpts));
+        }
+        catch { }
+    }
+
+    public AppSettings Clone() =>
+        JsonSerializer.Deserialize<AppSettings>(JsonSerializer.Serialize(this))!;
+}
