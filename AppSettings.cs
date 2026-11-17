@@ -52,6 +52,8 @@ internal sealed class AppSettings
     public double SeekStepLarge { get; set; } = 30;
     public double VolumeStep { get; set; } = 5;
     public int SubDelayStepMs { get; set; } = 100;
+    /// <summary>鼠标悬停在进度条上时显示该位置的缩略图。</summary>
+    public bool SeekThumbnails { get; set; } = true;
     public bool DebugLog { get; set; } = false;
 
     // ---- 窗口 ----

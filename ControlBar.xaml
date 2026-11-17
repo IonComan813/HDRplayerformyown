@@ -31,8 +31,8 @@
         </Style>
     </Window.Resources>
 
-    <!-- 上方留出透明区域放进度条的悬停时间提示；透明像素不接收鼠标，点击会落到下面的视频上 -->
-    <Grid x:Name="Root" Margin="16,34,16,16" Opacity="0">
+    <!-- 四周的透明边距不接收鼠标，点击会落到下面的视频上 -->
+    <Grid x:Name="Root" Margin="16,8,16,16" Opacity="0">
         <Border
             Background="{StaticResource OverlayCardBrush}"
             BorderBrush="{StaticResource OverlayStrokeBrush}"
@@ -69,20 +69,41 @@
                             IsMoveToPointEnabled="True"
                             Maximum="1"
                             Minimum="0" />
-                        <!-- 悬停时间提示 -->
-                        <Canvas IsHitTestVisible="False" ClipToBounds="False">
+                        <!-- 悬停预览：缩略图 + 时间。用 Popup 而不是画在控制栏里，控制栏窗口就不用为它留出一大块透明区域 -->
+                        <Popup
+                            x:Name="SeekPopup"
+                            AllowsTransparency="True"
+                            Focusable="False"
+                            IsHitTestVisible="False"
+                            Placement="Relative"
+                            PlacementTarget="{Binding ElementName=SeekSlider}"
+                            StaysOpen="True">
                             <Border
                                 x:Name="SeekTip"
-                                Canvas.Top="-30"
-                                Padding="8,3"
+                                Padding="4"
                                 Background="{DynamicResource SolidBackgroundFillColorQuarternaryBrush}"
                                 BorderBrush="{StaticResource OverlayStrokeBrush}"
                                 BorderThickness="1"
-                                CornerRadius="4"
-                                Visibility="Collapsed">
-                                <TextBlock x:Name="SeekTipText" FontFamily="Cascadia Mono, Consolas" FontSize="12" />
+                                CornerRadius="6">
+                                <StackPanel>
+                                    <Image
+                                        x:Name="SeekThumb"
+                                        MaxWidth="256"
+                                        MaxHeight="144"
+                                        Margin="0,0,0,3"
+                                        RenderOptions.BitmapScalingMode="HighQuality"
+                                        Stretch="Uniform"
+                                        Visibility="Collapsed" />
+                                    <TextBlock
+                                        x:Name="SeekTipText"
+                                        Margin="6,0,6,1"
+                                        HorizontalAlignment="Center"
+                                        FontFamily="Cascadia Mono, Consolas"
+                                        FontSize="12"
+                                        Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                                </StackPanel>
                             </Border>
-                        </Canvas>
+                        </Popup>
                     </Grid>
                     <TextBlock
                         x:Name="DurationText"

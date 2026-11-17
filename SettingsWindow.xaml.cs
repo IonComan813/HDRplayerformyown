@@ -203,6 +203,8 @@ public partial class SettingsWindow : FluentWindow
         AddNumber(p, "←/→ 跳转秒数", null, _s.SeekStep, 1, 600, 1, v => _s.SeekStep = v);
         AddNumber(p, "Shift+←/→ 跳转秒数", null, _s.SeekStepLarge, 1, 3600, 5, v => _s.SeekStepLarge = v);
         AddToggle(p, "精确跳转", "关闭则跳到关键帧，更快", _s.ExactSeek, v => _s.ExactSeek = v);
+        AddToggle(p, "进度条悬停预览缩略图", "后台另开一个不出画面的 mpv 实例截图；仅本地文件。HDR 片源的缩略图高光会被裁切",
+            _s.SeekThumbnails, v => _s.SeekThumbnails = v);
         AddNumber(p, "音量步进", null, _s.VolumeStep, 1, 50, 1, v => _s.VolumeStep = v);
         AddNumber(p, "字幕延迟步进 (ms)", null, _s.SubDelayStepMs, 10, 5000, 10, v => _s.SubDelayStepMs = (int)v);
         AddNote(p,

@@ -109,6 +109,16 @@ internal static class MpvNative
     public static extern int mpv_command(IntPtr ctx, IntPtr[] args);
 
     [DllImport(Lib, CallingConvention = CC)]
+    public static extern int mpv_command_ret(IntPtr ctx, IntPtr[] args, IntPtr result);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MpvByteArray
+    {
+        public IntPtr data;
+        public UIntPtr size;
+    }
+
+    [DllImport(Lib, CallingConvention = CC)]
     public static extern int mpv_command_string(IntPtr ctx, [MarshalAs(UnmanagedType.LPUTF8Str)] string args);
 
     [DllImport(Lib, CallingConvention = CC)]
@@ -265,6 +275,13 @@ internal sealed class Mpv : IDisposable
                 }
                 return map;
             }
+            case MpvFormat.ByteArray:
+            {
+                var ba = Marshal.PtrToStructure<MpvNative.MpvByteArray>(n.ptr);
+                var bytes = new byte[(int)ba.size];
+                if (bytes.Length > 0) Marshal.Copy(ba.data, bytes, 0, bytes.Length);
+                return bytes;
+            }
             default: return null;
         }
     }
@@ -283,6 +300,26 @@ internal sealed class Mpv : IDisposable
         finally
         {
             foreach (var p in ptrs) if (p != IntPtr.Zero) Marshal.FreeCoTaskMem(p);
+        }
+    }
+
+    /// <summary>带返回值的命令（如 screenshot-raw），结果转换方式同 <see cref="GetNode"/>。失败返回 null。</summary>
+    public object? CommandWithResult(params string[] args)
+    {
+        if (!IsAlive) return null;
+        var ptrs = new IntPtr[args.Length + 1];
+        IntPtr node = Marshal.AllocHGlobal(16);
+        try
+        {
+            for (int i = 0; i < args.Length; i++) ptrs[i] = Marshal.StringToCoTaskMemUTF8(args[i]);
+            if (MpvNative.mpv_command_ret(_ctx, ptrs, node) < 0) return null;
+            try { return NodeToObject(Marshal.PtrToStructure<MpvNative.MpvNode>(node)); }
+            finally { MpvNative.mpv_free_node_contents(node); }
+        }
+        finally
+        {
+            foreach (var p in ptrs) if (p != IntPtr.Zero) Marshal.FreeCoTaskMem(p);
+            Marshal.FreeHGlobal(node);
         }
     }
 
