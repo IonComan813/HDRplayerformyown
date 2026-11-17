@@ -5,16 +5,26 @@ using Wpf.Ui.Controls;
 
 namespace HdrPlayer;
 
-/// <summary>“视频参数”窗口：每秒刷新一次（HDR10+ 场景元数据、丢帧数等会随播放变化）。</summary>
+/// <summary>
+/// “视频参数”窗口。live：当前播放的文件，每秒刷新一次（HDR10+ 场景元数据、丢帧数等会随播放变化）；
+/// 否则是播放列表里其它文件的一次性探测结果，由调用方在读完后调用 <see cref="RefreshText"/>。
+/// </summary>
 public partial class InfoWindow : FluentWindow
 {
     private readonly Func<string> _builder;
     private readonly DispatcherTimer _timer;
 
-    public InfoWindow(Func<string> builder)
+    public InfoWindow(Func<string> builder, string title = "视频参数", bool live = true)
     {
         _builder = builder;
         InitializeComponent();
+        Title = title;
+        InfoTitleBar.Title = title;
+        if (!live)
+        {
+            AutoRefresh.IsChecked = false;
+            AutoRefresh.Visibility = Visibility.Collapsed;
+        }
 
         BtnClose.Click += (_, _) => Close();
         BtnCopy.Click += (_, _) => { if (InfoText.Text.Length > 0) Clipboard.SetText(InfoText.Text); };

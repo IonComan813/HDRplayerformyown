@@ -1,5 +1,5 @@
 # 推送 v* 标签（或在 GitHub 网页上新建 Release 并创建新标签）时自动构建，
-# 打包 HdrPlayer + libmpv-2.dll，上传到对应的 Release。
+# 打包 HdrPlayer + libmpv-2.dll（便携版 zip + 安装程序），上传到对应的 Release。
 # 手动运行（Actions → Build → Run workflow）只构建并上传 artifact，不发布。
 name: Build
 
@@ -79,11 +79,29 @@ jobs:
           Compress-Archive -Path publish/* -DestinationPath $name -Force
           "zip=$name" >> $env:GITHUB_OUTPUT
 
+      - name: 安装 Inno Setup
+        shell: pwsh
+        # 中文语言文件需要 6.5 以上；choco upgrade 在没装时会直接安装
+        run: choco upgrade innosetup -y --no-progress
+
+      - name: 生成安装程序
+        id: setup
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = (Get-Command ISCC.exe -ErrorAction Stop).Source }
+          & $iscc /Qp "/DAppVersion=${{ steps.ver.outputs.version }}" "/DSourceDir=$PWD\publish" "/DOutputDir=$PWD\dist" installer\HdrPlayer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC 失败" }
+          $exe = Get-ChildItem dist -Filter *-setup.exe | Select-Object -First 1
+          "exe=dist/$($exe.Name)" >> $env:GITHUB_OUTPUT
+
       - name: 上传 artifact
         uses: actions/upload-artifact@v4
         with:
           name: HdrPlayer-${{ steps.ver.outputs.version }}-win-x64
-          path: ${{ steps.pack.outputs.zip }}
+          path: |
+            ${{ steps.pack.outputs.zip }}
+            ${{ steps.setup.outputs.exe }}
 
       - name: 发布到 Release
         if: github.ref_type == 'tag'
@@ -91,12 +109,13 @@ jobs:
         run: |
           $tag = "${{ steps.ver.outputs.tag }}"
           $zip = "${{ steps.pack.outputs.zip }}"
+          $exe = "${{ steps.setup.outputs.exe }}"
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             # 已经在网页上建好了 Release：只上传文件
-            gh release upload $tag $zip --clobber
+            gh release upload $tag $zip $exe --clobber
           } else {
-            $ghArgs = @($tag, $zip, "--title", "HdrPlayer $tag", "--generate-notes")
+            $ghArgs = @($tag, $zip, $exe, "--title", "HdrPlayer $tag", "--generate-notes")
             if ($tag -match "-") { $ghArgs += "--prerelease" }   # v1.0-beta 这类标签发成预发布
             gh release create @args
           }

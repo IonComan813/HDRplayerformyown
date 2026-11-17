@@ -18,7 +18,7 @@
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <ui:TitleBar Grid.Row="0" Title="视频参数" ShowMaximize="False" ShowMinimize="False">
+        <ui:TitleBar x:Name="InfoTitleBar" Grid.Row="0" Title="视频参数" ShowMaximize="False" ShowMinimize="False">
             <ui:TitleBar.Icon>
                 <ui:SymbolIcon Symbol="Info24" />
             </ui:TitleBar.Icon>

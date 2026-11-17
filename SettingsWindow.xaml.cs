@@ -66,6 +66,9 @@ public partial class SettingsWindow : FluentWindow
     private static readonly (string, string)[] GpuApiChoices =
         { ("d3d11", "Direct3D 11（推荐）"), ("vulkan", "Vulkan") };
 
+    /// <summary>只在打开文件时读取的设置：正在播放的文件要重新载入才生效。</summary>
+    private const string ReloadNote = "打开下一个文件时生效；当前文件可点控制栏的重新载入按钮（F5）立即生效";
+
     private readonly AppSettings _s;
     private readonly Mpv _mpv;
     private readonly string _gdiName;
@@ -145,7 +148,7 @@ public partial class SettingsWindow : FluentWindow
     {
         var p = NewPage("解码 / 渲染");
         AddCombo(p, "解码方式", null, HwdecChoices, _s.Hwdec, v => _s.Hwdec = v);
-        AddNumber(p, "软解线程数", $"0 = 自动（按 CPU 逻辑核心数，最多 16；本机 {Environment.ProcessorCount} 个逻辑核心）。从下一个文件开始生效",
+        AddNumber(p, "软解线程数", $"0 = 自动（按 CPU 逻辑核心数，最多 16；本机 {Environment.ProcessorCount} 个逻辑核心）。" + ReloadNote,
             _s.DecoderThreads, 0, 64, 1, v => _s.DecoderThreads = (int)v);
         AddCombo(p, "渲染 API", "重启播放器后生效", GpuApiChoices, _s.GpuApi, v => _s.GpuApi = v);
         AddCombo(p, "放大算法", null, ScaleChoices, _s.Scale, v => _s.Scale = v);
@@ -178,7 +181,7 @@ public partial class SettingsWindow : FluentWindow
         AddCombo(p, "输出设备", null, devices.ToArray(), _s.AudioDevice, v => _s.AudioDevice = v);
         AddToggle(p, "多声道下混到立体声", "5.1 / 7.1 → 2.0", _s.DownmixToStereo, v => _s.DownmixToStereo = v);
         AddToggle(p, "下混时归一化", "防削波，但整体音量会变小", _s.NormalizeDownmix, v => _s.NormalizeDownmix = v);
-        AddText(p, "首选音轨语言", "如 chi,jpn,eng", _s.AudioLanguages, v => _s.AudioLanguages = v);
+        AddText(p, "首选音轨语言", "如 chi,jpn,eng。" + ReloadNote, _s.AudioLanguages, v => _s.AudioLanguages = v);
         double ad = (_mpv.GetDouble("audio-delay") ?? 0) * 1000;
         AddLiveNumber(p, "音频延迟 (ms)", "即时生效", ad, -10000, 10000, 10, v => _mpv.SetProperty("audio-delay", v / 1000.0));
         return p;
@@ -191,8 +194,8 @@ public partial class SettingsWindow : FluentWindow
         AddLiveNumber(p, "字幕延迟 (ms)", "负数 = 提前，即时生效", sd, -60000, 60000, 50, v => _mpv.SetProperty("sub-delay", v / 1000.0));
         AddText(p, "字体", "SRT 等纯文本字幕使用", _s.SubFont, v => _s.SubFont = v);
         AddNumber(p, "字号", null, _s.SubFontSize, 10, 120, 1, v => _s.SubFontSize = (int)v);
-        AddCombo(p, "自动加载外挂字幕", null, SubAutoChoices, _s.SubAuto, v => _s.SubAuto = v);
-        AddText(p, "首选字幕语言", null, _s.SubLanguages, v => _s.SubLanguages = v);
+        AddCombo(p, "自动加载外挂字幕", ReloadNote, SubAutoChoices, _s.SubAuto, v => _s.SubAuto = v);
+        AddText(p, "首选字幕语言", ReloadNote, _s.SubLanguages, v => _s.SubLanguages = v);
         AddNote(p, "把字幕文件直接拖到画面上即可加载。快捷键：Z 提前 / X 延后 / V 显示开关 / J 切换字幕轨。");
         return p;
     }
@@ -212,7 +215,7 @@ public partial class SettingsWindow : FluentWindow
             "↑/↓/滚轮 音量　M 静音　F/回车/双击 全屏　Esc 退出全屏\n" +
             "H 开关 HDR　I 视频参数　P 播放列表　PgUp/PgDn 上/下一个\n" +
             "Z/X 字幕延迟　V 字幕开关　J 切换字幕　# 切换音轨\n" +
-            ". / , 逐帧前进/后退　Ctrl+O 打开　右键 菜单");
+            ". / , 逐帧前进/后退　Ctrl+O 打开　F5 重新载入　单击画面 暂停/播放　右键 菜单");
         return p;
     }
 

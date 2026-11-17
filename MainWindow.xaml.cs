@@ -38,14 +38,17 @@ public partial class MainWindow : FluentWindow
     /// <summary>mpv 窗口拿到焦点时的按键 → 动作（经 script-message 回传给本程序统一处理）。</summary>
     private static readonly (string Key, string Action)[] MpvBindings =
     {
-        ("SPACE", "pause"), ("MBTN_LEFT_DBL", "fullscreen"), ("MBTN_RIGHT", "menu"), ("MBTN_MID", "pause"),
+        ("SPACE", "pause"), ("MBTN_LEFT", "click"), ("MBTN_LEFT_DBL", "dblclick"), ("MBTN_RIGHT", "menu"), ("MBTN_MID", "pause"),
         ("LEFT", "seek-back"), ("RIGHT", "seek-fwd"), ("Shift+LEFT", "seek-back-big"), ("Shift+RIGHT", "seek-fwd-big"),
         ("UP", "vol-up"), ("DOWN", "vol-down"), ("WHEEL_UP", "vol-up"), ("WHEEL_DOWN", "vol-down"),
         ("m", "mute"), ("f", "fullscreen"), ("ENTER", "fullscreen"), ("ESC", "exit-fullscreen"),
         ("h", "hdr"), ("z", "sub-delay-dec"), ("x", "sub-delay-inc"), ("v", "sub-toggle"), ("j", "sub-cycle"),
         ("SHARP", "audio-cycle"), ("i", "info"), ("p", "playlist"), ("PGUP", "prev"), ("PGDWN", "next"),
-        ("Ctrl+o", "open"), (".", "frame-step"), (",", "frame-back"),
+        ("Ctrl+o", "open"), (".", "frame-step"), (",", "frame-back"), ("F5", "reload"),
     };
+
+    /// <summary>双击判定时间，和 mpv 的 input-doubleclick-time 保持一致。单击画面要等这么久确认不是双击才暂停。</summary>
+    private const int DoubleClickMs = 300;
 
     /// <summary>鼠标静止多久后隐藏悬浮控制栏（mpv 的鼠标指针也同时隐藏）。</summary>
     private const int BarHideMs = 2000;
@@ -87,6 +90,13 @@ public partial class MainWindow : FluentWindow
     private bool? _originalWindowsHdr;
     private float _displayPeak;
 
+    // 单击画面暂停
+    private DispatcherTimer? _clickTimer;
+    private DateTime _activatedAt = DateTime.MinValue, _lastDblClick = DateTime.MinValue;
+
+    // 重新载入当前文件：期间临时设置了 mpv 的 start 选项，载入后要清掉
+    private bool _reloading;
+
     // 关闭流程
     private bool _shuttingDown, _closeReady;
 
@@ -110,6 +120,8 @@ public partial class MainWindow : FluentWindow
         _bar.BtnPlaylist.Click += (_, _) => DoAction("playlist");
         _bar.BtnSettings.Click += (_, _) => OpenSettings();
         _bar.BtnFull.Click += (_, _) => DoAction("fullscreen");
+        _bar.BtnReload.Click += (_, _) => DoAction("reload");
+        _bar.KeyForwarded += e => OnPreviewKeyDown(_bar, e);
         _bar.SeekRequested += (v, final) =>
             _mpv?.Command("seek", v.ToString("0.###", Inv), final ? "absolute+exact" : "absolute+keyframes");
         _bar.VolumeRequested += v => _mpv?.SetProperty("volume", v);
@@ -133,6 +145,7 @@ public partial class MainWindow : FluentWindow
         PlMenuPlay.Click += (_, _) => PlaySelected();
         PlMenuRemove.Click += (_, _) => RemoveSelected();
         PlMenuReveal.Click += (_, _) => RevealSelected();
+        PlMenuInfo.Click += (_, _) => { if (PlaylistBox.SelectedItem is PlaylistEntry e) ShowEntryInfo(e); };
         PlaylistBox.MouseDoubleClick += (_, e) =>
         {
             if (ItemsControl.ContainerFromElement(PlaylistBox, e.OriginalSource as DependencyObject) is ListBoxItem)
@@ -145,6 +158,7 @@ public partial class MainWindow : FluentWindow
         PreviewKeyDown += OnPreviewKeyDown;
 
         SourceInitialized += (_, _) => _hwnd = new WindowInteropHelper(this).Handle;
+        Activated += (_, _) => _activatedAt = DateTime.UtcNow;
         ContentRendered += OnContentRendered;
         LocationChanged += (_, _) => PositionBar();
         SizeChanged += (_, _) => PositionBar();
@@ -228,6 +242,7 @@ public partial class MainWindow : FluentWindow
         m.SetOption("input-conf", inputConf);
         m.SetOption("input-vo-keyboard", "yes");
         m.SetOption("input-cursor", "yes");
+        m.SetOption("input-doubleclick-time", DoubleClickMs.ToString(Inv));
         // 和悬浮控制栏同时隐藏
         m.SetOption("cursor-autohide", BarHideMs.ToString(Inv));
         // 拖到画面上：字幕文件 → sub-add；视频 → 加入播放列表（空闲时自动开始播放）
@@ -514,6 +529,7 @@ public partial class MainWindow : FluentWindow
                 break;
             case "mute":
                 _bar.MuteIcon.Symbol = value is true ? SymbolRegular.SpeakerMute24 : SymbolRegular.Speaker224;
+                _bar.SetMuted(value is true);
                 break;
             case "media-title":
                 SetTitle(value is string t && t.Length > 0 ? $"{t} - HdrPlayer" : "HdrPlayer");
@@ -567,6 +583,12 @@ public partial class MainWindow : FluentWindow
     {
         var m = _mpv;
         if (m == null) return;
+        if (_reloading)
+        {
+            // start 是全局选项，不清掉的话之后打开的每个文件都会从这个位置开始
+            _reloading = false;
+            m.SetProperty("start", "none");
+        }
         _dvProfile = m.GetString("current-tracks/video/dolby-vision-profile");
         // 剥离 RPU 时 Profile 5 没有可用的基础层（IPTPQc2 色彩空间），只能跳过；应用 RPU 时可以正常播放
         if (_dvProfile == "5" && DvStripped)
@@ -606,8 +628,62 @@ public partial class MainWindow : FluentWindow
 
     private void OnEndFile(MpvEndReason reason, int error)
     {
-        if (reason == MpvEndReason.Error)
-            _mpv?.ShowText("播放失败：" + Mpv.ErrorString(error), 4000);
+        if (reason != MpvEndReason.Error) return;
+        if (_reloading) { _reloading = false; _mpv?.SetProperty("start", "none"); }
+        _mpv?.ShowText("播放失败：" + Mpv.ErrorString(error), 4000);
+    }
+
+    /// <summary>
+    /// 重新载入当前文件并回到原来的位置。解码线程数、首选音轨 / 字幕语言、外挂字幕自动加载
+    /// 这些设置只在打开文件时读取，重新载入后立即生效。
+    /// </summary>
+    private void ReloadCurrent()
+    {
+        var m = _mpv;
+        if (m == null || _idle) return;
+        double pos = m.GetDouble("time-pos") ?? 0;
+        _reloading = true;
+        m.SetProperty("start", pos.ToString("0.###", Inv));
+        m.Command("playlist-play-index", "current");
+        m.ShowText("重新载入…");
+    }
+
+    /// <summary>
+    /// 单击画面：等双击时间过去、确认不是双击后再暂停 / 播放，免得双击全屏时画面先停一下。
+    /// 窗口没激活时的那一下单击只用来激活窗口，不暂停。
+    /// </summary>
+    private void OnVideoClick()
+    {
+        if (_idle) return;
+        var now = DateTime.UtcNow;
+        if ((now - _lastDblClick).TotalMilliseconds < DoubleClickMs + 100) return; // 双击的第二下
+        if ((now - _activatedAt).TotalMilliseconds < 300) return;
+        if (_clickTimer == null)
+        {
+            _clickTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(DoubleClickMs) };
+            _clickTimer.Tick += (_, _) => { _clickTimer.Stop(); DoAction("pause"); };
+        }
+        _clickTimer.Stop();
+        _clickTimer.Start();
+    }
+
+    /// <summary>
+    /// mpv 在右键按下时就发来 menu，这时鼠标还被 mpv 的窗口占着（按住期间鼠标归它）：
+    /// 立刻弹菜单的话，松开右键时菜单会失去鼠标捕获、马上关闭。所以等右键松开再弹。
+    /// </summary>
+    private void ShowContextMenuAfterRightButtonUp()
+    {
+        var start = DateTime.UtcNow;
+        var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(15) };
+        t.Tick += (_, _) =>
+        {
+            if (Native.IsRightButtonDown() && (DateTime.UtcNow - start).TotalSeconds < 3) return;
+            t.Stop();
+            if (_shuttingDown) return;
+            Activate();
+            ShowContextMenu();
+        };
+        t.Start();
     }
 
     private void OnClientMessage(string[] args)
@@ -639,8 +715,15 @@ public partial class MainWindow : FluentWindow
             case "vol-down": m.CommandString($"no-osd add volume {(-S.VolumeStep).ToString(Inv)}"); m.ShowText("音量 ${volume}"); break;
             case "mute": m.CommandString("no-osd cycle mute"); m.ShowText("静音：${mute}"); break;
             case "fullscreen": ToggleFullscreen(); break;
+            case "click": OnVideoClick(); break;
+            case "dblclick":
+                _lastDblClick = DateTime.UtcNow;
+                _clickTimer?.Stop();
+                ToggleFullscreen();
+                break;
+            case "reload": ReloadCurrent(); break;
             case "exit-fullscreen": if (_fullscreen) ToggleFullscreen(); break;
-            case "menu": ShowContextMenu(); break;
+            case "menu": ShowContextMenuAfterRightButtonUp(); break;
             case "hdr": SetHdr(!_hdrOn, manual: true); break;
             case "sub-delay-dec": AdjustSubDelay(-S.SubDelayStepMs); break;
             case "sub-delay-inc": AdjustSubDelay(S.SubDelayStepMs); break;
@@ -707,6 +790,7 @@ public partial class MainWindow : FluentWindow
             (ModifierKeys.Control, Key.O) => "open",
             (ModifierKeys.None, Key.OemPeriod) => "frame-step",
             (ModifierKeys.None, Key.OemComma) => "frame-back",
+            (ModifierKeys.None, Key.F5) => "reload",
             _ => null,
         };
         if (action != null)
@@ -844,6 +928,7 @@ public partial class MainWindow : FluentWindow
         items.Add(Item("打开文件…", OpenFiles, "Ctrl+O"));
         items.Add(Item("加载字幕…", LoadSubtitle, enabled: !_idle));
         items.Add(Item("加载外部音轨…", LoadAudioTrack, enabled: !_idle));
+        items.Add(Item("重新载入当前文件", ReloadCurrent, "F5", enabled: !_idle));
         items.Add(new Separator());
 
         var audioMenu = Item("音轨", null);
@@ -901,7 +986,9 @@ public partial class MainWindow : FluentWindow
         menu.IsOpen = true;
     }
 
-    private static string TrackLabel(Dictionary<string, object?> t)
+    private static string TrackLabel(Dictionary<string, object?> t) => TrackText(t).Replace("_", "__");
+
+    private static string TrackText(Dictionary<string, object?> t)
     {
         var parts = new List<string>();
         if (t.GetValueOrDefault("id") is long id) parts.Add("#" + id);
@@ -911,8 +998,7 @@ public partial class MainWindow : FluentWindow
         if (t.GetValueOrDefault("demux-channel-count") is long ch) parts.Add(ch + "ch");
         if (t.GetValueOrDefault("default") is true) parts.Add("(默认)");
         if (t.GetValueOrDefault("external") is true) parts.Add("(外部)");
-        // MenuItem 会把 “_” 当作访问键，转义一下
-        return string.Join(" ", parts).Replace("_", "__");
+        return string.Join(" ", parts); // 用于菜单时由 TrackLabel 转义 “_”（MenuItem 会把它当作访问键）
     }
 
     // =====================================================================
@@ -1105,6 +1191,9 @@ public partial class MainWindow : FluentWindow
         if (dlg.ShowDialog() != true) return;
 
         bool gpuApiChanged = copy.GpuApi != S.GpuApi;
+        // 这几项只在打开文件时读取，正在播放的文件要重新载入才生效
+        bool needsReload = copy.DecoderThreads != S.DecoderThreads || copy.AudioLanguages != S.AudioLanguages ||
+                           copy.SubLanguages != S.SubLanguages || copy.SubAuto != S.SubAuto;
         bool dvChanged = copy.DolbyVisionMode != S.DolbyVisionMode;
         if (copy.TargetPeakNits != S.TargetPeakNits) _displayPeak = 0;
         CopySettings(copy, S);
@@ -1115,6 +1204,8 @@ public partial class MainWindow : FluentWindow
         // 改设置不会去切换 Windows HDR，只重新应用 mpv 的 HDR 参数
         ApplyMpvHdrProps();
         UpdateHdrButton();
+        if (needsReload && !_idle)
+            m.ShowText("部分设置要重新载入当前文件才生效：点控制栏的重新载入按钮，或按 F5", 5000);
         if (gpuApiChanged)
             await Dialogs.ShowAsync(this, "HdrPlayer", "渲染 API 的修改将在重启播放器后生效。");
     }
@@ -1125,10 +1216,15 @@ public partial class MainWindow : FluentWindow
             p.SetValue(to, p.GetValue(from));
     }
 
-    /// <summary>右键“视频参数”窗口的内容。</summary>
-    private string BuildInfoText()
+    /// <summary>右键“视频参数”窗口的内容（当前播放的文件，每秒刷新）。</summary>
+    private string BuildInfoText() => BuildInfoText(_mpv, live: true);
+
+    /// <summary>
+    /// live = 当前播放的文件：包含播放位置、丢帧、渲染输出、显示器等运行状态。
+    /// 否则是播放列表里其它文件的探测结果（由后台的临时 mpv 实例打开，只读文件和视频参数）；这时会在后台线程调用。
+    /// </summary>
+    private string BuildInfoText(Mpv? m, bool live)
     {
-        var m = _mpv;
         var sb = new StringBuilder();
         if (m == null) return "";
 
@@ -1137,87 +1233,149 @@ public partial class MainWindow : FluentWindow
         void Line(string k, string v) => sb.Append("  ").Append(k.PadRight(14 - CountWide(k))).Append(v).Append('\n');
         void Head(string h) => sb.Append("\n【").Append(h).Append("】\n");
 
-        if (_idle)
+        if (live && _idle)
         {
             sb.Append("当前没有在播放。\n");
         }
         else
         {
+            double duration = live ? _duration : m.GetDouble("duration") ?? 0;
+            string? dv = live ? _dvProfile : m.GetString("current-tracks/video/dolby-vision-profile");
+            bool hdr10Plus = live ? _hdr10Plus
+                : double.TryParse(m.GetString("video-params/scene-max-r"), NumberStyles.Float, Inv, out double smr) && smr > 0;
+            bool hasVideo = !string.IsNullOrEmpty(m.GetString("video-codec"));
+
             Head("文件");
             Line("路径", P("path"));
             Line("容器", P("file-format"));
             Line("大小", O("file-size"));
-            Line("时长", FormatTime(_duration));
-            Line("位置", $"{FormatTime(_timePos)}");
+            Line("时长", FormatTime(duration));
+            if (live) Line("位置", $"{FormatTime(_timePos)}");
 
-            Head("视频");
-            Line("编码", $"{P("video-format")}  ({P("video-codec")})");
-            Line("分辨率", $"{P("video-params/w")} × {P("video-params/h")}  显示 {P("video-params/dw")} × {P("video-params/dh")}");
-            Line("帧率", $"容器 {P("container-fps")}  实际 {O("estimated-vf-fps")}  显示器 {O("display-fps")} Hz");
-            Line("码率", O("video-bitrate"));
-            Line("像素格式", $"{P("video-params/pixelformat")}  硬件格式 {P("video-params/hw-pixelformat")}");
-            Line("色彩矩阵", $"{P("video-params/colormatrix")}  范围 {P("video-params/colorlevels")}");
-            Line("原色", P("video-params/primaries"));
-            Line("传输特性", P("video-params/gamma"));
-            string gamma = P("video-params/gamma");
-            string fmt = gamma switch { "pq" => _hdr10Plus ? "HDR10+ (PQ + ST 2094-40 动态元数据)" : "HDR10 (PQ + 静态元数据)", "hlg" => "HLG", "—" => "—", _ => "SDR" };
-            Line("HDR 格式", fmt);
-            if (gamma is "pq" or "hlg")
+            if (hasVideo)
             {
-                Line("MaxCLL/FALL", $"{P("video-params/max-cll")} / {P("video-params/max-fall")} nit");
-                Line("母版亮度", $"{P("video-params/min-luma")} – {P("video-params/max-luma")} nit");
-                if (double.TryParse(m.GetString("video-params/sig-peak"), NumberStyles.Float, Inv, out double sp))
-                    Line("信号峰值", $"{sp * 203:0} nit (sig-peak {sp:0.###})");
+                Head("视频");
+                Line("编码", $"{P("video-format")}  ({P("video-codec")})");
+                Line("分辨率", $"{P("video-params/w")} × {P("video-params/h")}  显示 {P("video-params/dw")} × {P("video-params/dh")}");
+                Line("帧率", live ? $"容器 {P("container-fps")}  实际 {O("estimated-vf-fps")}  显示器 {O("display-fps")} Hz" : $"容器 {P("container-fps")}");
+                if (live) Line("码率", O("video-bitrate"));
+                Line("像素格式", $"{P("video-params/pixelformat")}  硬件格式 {P("video-params/hw-pixelformat")}");
+                Line("色彩矩阵", $"{P("video-params/colormatrix")}  范围 {P("video-params/colorlevels")}");
+                Line("原色", P("video-params/primaries"));
+                Line("传输特性", P("video-params/gamma"));
+                string gamma = P("video-params/gamma");
+                string fmt = gamma switch { "pq" => hdr10Plus ? "HDR10+ (PQ + ST 2094-40 动态元数据)" : "HDR10 (PQ + 静态元数据)", "hlg" => "HLG", "—" => "—", _ => "SDR" };
+                Line("HDR 格式", fmt);
+                if (gamma is "pq" or "hlg")
+                {
+                    Line("MaxCLL/FALL", $"{P("video-params/max-cll")} / {P("video-params/max-fall")} nit");
+                    Line("母版亮度", $"{P("video-params/min-luma")} – {P("video-params/max-luma")} nit");
+                    if (double.TryParse(m.GetString("video-params/sig-peak"), NumberStyles.Float, Inv, out double sp))
+                        Line("信号峰值", $"{sp * 203:0} nit (sig-peak {sp:0.###})");
+                }
+                if (hdr10Plus)
+                {
+                    Line("HDR10+ 场景", $"maxRGB R/G/B {P("video-params/scene-max-r")} / {P("video-params/scene-max-g")} / {P("video-params/scene-max-b")} nit");
+                    Line("", $"场景平均 {P("video-params/scene-avg")} nit");
+                }
+                if (dv != null)
+                    Line("杜比视界", $"Profile {dv}  Level {P("current-tracks/video/dolby-vision-level")}  → " +
+                        (DvStripped ? "剥离 RPU，仅播放基础层" : "应用 RPU 动态元数据（libplacebo 重塑）"));
+                if (live)
+                {
+                    string hw = P("hwdec-current");
+                    Line("解码", hw is "—" or "no" ? "软解 (CPU)" : $"硬解 ({hw})");
+                    Line("丢帧", $"解码 {P("decoder-frame-drop-count")}  输出 {P("frame-drop-count")}  延迟 {P("vo-delayed-frame-count")}");
+                }
             }
-            if (_hdr10Plus)
+
+            if (live && hasVideo)
             {
-                Line("HDR10+ 场景", $"maxRGB R/G/B {P("video-params/scene-max-r")} / {P("video-params/scene-max-g")} / {P("video-params/scene-max-b")} nit");
-                Line("", $"场景平均 {P("video-params/scene-avg")} nit");
+                Head("渲染输出");
+                Line("VO", $"{P("current-vo")}  API {P("gpu-api")}");
+                Line("输出色彩", $"{P("video-target-params/primaries")} / {P("video-target-params/gamma")}  峰值 {P("video-target-params/max-luma")} nit");
+                Line("HDR 输出", _hdrOn ? $"开  目标峰值 {Math.Round(DisplayPeak())} nit" : "关（色调映射到 SDR）");
+                Line("色调映射", $"{P("tone-mapping")}  峰值检测 {P("hdr-compute-peak")}  色域映射 {P("gamut-mapping-mode")}");
+                Line("缩放", $"{P("scale")} / {P("dscale")}  去色带 {P("deband")}");
             }
-            if (_dvProfile != null)
-                Line("杜比视界", $"Profile {_dvProfile}  Level {P("current-tracks/video/dolby-vision-level")}  → " +
-                    (DvStripped ? "已剥离 RPU，仅播放基础层" : "已应用 RPU 动态元数据（libplacebo 重塑）"));
-            string hw = P("hwdec-current");
-            Line("解码", hw is "—" or "no" ? "软解 (CPU)" : $"硬解 ({hw})");
-            Line("丢帧", $"解码 {P("decoder-frame-drop-count")}  输出 {P("frame-drop-count")}  延迟 {P("vo-delayed-frame-count")}");
 
-            Head("渲染输出");
-            Line("VO", $"{P("current-vo")}  API {P("gpu-api")}");
-            Line("输出色彩", $"{P("video-target-params/primaries")} / {P("video-target-params/gamma")}  峰值 {P("video-target-params/max-luma")} nit");
-            Line("HDR 输出", _hdrOn ? $"开  目标峰值 {Math.Round(DisplayPeak())} nit" : "关（色调映射到 SDR）");
-            Line("色调映射", $"{P("tone-mapping")}  峰值检测 {P("hdr-compute-peak")}  色域映射 {P("gamut-mapping-mode")}");
-            Line("缩放", $"{P("scale")} / {P("dscale")}  去色带 {P("deband")}");
+            if (!string.IsNullOrEmpty(m.GetString("audio-codec")) || !string.IsNullOrEmpty(m.GetString("current-tracks/audio/codec")))
+            {
+                Head("音频");
+                Line("编码", $"{P("audio-codec-name")}  ({P("audio-codec")})");
+                Line("声道", $"{P("audio-params/channel-count")} ch  {P("audio-params/hr-channels")}");
+                if (live)
+                    Line("输出声道", $"{P("audio-out-params/channel-count")} ch  {P("audio-out-params/hr-channels")}" +
+                        (S.DownmixToStereo ? "  (下混到立体声)" : ""));
+                Line("采样率", $"{P("audio-params/samplerate")} Hz  {P("audio-params/format")}");
+                if (live)
+                {
+                    Line("码率", O("audio-bitrate"));
+                    Line("输出设备", $"{P("audio-device")}  ({P("current-ao")})");
+                    Line("音频延迟", $"{(m.GetDouble("audio-delay") ?? 0) * 1000:0} ms");
+                }
+            }
 
-            Head("音频");
-            Line("编码", $"{P("audio-codec-name")}  ({P("audio-codec")})");
-            Line("输入声道", $"{P("audio-params/channel-count")} ch  {P("audio-params/hr-channels")}");
-            Line("输出声道", $"{P("audio-out-params/channel-count")} ch  {P("audio-out-params/hr-channels")}" +
-                (S.DownmixToStereo ? "  (下混到立体声)" : ""));
-            Line("采样率", $"{P("audio-params/samplerate")} Hz  {P("audio-params/format")}");
-            Line("码率", O("audio-bitrate"));
-            Line("输出设备", $"{P("audio-device")}  ({P("current-ao")})");
-            Line("音频延迟", $"{(m.GetDouble("audio-delay") ?? 0) * 1000:0} ms");
+            if (live)
+            {
+                Head("字幕");
+                Line("当前", $"#{P("sid")} {P("current-tracks/sub/lang")} {P("current-tracks/sub/title")} {P("current-tracks/sub/codec")}");
+                Line("字幕延迟", $"{(m.GetDouble("sub-delay") ?? 0) * 1000:0} ms");
+            }
 
-            Head("字幕");
-            Line("当前", $"#{P("sid")} {P("current-tracks/sub/lang")} {P("current-tracks/sub/title")} {P("current-tracks/sub/codec")}");
-            Line("字幕延迟", $"{(m.GetDouble("sub-delay") ?? 0) * 1000:0} ms");
+            if (m.GetNode("track-list") is List<object?> tracks && tracks.Count > 0)
+            {
+                Head("全部轨道");
+                foreach (var t in tracks.OfType<Dictionary<string, object?>>())
+                {
+                    string type = (t.GetValueOrDefault("type") as string) switch
+                    {
+                        "video" => t.GetValueOrDefault("image") is true ? "封面" : "视频",
+                        "audio" => "音频", "sub" => "字幕", var x => x ?? "?",
+                    };
+                    string mark = live && t.GetValueOrDefault("selected") is true ? "  ← 当前" : "";
+                    Line(type, TrackText(t) + mark);
+                }
+            }
         }
 
-        Head("显示器");
-        var d = DisplayHelper.Query(CurrentGdiName());
-        if (d != null)
+        if (live)
         {
-            Line("名称", $"{(d.FriendlyName.Length > 0 ? d.FriendlyName : "?")}  ({d.GdiName})");
-            Line("Windows HDR", d.AdvancedColorSupported ? (d.AdvancedColorEnabled ? "开" : "关") : "不支持");
-            if (d.HasDxgi)
+            Head("显示器");
+            var d = DisplayHelper.Query(CurrentGdiName());
+            if (d != null)
             {
-                Line("位深", $"{d.DxgiBitsPerColor} bit  色彩空间 {(d.DxgiIsHdr ? "HDR10 (PQ/BT.2020)" : "sRGB")}");
-                Line("EDID 亮度", $"峰值 {d.MaxLuminance:0} nit  全屏 {d.MaxFullFrameLuminance:0} nit  最低 {d.MinLuminance:0.####} nit");
-                Line("EDID 原色", $"R({d.Red[0]:0.000},{d.Red[1]:0.000}) G({d.Green[0]:0.000},{d.Green[1]:0.000}) " +
-                                 $"B({d.Blue[0]:0.000},{d.Blue[1]:0.000}) W({d.White[0]:0.0000},{d.White[1]:0.0000})");
+                Line("名称", $"{(d.FriendlyName.Length > 0 ? d.FriendlyName : "?")}  ({d.GdiName})");
+                Line("Windows HDR", d.AdvancedColorSupported ? (d.AdvancedColorEnabled ? "开" : "关") : "不支持");
+                if (d.HasDxgi)
+                {
+                    Line("位深", $"{d.DxgiBitsPerColor} bit  色彩空间 {(d.DxgiIsHdr ? "HDR10 (PQ/BT.2020)" : "sRGB")}");
+                    Line("EDID 亮度", $"峰值 {d.MaxLuminance:0} nit  全屏 {d.MaxFullFrameLuminance:0} nit  最低 {d.MinLuminance:0.####} nit");
+                    Line("EDID 原色", $"R({d.Red[0]:0.000},{d.Red[1]:0.000}) G({d.Green[0]:0.000},{d.Green[1]:0.000}) " +
+                                     $"B({d.Blue[0]:0.000},{d.Blue[1]:0.000}) W({d.White[0]:0.0000},{d.White[1]:0.0000})");
+                }
             }
         }
         return sb.ToString();
+    }
+
+    /// <summary>播放列表右键“视频参数”：当前文件直接打开实时窗口，其它文件在后台探测后显示。</summary>
+    private void ShowEntryInfo(PlaylistEntry e)
+    {
+        if (e.Current && !_idle) { ShowInfo(); return; }
+        string text = $"正在读取 {Path.GetFileName(e.Path)} …";
+        var win = new InfoWindow(() => text, "视频参数 - " + Path.GetFileName(e.Path), live: false) { Owner = this };
+        win.Show();
+        string path = e.Path;
+        Task.Run(() => MediaProbe.Run(path, pm => BuildInfoText(pm, live: false))).ContinueWith(t =>
+        {
+            string result = t.IsFaulted ? "读取失败：" + t.Exception?.GetBaseException().Message : t.Result;
+            Dispatcher.InvokeAsync(() =>
+            {
+                text = result;
+                if (win.IsLoaded) win.RefreshText();
+            });
+        });
     }
 
     private static int CountWide(string s) => s.Count(c => c > 0x2E80);
