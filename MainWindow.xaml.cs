@@ -30,7 +30,8 @@ public partial class MainWindow : FluentWindow
           ".flac", ".mp3", ".opus", ".ogg", ".wav", ".w64" };
 
     private const string VideoFilter =
-        "视频文件|*.mkv;*.mp4;*.m4v;*.mov;*.ts;*.m2ts;*.mts;*.avi;*.wmv;*.webm;*.flv;*.mpg;*.mpeg;*.hevc;*.h265;*.264;*.265|所有文件|*.*";
+        "视频文件|*.mkv;*.mp4;*.m4v;*.mov;*.ts;*.m2ts;*.mts;*.m2t;*.avi;*.wmv;*.asf;*.webm;*.flv;*.f4v;*.mpg;*.mpeg;*.vob;" +
+        "*.hevc;*.h265;*.264;*.265;*.3gp;*.3g2;*.ogv;*.rm;*.rmvb;*.divx;*.mxf;*.y4m|所有文件|*.*";
     private const string SubFilter = "字幕文件|*.srt;*.ass;*.ssa;*.sub;*.idx;*.sup;*.vtt;*.smi|所有文件|*.*";
     private const string AudioFilter =
         "音频文件|*.mka;*.ac3;*.eac3;*.ec3;*.dts;*.thd;*.truehd;*.aac;*.m4a;*.flac;*.mp3;*.opus;*.ogg;*.wav|所有文件|*.*";

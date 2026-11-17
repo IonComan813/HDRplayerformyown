@@ -55,7 +55,8 @@ internal static class Native
 {
     public const uint WS_CHILD = 0x40000000, WS_VISIBLE = 0x10000000, WS_CLIPCHILDREN = 0x02000000, WS_CLIPSIBLINGS = 0x04000000;
     public const int GWL_EXSTYLE = -20;
-    public const long WS_EX_TOOLWINDOW = 0x80, WS_EX_NOACTIVATE = 0x08000000;
+    public const long WS_EX_TOOLWINDOW = 0x80, WS_EX_NOACTIVATE = 0x08000000, WS_EX_TRANSPARENT = 0x20;
+    public const int WM_MOUSEACTIVATE = 0x0021, MA_NOACTIVATE = 3;
     public const int BLACK_BRUSH = 4;
     public static readonly IntPtr IDC_ARROW = new(32512);
     public const uint GA_ROOT = 2;

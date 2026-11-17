@@ -5,7 +5,9 @@
 
 ## 运行
 
-**安装版**：从 Release 下载 `HdrPlayer-<版本>-win-x64-setup.exe`，不需要管理员权限。安装时可以勾选把 mkv / mp4 等视频文件设为用 HdrPlayer 打开；装好后右键视频的“打开方式”里也会有 HdrPlayer。Windows 不允许程序自己改默认程序，所以安装完成时可以打开系统的“默认应用”设置页，点一下确认即可。安装包已带 libmpv，也需要下面第 1 步的 .NET 运行时。
+**安装版**：从 Release 下载 `HdrPlayer-<版本>-win-x64-setup.exe`，不需要管理员权限，安装包已带 libmpv（也需要下面第 1 步的 .NET 运行时）。
+安装时会列出所有支持的视频后缀，逐个勾选要用 HdrPlayer 打开的：勾选的后缀会替换你之前在 Windows 里为它选的默认程序（安装程序删掉 Windows 记录的旧选择，再把 HdrPlayer 设为默认）；不勾选的也会出现在右键“打开方式”里。`.ts` 默认不勾，因为 TypeScript 源文件也用这个后缀。卸载后这些后缀会回到系统默认程序。
+要增删后缀，改 `installer/gen_iss.py` 里的列表后重新生成 `HdrPlayer.iss`。
 
 **便携版 / 自己编译**：
 

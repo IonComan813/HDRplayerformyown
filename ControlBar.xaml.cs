@@ -57,43 +57,48 @@ public partial class ControlBar : Window
             // 拖动中：快速跳到关键帧；单击轨道（IsMoveToPointEnabled）：精确跳转
             SeekRequested?.Invoke(e.NewValue, !_seekDragging);
         };
-        SeekPopup.CustomPopupPlacementCallback = AboveAnchor(SeekSlider, 12);
-        VolumePopup.CustomPopupPlacementCallback = AboveAnchor(VolumeSlider, 8);
-
         SeekSlider.MouseMove += (_, e) => UpdateSeekTip(e);
-        SeekSlider.MouseLeave += (_, _) => { if (!_seekDragging) CloseSeekTip(); };
+        SeekSlider.MouseLeave += (_, _) => { if (!_seekDragging) CloseTip(TipOwner.Seek); };
         SeekSlider.AddHandler(Thumb.DragCompletedEvent, new DragCompletedEventHandler((_, _) =>
         {
-            if (!SeekSlider.IsMouseOver) CloseSeekTip();
+            if (!SeekSlider.IsMouseOver) CloseTip(TipOwner.Seek);
         }));
 
         VolumeSlider.ValueChanged += (_, e) =>
         {
-            UpdateVolumeTip();
+            if (_tipOwner == TipOwner.Volume) ShowVolumeTip();
             if (!_settingVolume) VolumeRequested?.Invoke(Math.Round(e.NewValue));
         };
-        VolumeSlider.MouseEnter += (_, _) => { UpdateVolumeTip(); VolumePopup.IsOpen = true; };
-        VolumeSlider.MouseLeave += (_, _) => { if (!VolumeSlider.IsMouseCaptureWithin) VolumePopup.IsOpen = false; };
-        VolumeSlider.LostMouseCapture += (_, _) => { if (!VolumeSlider.IsMouseOver) VolumePopup.IsOpen = false; };
+        VolumeSlider.MouseEnter += (_, _) => ShowVolumeTip();
+        VolumeSlider.MouseLeave += (_, _) => { if (!VolumeSlider.IsMouseCaptureWithin) CloseTip(TipOwner.Volume); };
+        VolumeSlider.LostMouseCapture += (_, _) => { if (!VolumeSlider.IsMouseOver) CloseTip(TipOwner.Volume); };
         VolumeSlider.MouseWheel += (_, e) =>
         {
             VolumeSlider.Value = Math.Clamp(VolumeSlider.Value + Math.Sign(e.Delta) * 5, 0, VolumeSlider.Maximum);
             e.Handled = true;
         };
 
-        // 控制栏里的控件一律不拿键盘焦点：一旦拿到，Windows 会激活控制栏窗口，主窗口失去焦点，空格等快捷键就失效了
+        // 控制栏里的控件一律不拿键盘焦点：WPF 给某个元素键盘焦点时会对它所在的窗口调用 SetFocus，
+        // 这会把控制栏窗口激活、主窗口失去焦点，空格等快捷键就失效了。在 PreviewGotKeyboardFocus 里取消，
+        // WPF 就不会走到 SetFocus 这一步。
         PreviewGotKeyboardFocus += (_, e) => e.Handled = true;
-        // 万一还是被激活了（比如系统行为），立刻把激活状态还给主窗口
-        Activated += (_, _) => Owner?.Activate();
+        // 万一控制栏还是收到了按键，转给主窗口处理
         PreviewKeyDown += (_, e) => KeyForwarded?.Invoke(e);
 
         SourceInitialized += (_, _) =>
         {
             Handle = new WindowInteropHelper(this).Handle;
-            // 不激活：点控制栏时焦点留在主窗口 / mpv，快捷键照常可用
             long ex = Native.GetWindowLongPtr(Handle, Native.GWL_EXSTYLE).ToInt64();
             Native.SetWindowLongPtr(Handle, Native.GWL_EXSTYLE,
                 new IntPtr(ex | Native.WS_EX_NOACTIVATE | Native.WS_EX_TOOLWINDOW));
+            // 点击时明确告诉系统“不激活”：焦点留在主窗口 / mpv，快捷键照常可用。
+            // 注意不能在被激活后再去激活主窗口：那会发生在按下鼠标的过程中，打断按钮 / 滑块的鼠标捕获，点击全部失效。
+            HwndSource.FromHwnd(Handle)?.AddHook((IntPtr _, int msg, IntPtr _, IntPtr _, ref bool handled) =>
+            {
+                if (msg != Native.WM_MOUSEACTIVATE) return IntPtr.Zero;
+                handled = true;
+                return new IntPtr(Native.MA_NOACTIVATE);
+            });
         };
     }
 
@@ -127,74 +132,75 @@ public partial class ControlBar : Window
     public void SetMuted(bool muted)
     {
         _muted = muted;
-        UpdateVolumeTip();
+        if (_tipOwner == TipOwner.Volume) ShowVolumeTip();
     }
 
-    private void UpdateVolumeTip()
+    // ------------------------------------------------------------------ 悬停提示（进度条 / 音量）
+
+    private enum TipOwner { None, Seek, Volume }
+    private TipOwner _tipOwner;
+    private HoverTip? _tip;
+
+    /// <summary>提示窗口归控制栏所有（显示在它上面）；Owner 要在控制栏显示过之后才能设置，所以第一次用到时再创建。</summary>
+    private HoverTip? Tip => _tip ??= IsVisible ? new HoverTip { Owner = this } : null;
+
+    private void ShowVolumeTip()
     {
+        if (Tip is not { } tip) return;
         int v = (int)Math.Round(VolumeSlider.Value);
-        VolumeTipText.Text = _muted ? $"静音（{v}%）" : $"{v}%";
         // 锚点放在滑块圆点的位置（WPF-UI 的圆点宽 20，轨道两端各让出半个圆点）
         const double thumb = 20;
-        double w = Math.Max(0, VolumeSlider.ActualWidth - thumb);
-        VolumePopup.HorizontalOffset = thumb / 2 + w * VolumeSlider.Value / Math.Max(1, VolumeSlider.Maximum);
+        double x = thumb / 2 + Math.Max(0, VolumeSlider.ActualWidth - thumb) * VolumeSlider.Value / Math.Max(1, VolumeSlider.Maximum);
+        _tipOwner = TipOwner.Volume;
+        tip.ShowAt(VolumeSlider, x, 6, _muted ? $"静音（{v}%）" : $"{v}%", null);
     }
-
-    /// <summary>
-    /// 把 Popup 摆在目标控件上方、以 HorizontalOffset（DIP）为中心的位置。
-    /// 用自定义定位而不是自己算偏移：Popup 在内容排版完成后才调用它，尺寸变化（比如缩略图出来）时也会重新调用，
-    /// 所以不会先在错误位置闪一下。注意回调里的尺寸是屏幕像素，offset 是 DIP。
-    /// </summary>
-    private static CustomPopupPlacementCallback AboveAnchor(FrameworkElement target, double gap) =>
-        (popupSize, targetSize, offset) =>
-        {
-            var dpi = VisualTreeHelper.GetDpi(target);
-            double x = offset.X * dpi.DpiScaleX, pad = 60 * dpi.DpiScaleX;
-            double left = Math.Clamp(x - popupSize.Width / 2, -pad, Math.Max(-pad, targetSize.Width - popupSize.Width + pad));
-            double top = -popupSize.Height - gap * dpi.DpiScaleY;
-            return new[] { new CustomPopupPlacement(new Point(left, top), PopupPrimaryAxis.Horizontal) };
-        };
 
     private void UpdateSeekTip(MouseEventArgs e)
     {
-        if (FormatTime == null || SeekSlider.Template.FindName("PART_Track", SeekSlider) is not Track track)
+        if (FormatTime == null || Tip is not { } tip ||
+            SeekSlider.Template.FindName("PART_Track", SeekSlider) is not Track track)
             return;
         double v = Math.Clamp(track.ValueFromPoint(e.GetPosition(track)), 0, SeekSlider.Maximum);
         _hoverValue = v;
-        SeekTipText.Text = FormatTime(v);
-        if (_thumbsEnabled)
+        // 离已显示的缩略图太远就先不显示，等新的出来；请求会被缩略图线程合并，只处理最新的
+        if (!_thumbsEnabled || (!double.IsNaN(_thumbTime) && Math.Abs(_thumbTime - v) > ThumbnailTolerance))
         {
-            // 离已显示的缩略图太远就先藏起来，等新的出来；请求会被缩略图线程合并，只处理最新的
-            if (!double.IsNaN(_thumbTime) && Math.Abs(_thumbTime - v) > ThumbnailTolerance) HideThumbnail();
-            ThumbnailRequested?.Invoke(v);
+            _thumbTime = double.NaN;
+            _thumbImage = null;
         }
-        // 先设锚点再打开：Popup 打开时按 AboveAnchor 一次摆到正确位置
-        SeekPopup.HorizontalOffset = e.GetPosition(SeekSlider).X;
-        SeekPopup.IsOpen = true;
+        if (_thumbsEnabled) ThumbnailRequested?.Invoke(v);
+        _tipOwner = TipOwner.Seek;
+        tip.ShowAt(SeekSlider, e.GetPosition(SeekSlider).X, 10, FormatTime(v), _thumbImage);
     }
+
+    private ImageSource? _thumbImage;
 
     /// <summary>缩略图线程送来的结果（UI 线程调用）。servedAt 是实际截图的时间点。</summary>
     public void ShowThumbnail(double servedAt, ImageSource image)
     {
-        if (!_thumbsEnabled || !SeekPopup.IsOpen || double.IsNaN(_hoverValue)) return;
+        if (!_thumbsEnabled || _tipOwner != TipOwner.Seek || double.IsNaN(_hoverValue)) return;
         if (Math.Abs(servedAt - _hoverValue) > ThumbnailTolerance) return; // 鼠标已经移走了
-        SeekThumb.Source = image;
-        SeekThumb.Visibility = Visibility.Visible;
-        _thumbTime = servedAt; // 尺寸变了 Popup 会自己重新定位
+        _thumbImage = image;
+        _thumbTime = servedAt;
+        _tip?.UpdateImage(image);
     }
 
     private void HideThumbnail()
     {
-        SeekThumb.Visibility = Visibility.Collapsed;
-        SeekThumb.Source = null;
+        _thumbImage = null;
         _thumbTime = double.NaN;
+        if (_tipOwner == TipOwner.Seek) _tip?.UpdateImage(null);
     }
 
-    private void CloseSeekTip()
+    /// <summary>关闭提示；owner 不为 None 时只在提示属于它时才关（免得进度条的离开事件关掉音量提示）。</summary>
+    private void CloseTip(TipOwner owner = TipOwner.None)
     {
-        SeekPopup.IsOpen = false;
+        if (owner != TipOwner.None && _tipOwner != owner) return;
+        _tipOwner = TipOwner.None;
         _hoverValue = double.NaN;
-        HideThumbnail();
+        _thumbImage = null;
+        _thumbTime = double.NaN;
+        _tip?.HideTip();
     }
 
     // ------------------------------------------------------------------ 显示 / 隐藏（淡入淡出）
@@ -211,8 +217,7 @@ public partial class ControlBar : Window
     {
         if (!IsRevealed) return;
         IsRevealed = false;
-        CloseSeekTip();
-        VolumePopup.IsOpen = false;
+        CloseTip();
         Fade(0, 250, () => { if (!IsRevealed) Hide(); });
     }
 
@@ -220,8 +225,7 @@ public partial class ControlBar : Window
     public void HideNow()
     {
         IsRevealed = false;
-        CloseSeekTip();
-        VolumePopup.IsOpen = false;
+        CloseTip();
         Root.BeginAnimation(OpacityProperty, null);
         Root.Opacity = 0;
         Hide();
