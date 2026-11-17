@@ -369,7 +369,7 @@ public partial class MainWindow : FluentWindow
         bool switched = false;
         string gdi = CurrentGdiName();
         var info = DisplayHelper.Query(gdi);
-        if (S.AutoSwitchWindowsHdr && info is { AdvancedColorSupported: true } && info.AdvancedColorEnabled != on)
+        if (info is { AdvancedColorSupported: true } && info.AdvancedColorEnabled != on)
         {
             bool before = info.AdvancedColorEnabled;
             if (DisplayHelper.SetWindowsHdr(gdi, on, out string err))
@@ -421,7 +421,7 @@ public partial class MainWindow : FluentWindow
         string? gamma = m.GetString("video-params/gamma");
         if (gamma == null) return; // 还没解码出第一帧（纯音频文件永远不会到这里）
         _autoHdrChecked = true;
-        if (!S.AutoHdrForHdrVideo) return;
+        if (!S.AutoManageHdr) return; // 不自动管理：只在手动按 H / 点 HDR 按钮时切换
         // 音乐文件的封面图也算“视频轨”，不能因为它把 HDR 关掉
         if (m.GetFlag("current-tracks/video/image") == true) return;
         bool hdrSource = gamma is "pq" or "hlg" || _dvProfile != null;
@@ -486,7 +486,7 @@ public partial class MainWindow : FluentWindow
 
     private void RestoreWindowsHdr()
     {
-        if (!S.RestoreWindowsHdrOnExit || _originalWindowsHdr is not bool orig) return;
+        if (_originalWindowsHdr is not bool orig) return;
         try { DisplayHelper.SetWindowsHdr(CurrentGdiName(), orig, out _); } catch { }
     }
 
@@ -757,35 +757,17 @@ public partial class MainWindow : FluentWindow
         _clickTimer.Start();
     }
 
-    /// <summary>
-    /// mpv 在右键按下时就发来 menu，这时鼠标还被 mpv 的窗口占着（按住期间鼠标归它）：
-    /// 立刻弹菜单的话，松开右键时菜单会失去鼠标捕获、马上关闭。所以等右键松开再弹。
-    /// </summary>
-    private void ShowContextMenuAfterRightButtonUp()
-    {
-        var start = DateTime.UtcNow;
-        var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(15) };
-        t.Tick += (_, _) =>
-        {
-            if (Native.IsRightButtonDown() && (DateTime.UtcNow - start).TotalSeconds < 3) return;
-            t.Stop();
-            if (_shuttingDown) return;
-            Activate();
-            ShowContextMenu();
-        };
-        t.Start();
-    }
-
+    /// <summary>mpv 发来的 script-message：hp &lt;动作&gt; [参数]（按键绑定、右键菜单都走这里）。</summary>
     private void OnClientMessage(string[] args)
     {
-        if (args.Length >= 2 && args[0] == "hp") DoAction(args[1]);
+        if (args.Length >= 2 && args[0] == "hp") DoAction(args[1], args.Length >= 3 ? args[2] : null);
     }
 
     // =====================================================================
     //  动作（键盘 / 鼠标 / 菜单共用）
     // =====================================================================
 
-    private void DoAction(string action)
+    private void DoAction(string action, string? arg = null)
     {
         var m = _mpv;
         if (m == null) return;
@@ -814,7 +796,33 @@ public partial class MainWindow : FluentWindow
             case "reload": ReloadCurrent(); break;
             case "restart": if (!_idle) m.CommandString("osd-msg-bar seek 0 absolute+exact"); break;
             case "exit-fullscreen": if (_fullscreen) ToggleFullscreen(); break;
-            case "menu": ShowContextMenuAfterRightButtonUp(); break;
+            case "menu": ShowContextMenu(); break;
+            case "aid":
+                if (arg == null) break;
+                m.SetProperty("aid", arg);
+                m.ShowText("音轨：${aid} ${current-tracks/audio/lang:} ${current-tracks/audio/title:}");
+                break;
+            case "sid":
+                if (arg == null) break;
+                m.SetProperty("sid", arg);
+                m.ShowText(arg == "no" ? "字幕：关" : "字幕：${sid} ${current-tracks/sub/lang:} ${current-tracks/sub/title:}");
+                break;
+            case "hwdec":
+                if (arg == null) break;
+                S.Hwdec = arg;
+                m.SetProperty("hwdec", arg);
+                m.ShowText("解码方式：" + (SettingsWindow.HwdecChoices.FirstOrDefault(c => c.Value == arg).Name ?? arg));
+                S.Save();
+                break;
+            case "audio-delay-dec": AdjustAudioDelay(-S.SubDelayStepMs); break;
+            case "audio-delay-inc": AdjustAudioDelay(S.SubDelayStepMs); break;
+            case "audio-delay-reset": m.SetProperty("audio-delay", 0.0); m.ShowText("音频延迟：0 ms"); break;
+            case "sub-delay-reset": m.SetProperty("sub-delay", 0.0); m.ShowText("字幕延迟：0 ms"); break;
+            case "reveal": RevealFile(m.GetString("path")); break;
+            case "load-sub": LoadSubtitle(); break;
+            case "load-audio": LoadAudioTrack(); break;
+            case "settings": OpenSettings(); break;
+            case "quit": Close(); break;
             case "hdr": SetHdr(!_hdrOn, manual: true); break;
             case "sub-delay-dec": AdjustSubDelay(-S.SubDelayStepMs); break;
             case "sub-delay-inc": AdjustSubDelay(S.SubDelayStepMs); break;
@@ -829,6 +837,16 @@ public partial class MainWindow : FluentWindow
             case "frame-step": m.CommandString("frame-step"); break;
             case "frame-back": m.CommandString("frame-back-step"); break;
         }
+    }
+
+    private void AdjustAudioDelay(int ms)
+    {
+        var m = _mpv;
+        if (m == null) return;
+        m.CommandString($"no-osd add audio-delay {(ms / 1000.0).ToString(Inv)}");
+        double d = m.GetDouble("audio-delay") ?? 0;
+        // mpv 的 audio-delay 为正表示声音推迟播放
+        m.ShowText($"音频延迟：{d * 1000:+0;-0;0} ms（{(d < 0 ? "提前" : d > 0 ? "延后" : "无")}）");
     }
 
     private void AdjustSubDelay(int ms)
@@ -987,8 +1005,14 @@ public partial class MainWindow : FluentWindow
 
     private void RevealSelected()
     {
-        if (PlaylistBox.SelectedItem is PlaylistEntry e && File.Exists(e.Path))
-            System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{e.Path}\"");
+        if (PlaylistBox.SelectedItem is PlaylistEntry e) RevealFile(e.Path);
+    }
+
+    /// <summary>在资源管理器中打开文件所在的文件夹并选中它。</summary>
+    private static void RevealFile(string? path)
+    {
+        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
+        System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{Path.GetFullPath(path)}\"");
     }
 
     private void TogglePlaylist()
@@ -1003,82 +1027,146 @@ public partial class MainWindow : FluentWindow
     //  右键菜单
     // =====================================================================
 
-    private static MenuItem Item(string header, Action? click, string? gesture = null, bool isChecked = false, bool enabled = true)
+    /// <summary>菜单项：Cmd 是点击时执行的 mpv 命令（一般是 script-message hp …，回到 DoAction 处理）。</summary>
+    private sealed record MenuEntry(string Title, string? Cmd = null, string? Shortcut = null,
+        bool Checked = false, bool Enabled = true, List<MenuEntry>? Sub = null)
     {
-        var mi = new MenuItem { Header = header, InputGestureText = gesture ?? "", IsChecked = isChecked, IsEnabled = enabled };
-        if (click != null) mi.Click += (_, _) => click();
-        return mi;
+        public bool IsSeparator => Title.Length == 0 && Cmd == null && Sub == null;
     }
 
-    private void ShowContextMenu()
+    private static readonly MenuEntry Sep = new("");
+
+    private static string Hp(string action, string? arg = null) => arg == null ? $"script-message hp {action}" : $"script-message hp {action} {arg}";
+
+    /// <summary>视频画面 / 控制栏的右键菜单内容（每次弹出时按当前状态重新生成）。</summary>
+    private List<MenuEntry> BuildContextMenu()
     {
         var m = _mpv;
-        var menu = new ContextMenu();
-        var items = menu.Items;
-        items.Add(Item("视频参数…", ShowInfo, "I"));
-        items.Add(new Separator());
-        items.Add(Item("打开文件…", OpenFiles, "Ctrl+O"));
-        items.Add(Item("加载字幕…", LoadSubtitle, enabled: !_idle));
-        items.Add(Item("加载外部音轨…", LoadAudioTrack, enabled: !_idle));
-        items.Add(Item("重新载入当前文件", ReloadCurrent, "F5", enabled: !_idle));
-        items.Add(new Separator());
+        bool playing = !_idle;
+        string? path = playing ? m?.GetString("path") : null;
+        var items = new List<MenuEntry>
+        {
+            new("视频参数…", Hp("info"), "I"),
+            new("在资源管理器中显示", Hp("reveal"), Enabled: path != null && File.Exists(path)),
+            Sep,
+            new("打开文件…", Hp("open"), "Ctrl+O"),
+            new("加载字幕…", Hp("load-sub"), Enabled: playing),
+            new("加载外部音轨…", Hp("load-audio"), Enabled: playing),
+            new("重新载入当前文件", Hp("reload"), "F5", Enabled: playing),
+            Sep,
+        };
 
-        var audioMenu = Item("音轨", null);
-        var subMenu = Item("字幕", null);
-        subMenu.Items.Add(Item("关闭字幕", () => m?.SetProperty("sid", "no"), isChecked: m?.GetString("sid") is "no" or null));
-        if (m?.GetNode("track-list") is List<object?> tracks)
+        var audio = new List<MenuEntry>();
+        var subs = new List<MenuEntry> { new("关闭字幕", Hp("sid", "no"), Checked: m?.GetString("sid") is "no" or null) };
+        if (playing && m?.GetNode("track-list") is List<object?> tracks)
         {
             foreach (var t in tracks.OfType<Dictionary<string, object?>>())
             {
                 string type = t.GetValueOrDefault("type") as string ?? "";
                 if (type != "audio" && type != "sub") continue;
                 long id = t.GetValueOrDefault("id") is long l ? l : 0;
-                string prop = type == "audio" ? "aid" : "sid";
-                var item = Item(TrackLabel(t), () => m?.SetProperty(prop, id.ToString(Inv)),
-                    isChecked: t.GetValueOrDefault("selected") is true);
-                (type == "audio" ? audioMenu : subMenu).Items.Add(item);
+                var entry = new MenuEntry(TrackText(t), Hp(type == "audio" ? "aid" : "sid", id.ToString(Inv)),
+                    Checked: t.GetValueOrDefault("selected") is true);
+                (type == "audio" ? audio : subs).Add(entry);
             }
         }
-        audioMenu.IsEnabled = audioMenu.Items.Count > 0;
-        items.Add(audioMenu);
-        items.Add(subMenu);
+        items.Add(new MenuEntry("音轨", Sub: audio, Enabled: audio.Count > 0));
+        items.Add(new MenuEntry("字幕", Sub: subs, Enabled: playing));
 
-        var delayMenu = Item("字幕延迟", null);
-        delayMenu.Items.Add(Item($"提前 {S.SubDelayStepMs} ms", () => AdjustSubDelay(-S.SubDelayStepMs), "Z"));
-        delayMenu.Items.Add(Item($"延后 {S.SubDelayStepMs} ms", () => AdjustSubDelay(S.SubDelayStepMs), "X"));
-        delayMenu.Items.Add(Item("重置", () => { m?.SetProperty("sub-delay", "0"); m?.ShowText("字幕延迟：0 ms"); }));
-        items.Add(delayMenu);
-        items.Add(new Separator());
-
-        items.Add(Item("HDR 输出", () => DoAction("hdr"), "H", isChecked: _hdrOn));
-        var decMenu = Item("解码方式", null);
-        foreach (var (val, name) in SettingsWindow.HwdecChoices)
+        // 音频 / 字幕延迟：按文件记住（见 file-states.json），所以放在这里而不是全局设置里
+        int step = S.SubDelayStepMs;
+        double ad = (m?.GetDouble("audio-delay") ?? 0) * 1000, sd = (m?.GetDouble("sub-delay") ?? 0) * 1000;
+        items.Add(new MenuEntry("音频延迟", Enabled: playing, Sub: new()
         {
-            string v = val, n = name;
-            decMenu.Items.Add(Item(n, () =>
-            {
-                S.Hwdec = v;
-                m?.SetProperty("hwdec", v);
-                m?.ShowText("解码方式：" + n);
-                S.Save();
-            }, isChecked: S.Hwdec == v));
-        }
-        items.Add(decMenu);
-        items.Add(new Separator());
-        items.Add(Item("播放列表", TogglePlaylist, "P", isChecked: PlaylistPanel.Visibility == Visibility.Visible, enabled: !_fullscreen));
-        items.Add(Item("全屏", ToggleFullscreen, "F / 双击", isChecked: _fullscreen));
-        items.Add(Item("设置…", OpenSettings));
-        items.Add(new Separator());
-        items.Add(Item("退出", Close));
+            new($"当前：{ad:+0;-0;0} ms", Enabled: false),
+            new($"提前 {step} ms", Hp("audio-delay-dec")),
+            new($"延后 {step} ms", Hp("audio-delay-inc")),
+            new("重置", Hp("audio-delay-reset")),
+        }));
+        items.Add(new MenuEntry("字幕延迟", Enabled: playing, Sub: new()
+        {
+            new($"当前：{sd:+0;-0;0} ms", Enabled: false),
+            new($"提前 {step} ms", Hp("sub-delay-dec"), "Z"),
+            new($"延后 {step} ms", Hp("sub-delay-inc"), "X"),
+            new("重置", Hp("sub-delay-reset")),
+        }));
+        items.Add(Sep);
 
-        menu.Closed += (_, _) => _menuOpen = false;
-        menu.PlacementTarget = this;
-        menu.Placement = PlacementMode.MousePoint;
-        _menuOpen = true;
-        menu.IsOpen = true;
+        items.Add(new MenuEntry("HDR 输出", Hp("hdr"), "H", Checked: _hdrOn));
+        items.Add(new MenuEntry("解码方式", Sub: SettingsWindow.HwdecChoices
+            .Select(c => new MenuEntry(c.Name, Hp("hwdec", c.Value), Checked: S.Hwdec == c.Value)).ToList()));
+        items.Add(Sep);
+        items.Add(new MenuEntry("播放列表", Hp("playlist"), "P", Checked: PlaylistPanel.Visibility == Visibility.Visible, Enabled: !_fullscreen));
+        items.Add(new MenuEntry("全屏", Hp("fullscreen"), "F / 双击", Checked: _fullscreen));
+        items.Add(new MenuEntry("设置…", Hp("settings")));
+        items.Add(Sep);
+        items.Add(new MenuEntry("退出", Hp("quit")));
+        return items;
     }
 
-    private static string TrackLabel(Dictionary<string, object?> t) => TrackText(t).Replace("_", "__");
+    /// <summary>
+    /// 弹出右键菜单。优先用 mpv 自带的原生菜单（menu-data + context-menu，mpv 0.40+）：
+    /// 它在 mpv 自己的窗口线程里用系统菜单弹出，不存在 WPF 菜单从别的线程的窗口上弹出时抢不到鼠标 / 焦点、
+    /// 一弹出就关掉的问题（之前右键画面没有菜单就是这个原因）。libmpv 太旧时退回 WPF 菜单。
+    /// </summary>
+    private void ShowContextMenu()
+    {
+        var m = _mpv;
+        if (m == null) return;
+        var items = BuildContextMenu();
+        if (m.SetPropertyNode("menu-data", ToMpvMenu(items)) >= 0 && m.Command("context-menu") >= 0) return;
+        ShowWpfMenu(items);
+    }
+
+    private static List<object?> ToMpvMenu(List<MenuEntry> items) => items.Select(e =>
+    {
+        if (e.IsSeparator) return (object?)new Dictionary<string, object?> { ["type"] = "separator" };
+        // Win32 菜单里 & 是快捷键前缀，要写成 &&
+        var d = new Dictionary<string, object?> { ["title"] = e.Title.Replace("&", "&&") };
+        if (e.Sub != null) { d["type"] = "submenu"; d["submenu"] = ToMpvMenu(e.Sub); }
+        if (e.Cmd != null) d["cmd"] = e.Cmd;
+        if (e.Shortcut != null) d["shortcut"] = e.Shortcut;
+        var state = new List<object?>();
+        if (e.Checked) state.Add("checked");
+        if (!e.Enabled) state.Add("disabled");
+        if (state.Count > 0) d["state"] = state;
+        return d;
+    }).ToList();
+
+    /// <summary>旧版 libmpv 没有原生菜单时的后备：WPF 菜单，等右键松开后再弹（按住期间鼠标归 mpv 的窗口）。</summary>
+    private void ShowWpfMenu(List<MenuEntry> items)
+    {
+        var start = DateTime.UtcNow;
+        var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(15) };
+        t.Tick += (_, _) =>
+        {
+            if (Native.IsRightButtonDown() && (DateTime.UtcNow - start).TotalSeconds < 3) return;
+            t.Stop();
+            if (_shuttingDown) return;
+            var menu = new ContextMenu();
+            foreach (var mi in ToWpfMenu(items)) menu.Items.Add(mi);
+            menu.Closed += (_, _) => _menuOpen = false;
+            menu.PlacementTarget = this;
+            menu.Placement = PlacementMode.MousePoint;
+            Activate();
+            _menuOpen = true;
+            menu.IsOpen = true;
+        };
+        t.Start();
+    }
+
+    private List<object> ToWpfMenu(List<MenuEntry> items) => items.Select(e =>
+    {
+        if (e.IsSeparator) return (object)new Separator();
+        // MenuItem 会把 “_” 当作访问键，转义一下
+        var mi = new MenuItem
+        {
+            Header = e.Title.Replace("_", "__"), InputGestureText = e.Shortcut ?? "", IsChecked = e.Checked, IsEnabled = e.Enabled,
+        };
+        if (e.Sub != null) foreach (var sub in ToWpfMenu(e.Sub)) mi.Items.Add(sub);
+        if (e.Cmd != null) { string cmd = e.Cmd; mi.Click += (_, _) => _mpv?.CommandString(cmd); }
+        return mi;
+    }).ToList();
 
     private static string TrackText(Dictionary<string, object?> t)
     {
@@ -1090,7 +1178,7 @@ public partial class MainWindow : FluentWindow
         if (t.GetValueOrDefault("demux-channel-count") is long ch) parts.Add(ch + "ch");
         if (t.GetValueOrDefault("default") is true) parts.Add("(默认)");
         if (t.GetValueOrDefault("external") is true) parts.Add("(外部)");
-        return string.Join(" ", parts); // 用于菜单时由 TrackLabel 转义 “_”（MenuItem 会把它当作访问键）
+        return string.Join(" ", parts);
     }
 
     // =====================================================================

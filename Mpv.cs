@@ -109,6 +109,10 @@ internal static class MpvNative
     public static extern int mpv_command(IntPtr ctx, IntPtr[] args);
 
     [DllImport(Lib, CallingConvention = CC)]
+    public static extern int mpv_set_property(IntPtr ctx, [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+        MpvFormat format, IntPtr data);
+
+    [DllImport(Lib, CallingConvention = CC)]
     public static extern int mpv_command_ret(IntPtr ctx, IntPtr[] args, IntPtr result);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -175,6 +179,108 @@ internal sealed class Mpv : IDisposable
         SetProperty(name, value.ToString(CultureInfo.InvariantCulture));
 
     public int SetProperty(string name, bool value) => SetProperty(name, value ? "yes" : "no");
+
+    /// <summary>
+    /// 以 MPV_FORMAT_NODE 设置属性（如 menu-data，它不接受字符串）。value 可以是
+    /// string / bool / int / long / double / IList&lt;object?&gt; / IDictionary&lt;string, object?&gt; 的任意嵌套。
+    /// mpv 会复制一份数据，调用结束后这里分配的内存全部释放。
+    /// </summary>
+    public int SetPropertyNode(string name, object? value)
+    {
+        if (!IsAlive) return -1;
+        var allocs = new List<IntPtr>();
+        try
+        {
+            IntPtr node = Alloc(allocs, NodeSize);
+            WriteNode(node, value, allocs);
+            return MpvNative.mpv_set_property(_ctx, name, MpvFormat.Node, node);
+        }
+        finally
+        {
+            foreach (var p in allocs) Marshal.FreeHGlobal(p);
+        }
+    }
+
+    // mpv_node：8 字节 union + 4 字节 format（按 8 对齐共 16 字节）
+    // mpv_node_list：int num（补齐到 8）+ mpv_node* values + char** keys，共 24 字节
+    private const int NodeSize = 16, NodeListSize = 24;
+
+    private static IntPtr Alloc(List<IntPtr> allocs, int size)
+    {
+        IntPtr p = Marshal.AllocHGlobal(size);
+        allocs.Add(p);
+        for (int i = 0; i < size; i++) Marshal.WriteByte(p, i, 0);
+        return p;
+    }
+
+    private static IntPtr Utf8(List<IntPtr> allocs, string s)
+    {
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(s);
+        IntPtr p = Alloc(allocs, bytes.Length + 1);
+        Marshal.Copy(bytes, 0, p, bytes.Length);
+        return p;
+    }
+
+    private static void WriteNode(IntPtr dst, object? value, List<IntPtr> allocs)
+    {
+        MpvFormat format;
+        switch (value)
+        {
+            case null:
+                format = MpvFormat.None;
+                break;
+            case string s:
+                Marshal.WriteIntPtr(dst, Utf8(allocs, s));
+                format = MpvFormat.String;
+                break;
+            case bool b:
+                Marshal.WriteInt32(dst, b ? 1 : 0);
+                format = MpvFormat.Flag;
+                break;
+            case int or long:
+                Marshal.WriteInt64(dst, Convert.ToInt64(value, CultureInfo.InvariantCulture));
+                format = MpvFormat.Int64;
+                break;
+            case double d:
+                Marshal.WriteInt64(dst, BitConverter.DoubleToInt64Bits(d));
+                format = MpvFormat.Double;
+                break;
+            case IDictionary<string, object?> map:
+            {
+                IntPtr list = Alloc(allocs, NodeListSize);
+                IntPtr values = Alloc(allocs, Math.Max(1, map.Count) * NodeSize);
+                IntPtr keys = Alloc(allocs, Math.Max(1, map.Count) * IntPtr.Size);
+                int i = 0;
+                foreach (var kv in map)
+                {
+                    Marshal.WriteIntPtr(keys, i * IntPtr.Size, Utf8(allocs, kv.Key));
+                    WriteNode(values + i * NodeSize, kv.Value, allocs);
+                    i++;
+                }
+                Marshal.WriteInt32(list, 0, map.Count);
+                Marshal.WriteIntPtr(list, 8, values);
+                Marshal.WriteIntPtr(list, 16, keys);
+                Marshal.WriteIntPtr(dst, list);
+                format = MpvFormat.NodeMap;
+                break;
+            }
+            case System.Collections.IList arr:
+            {
+                IntPtr list = Alloc(allocs, NodeListSize);
+                IntPtr values = Alloc(allocs, Math.Max(1, arr.Count) * NodeSize);
+                for (int i = 0; i < arr.Count; i++) WriteNode(values + i * NodeSize, arr[i], allocs);
+                Marshal.WriteInt32(list, 0, arr.Count);
+                Marshal.WriteIntPtr(list, 8, values);
+                Marshal.WriteIntPtr(list, 16, IntPtr.Zero);
+                Marshal.WriteIntPtr(dst, list);
+                format = MpvFormat.NodeArray;
+                break;
+            }
+            default:
+                throw new ArgumentException("不支持的 mpv node 类型：" + value.GetType());
+        }
+        Marshal.WriteInt32(dst, 8, (int)format);
+    }
 
     public string? GetString(string name)
     {

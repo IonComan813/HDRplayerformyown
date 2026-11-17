@@ -8,11 +8,11 @@ internal sealed class AppSettings
 {
     // ---- HDR ----
     // HDR 输出的开 / 关不保存：启动时跟随 Windows 当前的“使用 HDR”状态，空着启动不会去改系统设置。
-    /// <summary>按片源自动切换 HDR 输出：HDR 片源开启、SDR 片源关闭（必要时同时切换 Windows HDR）。</summary>
-    public bool AutoHdrForHdrVideo { get; set; } = true;
-    /// <summary>开关 HDR 输出（手动或自动）时，同时切换 Windows 的“使用 HDR”。</summary>
-    public bool AutoSwitchWindowsHdr { get; set; } = true;
-    public bool RestoreWindowsHdrOnExit { get; set; } = true;
+    /// <summary>
+    /// 由软件自动管理系统 HDR：HDR 片源开始播放时自动打开 Windows 的“使用 HDR”，SDR 片源自动关闭。
+    /// 关闭则只在手动按 H / 点控制栏的 HDR 按钮时切换。两种情况下退出时都把 Windows HDR 还原为启动前的状态。
+    /// </summary>
+    public bool AutoManageHdr { get; set; } = true;
     /// <summary>0 = 自动读取显示器 EDID 上报的峰值亮度</summary>
     public int TargetPeakNits { get; set; } = 0;
     public string ToneMapping { get; set; } = "auto";
@@ -38,7 +38,7 @@ internal sealed class AppSettings
     public string AudioDevice { get; set; } = "auto";
     public bool DownmixToStereo { get; set; } = true;
     public bool NormalizeDownmix { get; set; } = false;
-    public string AudioLanguages { get; set; } = "";
+    public string AudioLanguages { get; set; } = "eng,en";
     public double Volume { get; set; } = 100;
 
     // ---- 字幕 ----
@@ -77,15 +77,32 @@ internal sealed class AppSettings
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = true };
 
+    /// <summary>设置文件格式版本，用于升级时调整旧设置的默认值。</summary>
+    public int SettingsVersion { get; set; }
+    private const int CurrentVersion = 2;
+
     public static AppSettings Load()
     {
+        AppSettings s;
         try
         {
-            if (File.Exists(FilePath))
-                return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath)) ?? new AppSettings();
+            s = File.Exists(FilePath)
+                ? JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath)) ?? new AppSettings()
+                : new AppSettings();
         }
-        catch { /* 设置文件损坏时使用默认值 */ }
-        return new AppSettings();
+        catch { s = new AppSettings(); /* 设置文件损坏时使用默认值 */ }
+        s.Migrate();
+        return s;
+    }
+
+    private void Migrate()
+    {
+        if (SettingsVersion < 2)
+        {
+            // 旧版本首选音轨语言默认是空的；新默认是英语
+            if (string.IsNullOrWhiteSpace(AudioLanguages)) AudioLanguages = "eng,en";
+        }
+        SettingsVersion = CurrentVersion;
     }
 
     public void Save()

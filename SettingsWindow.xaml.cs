@@ -36,6 +36,47 @@ public partial class SettingsWindow : FluentWindow
         ("strip", "剥离 RPU，只播放 HDR10 / HLG 基础层"),
     };
 
+    private static readonly (string, string)[] AudioLanguageChoices =
+    {
+        ("eng,en", "英语"),
+        ("chi,zho,chs,cht,zh,zh-Hans,zh-Hant,cmn,yue", "中文（普通话 / 粤语）"),
+        ("jpn,ja", "日语"),
+        ("kor,ko", "韩语"),
+        ("", "不指定（用文件标记的默认音轨）"),
+    };
+
+    /// <summary>字幕字体：先列常用的中文字体（装了的才列），再列其余已安装字体；显示中文名（如果有）+ 英文名。</summary>
+    private static (string Value, string Name)[] FontChoices()
+    {
+        string[] preferred =
+        {
+            "Microsoft YaHei", "Microsoft YaHei UI", "DengXian", "SimHei", "SimSun", "KaiTi", "FangSong",
+            "Source Han Sans SC", "Noto Sans CJK SC", "Noto Sans SC", "Sarasa Gothic SC", "LXGW WenKai",
+            "HarmonyOS Sans SC", "MiSans", "Segoe UI", "Arial",
+        };
+        var zh = System.Windows.Markup.XmlLanguage.GetLanguage("zh-cn");
+        var installed = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            foreach (var f in System.Windows.Media.Fonts.SystemFontFamilies)
+            {
+                string en = f.Source;
+                if (string.IsNullOrEmpty(en) || installed.ContainsKey(en)) continue;
+                string label = f.FamilyNames.TryGetValue(zh, out var local) && !string.Equals(local, en, StringComparison.OrdinalIgnoreCase)
+                    ? $"{local}（{en}）" : en;
+                installed[en] = label;
+            }
+        }
+        catch { /* 枚举失败就只给常用列表 */ }
+        var list = new List<(string, string)>();
+        foreach (var name in preferred)
+            if (installed.TryGetValue(name, out var label)) list.Add((name, label));
+        foreach (var kv in installed.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase))
+            if (!preferred.Contains(kv.Key, StringComparer.OrdinalIgnoreCase)) list.Add((kv.Key, kv.Value));
+        if (list.Count == 0) list.Add(("Microsoft YaHei", "微软雅黑（Microsoft YaHei）"));
+        return list.ToArray();
+    }
+
     private static readonly (string, string)[] PeakDetectChoices =
         { ("auto", "自动"), ("yes", "开"), ("no", "关") };
 
@@ -121,14 +162,12 @@ public partial class SettingsWindow : FluentWindow
             : "无法读取显示器 HDR 信息";
         AddNote(p, disp);
 
-        AddToggle(p, "按片源自动切换 HDR",
-            "HDR10 / HDR10+ / HLG / 杜比视界片源开始播放时自动开启 HDR，SDR 片源自动关闭。空着启动播放器不会改动系统设置。",
-            _s.AutoHdrForHdrVideo, v => _s.AutoHdrForHdrVideo = v);
-        AddToggle(p, "开关 HDR 时同时切换 Windows 的“使用 HDR”",
-            "自动切换和手动按 H / 点 HDR 按钮都会切换系统 HDR。关闭此项则只改播放器的输出方式。",
-            _s.AutoSwitchWindowsHdr, v => _s.AutoSwitchWindowsHdr = v);
-        AddToggle(p, "退出时恢复原来的 Windows HDR 状态", "本次运行中播放器切换过 Windows HDR 时，退出后还原为启动前的状态。",
-            _s.RestoreWindowsHdrOnExit, v => _s.RestoreWindowsHdrOnExit = v);
+        AddToggle(p, "由软件自动管理系统 HDR 开关",
+            "开：打开 HDR 视频（HDR10 / HDR10+ / HLG / 杜比视界）时自动开启 Windows 的“使用 HDR”，打开 SDR 视频时自动关闭；" +
+            "空着启动播放器不会改动系统设置。\n" +
+            "关：始终由你手动点控制栏的 HDR / SDR 按钮（或按 H）切换。\n" +
+            "两种方式下，退出播放器时都会把 Windows HDR 还原为启动前的状态。",
+            _s.AutoManageHdr, v => _s.AutoManageHdr = v);
         AddCombo(p, "杜比视界", "应用 RPU 需要 vo=gpu-next（本播放器默认）；Profile 7 双层片源的增强层由新版 mpv 自动处理",
             DolbyVisionChoices, _s.DolbyVisionMode, v => _s.DolbyVisionMode = v);
         AddNumber(p, "目标峰值亮度 (nit)", "0 = 读取显示器 EDID 上报的峰值", _s.TargetPeakNits, 0, 10000, 50,
@@ -181,22 +220,21 @@ public partial class SettingsWindow : FluentWindow
         AddCombo(p, "输出设备", null, devices.ToArray(), _s.AudioDevice, v => _s.AudioDevice = v);
         AddToggle(p, "多声道下混到立体声", "5.1 / 7.1 → 2.0", _s.DownmixToStereo, v => _s.DownmixToStereo = v);
         AddToggle(p, "下混时归一化", "防削波，但整体音量会变小", _s.NormalizeDownmix, v => _s.NormalizeDownmix = v);
-        AddText(p, "首选音轨语言", "如 chi,jpn,eng。" + ReloadNote, _s.AudioLanguages, v => _s.AudioLanguages = v);
-        double ad = (_mpv.GetDouble("audio-delay") ?? 0) * 1000;
-        AddLiveNumber(p, "音频延迟 (ms)", "即时生效", ad, -10000, 10000, 10, v => _mpv.SetProperty("audio-delay", v / 1000.0));
+        AddCombo(p, "首选音轨语言", "有多条音轨时优先选这种语言。" + ReloadNote, AudioLanguageChoices, _s.AudioLanguages,
+            v => _s.AudioLanguages = v);
+        AddNote(p, "音频延迟按文件记忆，在画面右键菜单 → 音频延迟 里调整。");
         return p;
     }
 
     private StackPanel BuildSubPage()
     {
         var p = NewPage("字幕");
-        double sd = (_mpv.GetDouble("sub-delay") ?? 0) * 1000;
-        AddLiveNumber(p, "字幕延迟 (ms)", "负数 = 提前，即时生效", sd, -60000, 60000, 50, v => _mpv.SetProperty("sub-delay", v / 1000.0));
-        AddText(p, "字体", "SRT 等纯文本字幕使用", _s.SubFont, v => _s.SubFont = v);
+        AddCombo(p, "字体", "SRT 等纯文本字幕使用（ASS 字幕自带字体样式）", FontChoices(), _s.SubFont, v => _s.SubFont = v);
         AddNumber(p, "字号", null, _s.SubFontSize, 10, 120, 1, v => _s.SubFontSize = (int)v);
         AddCombo(p, "自动加载外挂字幕", ReloadNote, SubAutoChoices, _s.SubAuto, v => _s.SubAuto = v);
         AddText(p, "首选字幕语言", ReloadNote, _s.SubLanguages, v => _s.SubLanguages = v);
-        AddNote(p, "把字幕文件直接拖到画面上即可加载。快捷键：Z 提前 / X 延后 / V 显示开关 / J 切换字幕轨。");
+        AddNote(p, "把字幕文件直接拖到画面上即可加载。字幕延迟按文件记忆，在画面右键菜单 → 字幕延迟 里调整。\n" +
+                   "快捷键：Z 提前 / X 延后 / V 显示开关 / J 切换字幕轨。");
         return p;
     }
 
@@ -215,7 +253,8 @@ public partial class SettingsWindow : FluentWindow
         AddToggle(p, "进度条悬停预览缩略图", "后台另开一个不出画面的 mpv 实例截图；仅本地文件。HDR 片源的缩略图高光会被裁切",
             _s.SeekThumbnails, v => _s.SeekThumbnails = v);
         AddNumber(p, "音量步进", null, _s.VolumeStep, 1, 50, 1, v => _s.VolumeStep = v);
-        AddNumber(p, "字幕延迟步进 (ms)", null, _s.SubDelayStepMs, 10, 5000, 10, v => _s.SubDelayStepMs = (int)v);
+        AddNumber(p, "延迟调整步进 (ms)", "右键菜单里的音频 / 字幕延迟，以及 Z / X 每次调整多少", _s.SubDelayStepMs, 10, 5000, 10,
+            v => _s.SubDelayStepMs = (int)v);
         var assocBtn = new Wpf.Ui.Controls.Button { Content = "打开默认应用设置", Icon = new SymbolIcon { Symbol = SymbolRegular.Open24 } };
         assocBtn.Click += (_, _) =>
         {
@@ -315,13 +354,6 @@ public partial class SettingsWindow : FluentWindow
         var nb = NewNumber(value, min, max, step);
         AddCard(page, title, description, nb);
         _commit.Add(() => setter(ReadNumber(nb, value)));
-    }
-
-    private static void AddLiveNumber(Panel page, string title, string? description, double value, double min, double max, double step, Action<double> apply)
-    {
-        var nb = NewNumber(value, min, max, step);
-        nb.ValueChanged += (_, _) => { if (nb.Value is double v) apply(v); };
-        AddCard(page, title, description, nb);
     }
 
     private void AddText(Panel page, string title, string? description, string value, Action<string> setter)
