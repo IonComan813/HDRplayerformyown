@@ -36,26 +36,6 @@ public partial class SettingsWindow : FluentWindow
         ("strip", "剥离 RPU，只播放 HDR10 / HLG 基础层"),
     };
 
-    // 每个选项背后是一串语言代码：片源里的语言标记五花八门（ISO 639-2 的 chi / zho、639-1 的 zh、
-    // BCP 47 的 zh-Hans、民间常用的 chs / cht……），所以一种语言要列多个代码。mpv 按顺序依次匹配，用第一个找得到的。
-    private static readonly (string, string)[] AudioLanguageChoices =
-    {
-        ("eng,en", "英语"),
-        ("chi,zho,chs,cht,zh,zh-Hans,zh-Hant,cmn,yue", "中文（普通话 / 粤语）"),
-        ("jpn,ja", "日语"),
-        ("kor,ko", "韩语"),
-    };
-
-    private static readonly (string, string)[] SubLanguageChoices =
-    {
-        ("chi,zho,chs,zh,zh-Hans,eng,en", "中文，没有就用英语"),
-        ("chs,sc,zh-Hans,zh-CN,chi,zho,zh", "简体中文"),
-        ("cht,tc,zh-Hant,zh-TW,zh-HK,chi,zho,zh", "繁体中文"),
-        ("eng,en", "英语"),
-        ("jpn,ja", "日语"),
-        ("kor,ko", "韩语"),
-    };
-
     /// <summary>字幕字体：先列常用的中文字体（装了的才列），再列其余已安装字体；显示中文名（如果有）+ 英文名。</summary>
     private static (string Value, string Name)[] FontChoices()
     {
@@ -231,8 +211,10 @@ public partial class SettingsWindow : FluentWindow
         AddCombo(p, "输出设备", null, devices.ToArray(), _s.AudioDevice, v => _s.AudioDevice = v);
         AddToggle(p, "多声道下混到立体声", "5.1 / 7.1 → 2.0", _s.DownmixToStereo, v => _s.DownmixToStereo = v);
         AddToggle(p, "下混时归一化", "防削波，但整体音量会变小", _s.NormalizeDownmix, v => _s.NormalizeDownmix = v);
-        AddLanguagePicker(p, "首选音轨语言", "有多条音轨时优先选这种语言。" + ReloadNote, AudioLanguageChoices, _s.AudioLanguages,
-            v => _s.AudioLanguages = v);
+        AddLanguagePicker(p, "首选音轨语言",
+            "有多条音轨时优先选这种语言；选的不是英语时，找不到这种语言就用英语音轨。" +
+            "手动输入则完全按你填的顺序匹配，不会自动回退。" + ReloadNote,
+            LanguagePresets.Audio, _s.AudioLanguages, v => _s.AudioLanguages = v);
         AddNote(p, "音频延迟按文件记忆，在画面右键菜单 → 音频延迟 里调整。");
         return p;
     }
@@ -243,8 +225,10 @@ public partial class SettingsWindow : FluentWindow
         AddCombo(p, "字体", "SRT 等纯文本字幕使用（ASS 字幕自带字体样式）", FontChoices(), _s.SubFont, v => _s.SubFont = v);
         AddNumber(p, "字号", null, _s.SubFontSize, 10, 120, 1, v => _s.SubFontSize = (int)v);
         AddCombo(p, "自动加载外挂字幕", ReloadNote, SubAutoChoices, _s.SubAuto, v => _s.SubAuto = v);
-        AddLanguagePicker(p, "首选字幕语言", "有多条字幕轨时优先选这种语言。" + ReloadNote, SubLanguageChoices, _s.SubLanguages,
-            v => _s.SubLanguages = v);
+        AddLanguagePicker(p, "首选字幕语言",
+            "有多条字幕轨时优先选这种语言。简体中文找不到就用繁体中文，繁体中文找不到就用简体中文，都没有就用英语；" +
+            "其它语言找不到也用英语。手动输入则完全按你填的顺序匹配，不会自动回退。" + ReloadNote,
+            LanguagePresets.Subtitle, _s.SubLanguages, v => _s.SubLanguages = v);
         AddNote(p, "把字幕文件直接拖到画面上即可加载。字幕延迟按文件记忆，在画面右键菜单 → 字幕延迟 里调整。\n" +
                    "快捷键：Z 提前 / X 延后 / V 显示开关 / J 切换字幕轨。");
         return p;

@@ -38,14 +38,14 @@ internal sealed class AppSettings
     public string AudioDevice { get; set; } = "auto";
     public bool DownmixToStereo { get; set; } = true;
     public bool NormalizeDownmix { get; set; } = false;
-    public string AudioLanguages { get; set; } = "eng,en";
+    public string AudioLanguages { get; set; } = LanguagePresets.DefaultAudio;
     public double Volume { get; set; } = 100;
 
     // ---- 字幕 ----
     public string SubFont { get; set; } = "Microsoft YaHei";
     public int SubFontSize { get; set; } = 44;
     public string SubAuto { get; set; } = "fuzzy";
-    public string SubLanguages { get; set; } = "chi,zho,chs,zh,zh-Hans,eng,en";
+    public string SubLanguages { get; set; } = LanguagePresets.DefaultSubtitle;
 
     // ---- 操作 ----
     public double SeekStep { get; set; } = 5;
@@ -87,7 +87,7 @@ internal sealed class AppSettings
 
     /// <summary>设置文件格式版本，用于升级时调整旧设置的默认值。</summary>
     public int SettingsVersion { get; set; }
-    private const int CurrentVersion = 2;
+    private const int CurrentVersion = 3;
 
     public static AppSettings Load()
     {
@@ -109,6 +109,12 @@ internal sealed class AppSettings
         {
             // 旧版本首选音轨语言默认是空的；新默认是英语
             if (string.IsNullOrWhiteSpace(AudioLanguages)) AudioLanguages = "eng,en";
+        }
+        if (SettingsVersion < 3)
+        {
+            // 语言预设加入了回退规则（简体 ↔ 繁体 → 英语、其它语言 → 英语），把旧预设换成新的；手动输入的不动
+            if (LanguagePresets.Upgrades.TryGetValue(NormalizeLanguageList(SubLanguages), out var sub)) SubLanguages = sub;
+            if (LanguagePresets.Upgrades.TryGetValue(NormalizeLanguageList(AudioLanguages), out var aud)) AudioLanguages = aud;
         }
         SettingsVersion = CurrentVersion;
     }
