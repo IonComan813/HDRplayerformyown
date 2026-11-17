@@ -10,6 +10,13 @@ public partial class App : Application
     {
         base.OnStartup(e);
 
+        // 以管理员身份被调用来写“默认关联配置”策略（见 DefaultApps），做完就退出，不加载 mpv
+        if (e.Args.Length > 0 && (e.Args[0] == DefaultApps.ApplyArg || e.Args[0] == DefaultApps.RemoveArg))
+        {
+            Shutdown(DefaultApps.HandleCommandLine(e.Args));
+            return;
+        }
+
         string dll = Path.Combine(AppContext.BaseDirectory, "libmpv-2.dll");
         if (!File.Exists(dll) || !NativeLibrary.TryLoad(dll, out _))
         {

@@ -251,18 +251,7 @@ public partial class SettingsWindow : FluentWindow
         AddNumber(p, "音量步进", null, _s.VolumeStep, 1, 50, 1, v => _s.VolumeStep = v);
         AddNumber(p, "延迟调整步进 (ms)", "右键菜单里的音频 / 字幕延迟，以及 Z / X 每次调整多少", _s.SubDelayStepMs, 10, 5000, 10,
             v => _s.SubDelayStepMs = (int)v);
-        var assocBtn = new Wpf.Ui.Controls.Button { Content = "打开默认应用设置", Icon = new SymbolIcon { Symbol = SymbolRegular.Open24 } };
-        assocBtn.Click += (_, _) =>
-        {
-            // 用安装版时直接跳到 HdrPlayer 的页面（Windows 11），页面顶部“设为默认值”一键设置安装时勾选的后缀
-            try
-            {
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
-                    "ms-settings:defaultapps?registeredAppUser=HdrPlayer") { UseShellExecute = true });
-            }
-            catch { }
-        };
-        AddCard(p, "用 HdrPlayer 打开视频文件", "安装版：在打开的页面点顶部的“设为默认值”。Windows 不允许程序自己修改默认程序", assocBtn);
+        AddDefaultAppCards(p);
         AddNote(p,
             "空格 播放/暂停　←/→ 快退/快进　Shift+←/→ 大步跳转\n" +
             "↑/↓/滚轮 音量　M 静音　F/回车/双击 全屏　Esc 退出全屏\n" +
@@ -396,5 +385,67 @@ public partial class SettingsWindow : FluentWindow
         var lbl = new TextBlock { Text = text, FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(4, 8, 4, 12) };
         lbl.SetResourceReference(TextBlock.ForegroundProperty, "TextFillColorSecondaryBrush");
         page.Children.Add(lbl);
+    }
+
+    // ------------------------------------------------------------------ 默认播放器
+
+    private void AddDefaultAppCards(Panel p)
+    {
+        var status = new TextBlock { FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(4, 0, 4, 8) };
+        status.SetResourceReference(TextBlock.ForegroundProperty, "TextFillColorSecondaryBrush");
+
+        var setBtn = new Wpf.Ui.Controls.Button
+        {
+            Content = "一键设为默认", Appearance = ControlAppearance.Primary,
+            Icon = new SymbolIcon { Symbol = SymbolRegular.Shield24 },
+        };
+        var undoBtn = new Wpf.Ui.Controls.Button { Content = "取消", Margin = new Thickness(8, 0, 0, 0) };
+        void Refresh()
+        {
+            bool on = DefaultApps.PolicyActive();
+            undoBtn.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+            status.Text = on
+                ? "已设置：注销并重新登录（或重启）后，" + string.Join(" ", DefaultApps.ChosenExtensions()) +
+                  " 由 HdrPlayer 打开。设置期间 Windows 每次登录都会恢复成 HdrPlayer，想改用别的播放器请先点“取消”。"
+                : "";
+            status.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        }
+        setBtn.Click += async (_, _) =>
+        {
+            var exts = DefaultApps.ChosenExtensions();
+            try { DefaultApps.RegisterForCurrentUser(exts); } catch { }
+            string? err = DefaultApps.RunElevated(DefaultApps.ApplyArg, exts);
+            Refresh();
+            if (err != null) await Dialogs.ShowAsync(this, "设为默认播放器", "没有完成：" + err);
+            else await Dialogs.ShowAsync(this, "设为默认播放器",
+                "已写入 Windows 的默认关联配置。注销并重新登录（或重启）后生效。" +
+                (DefaultApps.IsHomeEdition() ? "\n\n注意：这台电脑是 Windows 家庭版，微软官方只在专业版 / 企业版 / 教育版上支持这个设置，可能不生效；不生效时请用“打开默认应用设置”。" : ""));
+        };
+        undoBtn.Click += async (_, _) =>
+        {
+            string? err = DefaultApps.RunElevated(DefaultApps.RemoveArg);
+            Refresh();
+            if (err != null) await Dialogs.ShowAsync(this, "取消默认播放器设置", "没有完成：" + err);
+        };
+        var row = new StackPanel { Orientation = Orientation.Horizontal };
+        row.Children.Add(setBtn);
+        row.Children.Add(undoBtn);
+        AddCard(p, "用 HdrPlayer 打开视频文件",
+            "一次设置所有视频后缀（安装时勾选的；便携版用常见后缀）。用的是 Windows 给企业管理员的“默认关联配置文件”，" +
+            "需要管理员权限，注销重新登录后生效", row);
+        p.Children.Add(status);
+        Refresh();
+
+        var openBtn = new Wpf.Ui.Controls.Button { Content = "打开默认应用设置", Icon = new SymbolIcon { Symbol = SymbolRegular.Open24 } };
+        openBtn.Click += (_, _) =>
+        {
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                    "ms-settings:defaultapps?registeredAppUser=HdrPlayer") { UseShellExecute = true });
+            }
+            catch { }
+        };
+        AddCard(p, "手动设置", "不想用上面的方式时：在 Windows 设置里 HdrPlayer 的页面点“设为默认值”，或逐个后缀选择", openBtn);
     }
 }

@@ -7,7 +7,9 @@
 
 **安装版**：从 Release 下载 `HdrPlayer-<版本>-win-x64-setup.exe`，不需要管理员权限，安装包已带 libmpv（也需要下面第 1 步的 .NET 运行时）。
 安装时会列出所有支持的视频后缀，逐个勾选要用 HdrPlayer 打开的；所有后缀都会出现在右键“打开方式”里。`.ts` 默认不勾，因为 TypeScript 源文件也用这个后缀。
-Windows 10/11 不允许安装程序直接修改默认程序，所以安装完成时会打开 HdrPlayer 的“默认应用”页面，点顶部的 **“设为默认值”**，勾选的后缀就都改用 HdrPlayer 打开（以后也可以从 设置 → 操作 → 打开默认应用设置 进入）。
+**一键设为默认播放器**：安装完成页勾选“一键设为默认播放器”（或以后在 设置 → 操作 → “一键设为默认”），确认一次管理员权限，**注销并重新登录（或重启）**后，勾选的后缀就全部用 HdrPlayer 打开，不用在 Windows 设置里逐个后缀点。
+原理：Windows 10/11 不允许程序直接写用户的默认程序选择（带系统校验，新版 Windows 11 还换成了带机器标识的 UserChoiceLatest），这里用的是微软给企业管理员的正规机制——组策略“设置默认关联配置文件”（`HKLM\SOFTWARE\Policies\Microsoft\Windows\System\DefaultAssociationsConfiguration` 指向 `C:\ProgramData\HdrPlayer\DefaultAssociations.xml`），由 Windows 自己在登录时应用。不伪造系统校验，所以不怕系统更新改算法。
+注意：策略生效期间，每次登录 Windows 都会把这些后缀恢复成 HdrPlayer；想换回别的播放器，先在设置里点“取消”（卸载时也会自动撤销）。微软官方只支持专业版 / 企业版 / 教育版，家庭版可能无效，可改用设置里的“打开默认应用设置”手动设置。
 要增删后缀，改 `installer/gen_iss.py` 里的列表后重新生成 `HdrPlayer.iss`。
 
 **便携版 / 自己编译**：
