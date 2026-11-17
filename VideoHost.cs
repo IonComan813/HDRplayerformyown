@@ -6,13 +6,49 @@ namespace HdrPlayer;
 /// <summary>
 /// 给 mpv 用的原生子窗口（mpv 通过 wid 在里面创建自己的渲染窗口）。
 /// HDR 需要 mpv 自己的 D3D11 交换链直接输出 PQ/BT.2020，所以不能把画面画进 WPF，只能嵌原生窗口。
+///
+/// 鼠标输入在这里处理，而不是交给 mpv：mpv 在 Windows 上嵌入（wid）时会对自己的子窗口调用
+/// EnableWindow(FALSE)（见 mpv video/out/w32_common.c），被禁用的子窗口收不到任何鼠标消息，
+/// 系统把它们转给父窗口，也就是这个窗口。所以 mpv 的 MBTN_* 绑定在嵌入时根本不会触发，
+/// 之前画面上右键没有菜单就是这个原因。这个窗口和 WPF 在同一个线程，可以直接弹 WPF 菜单。
 /// </summary>
 public sealed class VideoHost : HwndHost
 {
     private const string ClassName = "HdrPlayerVideoHost";
     private static bool _classRegistered;
+    // 窗口过程委托必须一直被引用，否则 GC 回收后原生代码再调用就会崩溃
+    private static readonly Native.WndProc WndProcDelegate = StaticWndProc;
+    private static readonly Dictionary<IntPtr, VideoHost> Instances = new();
 
     public IntPtr Hwnd { get; private set; }
+
+    /// <summary>左键单击（松开时触发；双击的两次单击也会各触发一次，由使用方按时间区分）。</summary>
+    public event Action? LeftClick;
+    public event Action? LeftDoubleClick;
+    /// <summary>右键松开：弹出菜单。</summary>
+    public event Action? RightClick;
+    public event Action? MiddleClick;
+    /// <summary>滚轮，参数为 WHEEL_DELTA 的倍数（向上为正）。</summary>
+    public event Action<int>? Wheel;
+
+    private bool _hideCursor;
+    /// <summary>为 true 时鼠标指针停在画面上不显示（和悬浮控制栏一起隐藏）。</summary>
+    public bool HideCursor
+    {
+        get => _hideCursor;
+        set
+        {
+            if (_hideCursor == value) return;
+            _hideCursor = value;
+            // WM_SETCURSOR 只在鼠标移动时才发，静止时隐藏 / 显示要立刻设置一次
+            if (Hwnd != IntPtr.Zero && IsCursorOver())
+                Native.SetCursor(value ? IntPtr.Zero : Native.LoadCursor(IntPtr.Zero, Native.IDC_ARROW));
+        }
+    }
+
+    private bool IsCursorOver() =>
+        Native.GetCursorPos(out var p) && Native.GetWindowRect(Hwnd, out var r) && r.Contains(p) &&
+        Native.WindowFromPoint(p) == Hwnd;
 
     protected override HandleRef BuildWindowCore(HandleRef hwndParent)
     {
@@ -21,13 +57,73 @@ public sealed class VideoHost : HwndHost
             Native.WS_CHILD | Native.WS_VISIBLE | Native.WS_CLIPCHILDREN | Native.WS_CLIPSIBLINGS,
             0, 0, 1, 1, hwndParent.Handle, IntPtr.Zero, Native.GetModuleHandle(null), IntPtr.Zero);
         if (Hwnd == IntPtr.Zero) throw new InvalidOperationException("创建视频窗口失败：" + Marshal.GetLastWin32Error());
+        Instances[Hwnd] = this;
         return new HandleRef(this, Hwnd);
     }
 
     protected override void DestroyWindowCore(HandleRef hwnd)
     {
+        Instances.Remove(hwnd.Handle);
         Native.DestroyWindow(hwnd.Handle);
         Hwnd = IntPtr.Zero;
+    }
+
+    private static IntPtr StaticWndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
+    {
+        try
+        {
+            if (Instances.TryGetValue(hwnd, out var host) && host.HandleMessage(msg, wParam, lParam, out IntPtr result))
+                return result;
+        }
+        catch (Exception ex)
+        {
+            // 异常不能穿过原生窗口过程，交给 WPF 的全局异常处理
+            System.Windows.Application.Current?.Dispatcher.BeginInvoke(new Action(() => throw new InvalidOperationException("视频窗口消息处理出错", ex)));
+        }
+        return Native.DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+
+    private bool HandleMessage(uint msg, IntPtr wParam, IntPtr lParam, out IntPtr result)
+    {
+        result = IntPtr.Zero;
+        switch (msg)
+        {
+            case Native.WM_LBUTTONDOWN:
+            case Native.WM_RBUTTONDOWN:
+            case Native.WM_MBUTTONDOWN:
+                // 按住时移出画面也能收到松开
+                Native.SetCapture(Hwnd);
+                return true;
+            case Native.WM_LBUTTONUP:
+                Native.ReleaseCapture();
+                if (IsCursorOver()) LeftClick?.Invoke();
+                return true;
+            case Native.WM_LBUTTONDBLCLK:
+                Native.SetCapture(Hwnd);
+                LeftDoubleClick?.Invoke();
+                return true;
+            case Native.WM_RBUTTONUP:
+                Native.ReleaseCapture();
+                // 不交给 DefWindowProc，否则它还会再发一个 WM_CONTEXTMENU
+                if (IsCursorOver()) RightClick?.Invoke();
+                return true;
+            case Native.WM_MBUTTONUP:
+                Native.ReleaseCapture();
+                if (IsCursorOver()) MiddleClick?.Invoke();
+                return true;
+            case Native.WM_MOUSEWHEEL:
+                Wheel?.Invoke((short)((wParam.ToInt64() >> 16) & 0xFFFF));
+                return true;
+            case Native.WM_SETCURSOR:
+                if (_hideCursor && (lParam.ToInt64() & 0xFFFF) == Native.HTCLIENT)
+                {
+                    Native.SetCursor(IntPtr.Zero);
+                    result = new IntPtr(1);
+                    return true;
+                }
+                return false;
+        }
+        return false;
     }
 
     private static void RegisterClass()
@@ -36,9 +132,8 @@ public sealed class VideoHost : HwndHost
         var wc = new Native.WNDCLASSEX
         {
             cbSize = (uint)Marshal.SizeOf<Native.WNDCLASSEX>(),
-            style = 0,
-            // 窗口过程直接用 DefWindowProcW，不需要托管委托（也就不存在被 GC 回收的问题）
-            lpfnWndProc = Native.GetProcAddress(Native.GetModuleHandle("user32.dll"), "DefWindowProcW"),
+            style = Native.CS_DBLCLKS,
+            lpfnWndProc = Marshal.GetFunctionPointerForDelegate(WndProcDelegate),
             hInstance = Native.GetModuleHandle(null),
             hCursor = Native.LoadCursor(IntPtr.Zero, Native.IDC_ARROW),
             hbrBackground = Native.GetStockObject(Native.BLACK_BRUSH),
@@ -58,6 +153,21 @@ internal static class Native
     public const long WS_EX_TOOLWINDOW = 0x80, WS_EX_NOACTIVATE = 0x08000000, WS_EX_TRANSPARENT = 0x20;
     public const int WM_MOUSEACTIVATE = 0x0021, MA_NOACTIVATE = 3;
     public const int BLACK_BRUSH = 4;
+    public const uint CS_DBLCLKS = 0x0008;
+    public const uint WM_SETCURSOR = 0x0020, WM_MOUSEWHEEL = 0x020A,
+        WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_LBUTTONDBLCLK = 0x0203,
+        WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205, WM_MBUTTONDOWN = 0x0207, WM_MBUTTONUP = 0x0208;
+    public const int HTCLIENT = 1;
+
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    public delegate IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", EntryPoint = "DefWindowProcW")]
+    public static extern IntPtr DefWindowProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern IntPtr SetCapture(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool ReleaseCapture();
+    [DllImport("user32.dll")] public static extern IntPtr SetCursor(IntPtr cursor);
+    [DllImport("user32.dll")] public static extern uint GetDoubleClickTime();
     public static readonly IntPtr IDC_ARROW = new(32512);
     public const uint GA_ROOT = 2;
     public const uint MONITOR_DEFAULTTONEAREST = 2;

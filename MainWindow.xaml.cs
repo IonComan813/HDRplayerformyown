@@ -48,8 +48,9 @@ public partial class MainWindow : FluentWindow
         ("Ctrl+o", "open"), (".", "frame-step"), (",", "frame-back"), ("F5", "reload"), ("HOME", "restart"),
     };
 
-    /// <summary>双击判定时间，和 mpv 的 input-doubleclick-time 保持一致。单击画面要等这么久确认不是双击才暂停。</summary>
-    private const int DoubleClickMs = 300;
+    /// <summary>双击判定时间：跟随系统设置（画面的双击由 Windows 判定），mpv 的 input-doubleclick-time 也设成一样。
+    /// 单击画面要等这么久确认不是双击才暂停。</summary>
+    private static readonly int DoubleClickMs = (int)Math.Clamp(Native.GetDoubleClickTime(), 200u, 900u);
 
     /// <summary>鼠标静止多久后隐藏悬浮控制栏（mpv 的鼠标指针也同时隐藏）。</summary>
     private const int BarHideMs = 2000;
@@ -144,6 +145,13 @@ public partial class MainWindow : FluentWindow
         _bar.SizeChanged += (_, _) => PositionBar();
         _bar.MouseRightButtonUp += (_, e) => { ShowContextMenu(); e.Handled = true; };
 
+        // ---- 画面上的鼠标 ----（mpv 嵌入时自己的窗口被禁用，收不到鼠标，见 VideoHost 的说明）
+        Video.LeftClick += OnVideoClick;
+        Video.LeftDoubleClick += () => DoAction("dblclick");
+        Video.RightClick += ShowContextMenu;
+        Video.MiddleClick += () => { if (!_idle) DoAction("pause"); };
+        Video.Wheel += delta => DoAction(delta > 0 ? "vol-up" : "vol-down");
+
         // ---- 播放列表 ----
         BtnPlAdd.Click += (_, _) => OpenFiles();
         BtnPlRemove.Click += (_, _) => RemoveSelected();
@@ -159,7 +167,7 @@ public partial class MainWindow : FluentWindow
                 PlaySelected();
         };
 
-        // 画面上的拖放由 mpv 自己处理；播放列表、标题栏和控制栏上的拖放由这里处理
+        // 拖放都由这里处理（画面上也是：mpv 嵌入时窗口被禁用，系统把拖放交给上层的 WPF 窗口）
         DragOver += OnFileDragOver;
         Drop += OnFileDrop;
         PreviewKeyDown += OnPreviewKeyDown;
@@ -1105,43 +1113,17 @@ public partial class MainWindow : FluentWindow
     }
 
     /// <summary>
-    /// 弹出右键菜单。优先用 mpv 自带的原生菜单（menu-data + context-menu，mpv 0.40+）：
-    /// 它在 mpv 自己的窗口线程里用系统菜单弹出，不存在 WPF 菜单从别的线程的窗口上弹出时抢不到鼠标 / 焦点、
-    /// 一弹出就关掉的问题（之前右键画面没有菜单就是这个原因）。libmpv 太旧时退回 WPF 菜单。
+    /// 弹出右键菜单（WPF 菜单，样式和播放列表的菜单一致）。
+    /// 画面上的右键由 VideoHost 在松开时直接通知（它和 WPF 同一个线程，菜单能正常拿到鼠标和焦点）。
+    /// 以前的两个版本都依赖 mpv 的 MBTN_RIGHT 绑定，但嵌入时 mpv 的窗口被禁用、根本收不到鼠标，
+    /// 所以无论 WPF 菜单还是 mpv 的原生菜单（它也挂在那个被禁用的窗口上）都弹不出来。
     /// </summary>
     private void ShowContextMenu()
     {
-        var m = _mpv;
-        if (m == null) return;
+        if (_mpv == null || _shuttingDown) return;
         var items = BuildContextMenu();
-        if (m.SetPropertyNode("menu-data", ToMpvMenu(items)) >= 0 && m.Command("context-menu") >= 0) return;
-        ShowWpfMenu(items);
-    }
-
-    private static List<object?> ToMpvMenu(List<MenuEntry> items) => items.Select(e =>
-    {
-        if (e.IsSeparator) return (object?)new Dictionary<string, object?> { ["type"] = "separator" };
-        // Win32 菜单里 & 是快捷键前缀，要写成 &&
-        var d = new Dictionary<string, object?> { ["title"] = e.Title.Replace("&", "&&") };
-        if (e.Sub != null) { d["type"] = "submenu"; d["submenu"] = ToMpvMenu(e.Sub); }
-        if (e.Cmd != null) d["cmd"] = e.Cmd;
-        if (e.Shortcut != null) d["shortcut"] = e.Shortcut;
-        var state = new List<object?>();
-        if (e.Checked) state.Add("checked");
-        if (!e.Enabled) state.Add("disabled");
-        if (state.Count > 0) d["state"] = state;
-        return d;
-    }).ToList();
-
-    /// <summary>旧版 libmpv 没有原生菜单时的后备：WPF 菜单，等右键松开后再弹（按住期间鼠标归 mpv 的窗口）。</summary>
-    private void ShowWpfMenu(List<MenuEntry> items)
-    {
-        var start = DateTime.UtcNow;
-        var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(15) };
-        t.Tick += (_, _) =>
+        void Open()
         {
-            if (Native.IsRightButtonDown() && (DateTime.UtcNow - start).TotalSeconds < 3) return;
-            t.Stop();
             if (_shuttingDown) return;
             var menu = new ContextMenu();
             foreach (var mi in ToWpfMenu(items)) menu.Items.Add(mi);
@@ -1150,7 +1132,18 @@ public partial class MainWindow : FluentWindow
             menu.Placement = PlacementMode.MousePoint;
             Activate();
             _menuOpen = true;
+            Video.HideCursor = false;
             menu.IsOpen = true;
+        }
+        if (!Native.IsRightButtonDown()) { Open(); return; }
+        // 保险：如果是从 mpv 的 MBTN_RIGHT 绑定来的（按下时就触发），等右键松开再弹，否则松开的那一下会把菜单关掉
+        var start = DateTime.UtcNow;
+        var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(15) };
+        t.Tick += (_, _) =>
+        {
+            if (Native.IsRightButtonDown() && (DateTime.UtcNow - start).TotalSeconds < 3) return;
+            t.Stop();
+            Open();
         };
         t.Start();
     }
@@ -1299,6 +1292,8 @@ public partial class MainWindow : FluentWindow
         {
             _bar.Conceal();
         }
+        // 控制栏淡出时画面上的鼠标指针也隐藏
+        Video.HideCursor = !keep;
     }
 
     private static string FormatTime(double sec)
