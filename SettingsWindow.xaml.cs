@@ -145,6 +145,8 @@ public partial class SettingsWindow : FluentWindow
     {
         var p = NewPage("解码 / 渲染");
         AddCombo(p, "解码方式", null, HwdecChoices, _s.Hwdec, v => _s.Hwdec = v);
+        AddNumber(p, "软解线程数", $"0 = 自动（按 CPU 逻辑核心数，最多 16；本机 {Environment.ProcessorCount} 个逻辑核心）。从下一个文件开始生效",
+            _s.DecoderThreads, 0, 64, 1, v => _s.DecoderThreads = (int)v);
         AddCombo(p, "渲染 API", "重启播放器后生效", GpuApiChoices, _s.GpuApi, v => _s.GpuApi = v);
         AddCombo(p, "放大算法", null, ScaleChoices, _s.Scale, v => _s.Scale = v);
         AddCombo(p, "缩小算法", null, DscaleChoices, _s.Dscale, v => _s.Dscale = v);
@@ -201,6 +203,8 @@ public partial class SettingsWindow : FluentWindow
         AddNumber(p, "←/→ 跳转秒数", null, _s.SeekStep, 1, 600, 1, v => _s.SeekStep = v);
         AddNumber(p, "Shift+←/→ 跳转秒数", null, _s.SeekStepLarge, 1, 3600, 5, v => _s.SeekStepLarge = v);
         AddToggle(p, "精确跳转", "关闭则跳到关键帧，更快", _s.ExactSeek, v => _s.ExactSeek = v);
+        AddToggle(p, "进度条悬停预览缩略图", "后台另开一个不出画面的 mpv 实例截图；仅本地文件。HDR 片源的缩略图高光会被裁切",
+            _s.SeekThumbnails, v => _s.SeekThumbnails = v);
         AddNumber(p, "音量步进", null, _s.VolumeStep, 1, 50, 1, v => _s.VolumeStep = v);
         AddNumber(p, "字幕延迟步进 (ms)", null, _s.SubDelayStepMs, 10, 5000, 10, v => _s.SubDelayStepMs = (int)v);
         AddNote(p,

@@ -24,6 +24,8 @@ internal sealed class AppSettings
 
     // ---- 解码 / 渲染 ----
     public string Hwdec { get; set; } = "d3d11va";
+    /// <summary>软解线程数（vd-lavc-threads），0 = 自动：按 CPU 逻辑核心数，最多 16。</summary>
+    public int DecoderThreads { get; set; } = 0;
     public string GpuApi { get; set; } = "d3d11";
     public string Scale { get; set; } = "ewa_lanczossharp";
     public string Dscale { get; set; } = "mitchell";
@@ -50,6 +52,8 @@ internal sealed class AppSettings
     public double SeekStepLarge { get; set; } = 30;
     public double VolumeStep { get; set; } = 5;
     public int SubDelayStepMs { get; set; } = 100;
+    /// <summary>鼠标悬停在进度条上时显示该位置的缩略图。</summary>
+    public bool SeekThumbnails { get; set; } = true;
     public bool DebugLog { get; set; } = false;
 
     // ---- 窗口 ----

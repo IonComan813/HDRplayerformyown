@@ -56,6 +56,7 @@ public partial class MainWindow : FluentWindow
     private Mpv? _mpv;
     private readonly string[] _startupFiles;
     private readonly ControlBar _bar;
+    private readonly Thumbnailer _thumbs = new();
     private readonly DispatcherTimer _uiTimer;
     private InfoWindow? _infoWindow;
     private IntPtr _hwnd;
@@ -112,6 +113,11 @@ public partial class MainWindow : FluentWindow
         _bar.SeekRequested += (v, final) =>
             _mpv?.Command("seek", v.ToString("0.###", Inv), final ? "absolute+exact" : "absolute+keyframes");
         _bar.VolumeRequested += v => _mpv?.SetProperty("volume", v);
+        _bar.ThumbnailRequested += t => _thumbs.Request(t);
+        _thumbs.ThumbnailReady += (_, at, bmp) =>
+        {
+            if (!_shuttingDown) Dispatcher.InvokeAsync(() => _bar.ShowThumbnail(at, bmp));
+        };
         _bar.SetVolume(S.Volume);
         _bar.BtnPrev.IsEnabled = _bar.BtnNext.IsEnabled = false;
         _bar.DragOver += OnFileDragOver;
@@ -290,6 +296,8 @@ public partial class MainWindow : FluentWindow
     {
         Func<string, string, int> set = initial ? m.SetOption : m.SetProperty;
         set("hwdec", S.Hwdec);
+        // 软解线程数：运行时修改从下一个文件开始生效（解码器重新初始化时）
+        set("vd-lavc-threads", Math.Clamp(S.DecoderThreads, 0, 64).ToString(Inv));
         set("scale", S.Scale);
         set("dscale", S.Dscale);
         set("deband", S.Deband ? "yes" : "no");
@@ -491,12 +499,14 @@ public partial class MainWindow : FluentWindow
                     _duration = 0; _timePos = 0; _timeDirty = true;
                     _bar.SetDuration(0);
                     _bar.FormatText.Text = "";
+                    UpdateThumbnailSource();
                 }
                 ShowIdleHint(_idle);
                 break;
             case "duration":
                 _duration = value is double d ? d : 0;
                 _bar.SetDuration(_duration);
+                _bar.ThumbnailTolerance = Math.Max(3, _duration / 120);
                 _timeDirty = true;
                 break;
             case "volume":
@@ -571,7 +581,21 @@ public partial class MainWindow : FluentWindow
             return;
         }
         UpdateFormatLabel();
+        UpdateThumbnailSource();
         MaybeAutoHdr();
+    }
+
+    /// <summary>当前文件是有画面的本地文件、且设置里开启时，让缩略图线程跟着打开它。</summary>
+    private void UpdateThumbnailSource()
+    {
+        var m = _mpv;
+        string? path = m == null || _idle ? null : m.GetString("path");
+        bool ok = S.SeekThumbnails && path != null && File.Exists(path) &&
+                  !string.IsNullOrEmpty(m!.GetString("video-codec")) && m.GetFlag("current-tracks/video/image") != true &&
+                  // 杜比视界 P5 的画面要靠 RPU 重塑才有正确颜色，软件截图不做这一步，缩略图会偏绿 / 偏紫
+                  _dvProfile != "5";
+        _bar.ThumbnailsEnabled = ok;
+        _thumbs.SetFile(ok ? Path.GetFullPath(path!) : null);
     }
 
     private void OnVideoReconfig()
@@ -1087,6 +1111,7 @@ public partial class MainWindow : FluentWindow
         S.Save();
         ApplyPlaybackOptions(m, initial: false);
         if (dvChanged) m.SetProperty("vf", DolbyVisionFilter());
+        UpdateThumbnailSource();
         // 改设置不会去切换 Windows HDR，只重新应用 mpv 的 HDR 参数
         ApplyMpvHdrProps();
         UpdateHdrButton();
@@ -1222,7 +1247,11 @@ public partial class MainWindow : FluentWindow
             var m = _mpv;
             _mpv = null;
             // 在后台线程销毁 mpv，UI 线程继续处理消息，避免与 mpv 窗口线程互相等待
-            Task.Run(() => { try { m.Dispose(); } catch { } }).ContinueWith(_ =>
+            Task.Run(() =>
+            {
+                try { _thumbs.Dispose(); } catch { }
+                try { m.Dispose(); } catch { }
+            }).ContinueWith(_ =>
             {
                 try
                 {
