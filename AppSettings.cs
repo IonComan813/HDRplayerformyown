@@ -8,11 +8,11 @@ internal sealed class AppSettings
 {
     // ---- HDR ----
     // HDR 输出的开 / 关不保存：启动时跟随 Windows 当前的“使用 HDR”状态，空着启动不会去改系统设置。
-    /// <summary>按片源自动切换 HDR 输出：HDR 片源开启、SDR 片源关闭（必要时同时切换 Windows HDR）。</summary>
-    public bool AutoHdrForHdrVideo { get; set; } = true;
-    /// <summary>开关 HDR 输出（手动或自动）时，同时切换 Windows 的“使用 HDR”。</summary>
-    public bool AutoSwitchWindowsHdr { get; set; } = true;
-    public bool RestoreWindowsHdrOnExit { get; set; } = true;
+    /// <summary>
+    /// 由软件自动管理系统 HDR：HDR 片源开始播放时自动打开 Windows 的“使用 HDR”，SDR 片源自动关闭。
+    /// 关闭则只在手动按 H / 点控制栏的 HDR 按钮时切换。两种情况下退出时都把 Windows HDR 还原为启动前的状态。
+    /// </summary>
+    public bool AutoManageHdr { get; set; } = true;
     /// <summary>0 = 自动读取显示器 EDID 上报的峰值亮度</summary>
     public int TargetPeakNits { get; set; } = 0;
     public string ToneMapping { get; set; } = "auto";
@@ -38,14 +38,14 @@ internal sealed class AppSettings
     public string AudioDevice { get; set; } = "auto";
     public bool DownmixToStereo { get; set; } = true;
     public bool NormalizeDownmix { get; set; } = false;
-    public string AudioLanguages { get; set; } = "";
+    public string AudioLanguages { get; set; } = LanguagePresets.DefaultAudio;
     public double Volume { get; set; } = 100;
 
     // ---- 字幕 ----
     public string SubFont { get; set; } = "Microsoft YaHei";
     public int SubFontSize { get; set; } = 44;
     public string SubAuto { get; set; } = "fuzzy";
-    public string SubLanguages { get; set; } = "chi,zho,chs,zh,zh-Hans,eng,en";
+    public string SubLanguages { get; set; } = LanguagePresets.DefaultSubtitle;
 
     // ---- 操作 ----
     public double SeekStep { get; set; } = 5;
@@ -54,6 +54,12 @@ internal sealed class AppSettings
     public int SubDelayStepMs { get; set; } = 100;
     /// <summary>鼠标悬停在进度条上时显示该位置的缩略图。</summary>
     public bool SeekThumbnails { get; set; } = true;
+    /// <summary>空着启动时恢复上次的播放列表（只恢复列表，不自动播放）。</summary>
+    public bool RestorePlaylist { get; set; } = true;
+    /// <summary>记住每个文件的播放进度，下次打开时从那里继续。</summary>
+    public bool RememberPosition { get; set; } = true;
+    /// <summary>记住每个文件的音频延迟和字幕延迟。</summary>
+    public bool RememberDelays { get; set; } = true;
     public bool DebugLog { get; set; } = false;
 
     // ---- 窗口 ----
@@ -71,15 +77,46 @@ internal sealed class AppSettings
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = true };
 
+    /// <summary>
+    /// 把语言列表整理成 mpv 要的格式：“chi，zho, chs ,eng”→“chi,zho,chs,eng”。
+    /// 全角 / 半角逗号（以及顿号、分号）都当作分隔符，去掉空格和空项，顺序不变（mpv 按顺序依次匹配）。
+    /// </summary>
+    public static string NormalizeLanguageList(string? list) =>
+        string.Join(",", (list ?? "").Split(new[] { ',', '，', '、', ';', '；' },
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+
+    /// <summary>设置文件格式版本，用于升级时调整旧设置的默认值。</summary>
+    public int SettingsVersion { get; set; }
+    private const int CurrentVersion = 3;
+
     public static AppSettings Load()
     {
+        AppSettings s;
         try
         {
-            if (File.Exists(FilePath))
-                return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath)) ?? new AppSettings();
+            s = File.Exists(FilePath)
+                ? JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath)) ?? new AppSettings()
+                : new AppSettings();
         }
-        catch { /* 设置文件损坏时使用默认值 */ }
-        return new AppSettings();
+        catch { s = new AppSettings(); /* 设置文件损坏时使用默认值 */ }
+        s.Migrate();
+        return s;
+    }
+
+    private void Migrate()
+    {
+        if (SettingsVersion < 2)
+        {
+            // 旧版本首选音轨语言默认是空的；新默认是英语
+            if (string.IsNullOrWhiteSpace(AudioLanguages)) AudioLanguages = "eng,en";
+        }
+        if (SettingsVersion < 3)
+        {
+            // 语言预设加入了回退规则（简体 ↔ 繁体 → 英语、其它语言 → 英语），把旧预设换成新的；手动输入的不动
+            if (LanguagePresets.Upgrades.TryGetValue(NormalizeLanguageList(SubLanguages), out var sub)) SubLanguages = sub;
+            if (LanguagePresets.Upgrades.TryGetValue(NormalizeLanguageList(AudioLanguages), out var aud)) AudioLanguages = aud;
+        }
+        SettingsVersion = CurrentVersion;
     }
 
     public void Save()

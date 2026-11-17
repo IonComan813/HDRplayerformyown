@@ -70,10 +70,11 @@ internal sealed class HoverTip : Window
     public bool IsShowing => IsVisible && Opacity > 0;
 
     /// <summary>显示在 anchor 上方，水平中心对准 anchor 内的 x（DIP）。</summary>
-    public void ShowAt(FrameworkElement anchor, double x, double gap, string text, ImageSource? image)
+    /// <param name="stale">缩略图不是当前位置的（新的还在生成），调暗显示。</param>
+    public void ShowAt(FrameworkElement anchor, double x, double gap, string text, ImageSource? image, bool stale)
     {
         _text.Text = text;
-        SetImage(image);
+        SetImage(image, stale);
         _anchor = anchor;
         _anchorX = x;
         _gap = gap;
@@ -81,9 +82,9 @@ internal sealed class HoverTip : Window
     }
 
     /// <summary>只换缩略图（尺寸会变），位置按上一次的锚点重新计算。</summary>
-    public void UpdateImage(ImageSource? image)
+    public void UpdateImage(ImageSource? image, bool stale)
     {
-        SetImage(image);
+        SetImage(image, stale);
         if (IsShowing) Place();
     }
 
@@ -93,8 +94,9 @@ internal sealed class HoverTip : Window
         _anchor = null;
     }
 
-    private void SetImage(ImageSource? image)
+    private void SetImage(ImageSource? image, bool stale)
     {
+        _image.Opacity = stale ? 0.4 : 1;
         _image.Source = image;
         _image.Visibility = image == null ? Visibility.Collapsed : Visibility.Visible;
     }

@@ -30,8 +30,8 @@ public partial class ControlBar : Window
         get => _thumbsEnabled;
         set { _thumbsEnabled = value; if (!value) HideThumbnail(); }
     }
-    /// <summary>缩略图的实际时间和悬停位置相差多少秒以内才显示（按片长设置）。</summary>
-    public double ThumbnailTolerance { get; set; } = 5;
+    /// <summary>缩略图时间和悬停位置相差超过这么多秒，就调暗显示（表示是旧图，新图还在生成）。</summary>
+    private const double ThumbnailExactRange = 0.75;
 
     private bool _thumbsEnabled, _muted;
     private double _hoverValue = double.NaN, _thumbTime = double.NaN;
@@ -152,7 +152,7 @@ public partial class ControlBar : Window
         const double thumb = 20;
         double x = thumb / 2 + Math.Max(0, VolumeSlider.ActualWidth - thumb) * VolumeSlider.Value / Math.Max(1, VolumeSlider.Maximum);
         _tipOwner = TipOwner.Volume;
-        tip.ShowAt(VolumeSlider, x, 6, _muted ? $"静音（{v}%）" : $"{v}%", null);
+        tip.ShowAt(VolumeSlider, x, 6, _muted ? $"静音（{v}%）" : $"{v}%", null, false);
     }
 
     private void UpdateSeekTip(MouseEventArgs e)
@@ -162,34 +162,32 @@ public partial class ControlBar : Window
             return;
         double v = Math.Clamp(track.ValueFromPoint(e.GetPosition(track)), 0, SeekSlider.Maximum);
         _hoverValue = v;
-        // 离已显示的缩略图太远就先不显示，等新的出来；请求会被缩略图线程合并，只处理最新的
-        if (!_thumbsEnabled || (!double.IsNaN(_thumbTime) && Math.Abs(_thumbTime - v) > ThumbnailTolerance))
-        {
-            _thumbTime = double.NaN;
-            _thumbImage = null;
-        }
-        if (_thumbsEnabled) ThumbnailRequested?.Invoke(v);
+        // 新位置的缩略图还没出来时，先把上一张调暗留着（不撤掉，免得提示框大小跳来跳去）
+        if (!_thumbsEnabled) _thumbImage = null;
+        else ThumbnailRequested?.Invoke(v);
         _tipOwner = TipOwner.Seek;
-        tip.ShowAt(SeekSlider, e.GetPosition(SeekSlider).X, 10, FormatTime(v), _thumbImage);
+        tip.ShowAt(SeekSlider, e.GetPosition(SeekSlider).X, 10, FormatTime(v), _thumbImage, IsThumbStale());
     }
 
     private ImageSource? _thumbImage;
+
+    private bool IsThumbStale() =>
+        _thumbImage != null && (double.IsNaN(_thumbTime) || Math.Abs(_thumbTime - _hoverValue) > ThumbnailExactRange);
 
     /// <summary>缩略图线程送来的结果（UI 线程调用）。servedAt 是实际截图的时间点。</summary>
     public void ShowThumbnail(double servedAt, ImageSource image)
     {
         if (!_thumbsEnabled || _tipOwner != TipOwner.Seek || double.IsNaN(_hoverValue)) return;
-        if (Math.Abs(servedAt - _hoverValue) > ThumbnailTolerance) return; // 鼠标已经移走了
         _thumbImage = image;
         _thumbTime = servedAt;
-        _tip?.UpdateImage(image);
+        _tip?.UpdateImage(image, IsThumbStale());
     }
 
     private void HideThumbnail()
     {
         _thumbImage = null;
         _thumbTime = double.NaN;
-        if (_tipOwner == TipOwner.Seek) _tip?.UpdateImage(null);
+        if (_tipOwner == TipOwner.Seek) _tip?.UpdateImage(null, false);
     }
 
     /// <summary>关闭提示；owner 不为 None 时只在提示属于它时才关（免得进度条的离开事件关掉音量提示）。</summary>

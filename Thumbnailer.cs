@@ -15,7 +15,7 @@ internal sealed class Thumbnailer : IDisposable
 
     /// <summary>缩略图的最大像素尺寸（mpv 里先缩小再截图，转换开销很小）。</summary>
     public const int MaxW = 384, MaxH = 216;
-    private const int CacheLimit = 200;
+    private const int CacheLimit = 300;
 
     private readonly object _lock = new();
     private readonly AutoResetEvent _wake = new(false);
@@ -32,7 +32,8 @@ internal sealed class Thumbnailer : IDisposable
     private Mpv? _mpv;
     private string? _loadedFile;
     private bool _usable;
-    private double _bucket = 2;
+    /// <summary>缩略图按整秒取：悬停位置四舍五入到最近的一秒，精确跳到那一帧。</summary>
+    private const double ThumbStep = 1;
     private readonly Dictionary<int, BitmapSource> _cache = new();
     private readonly Queue<int> _cacheOrder = new();
 
@@ -87,8 +88,8 @@ internal sealed class Thumbnailer : IDisposable
         if (!string.Equals(file, _loadedFile, StringComparison.OrdinalIgnoreCase)) Load(file);
         if (!_usable) return;
 
-        int key = (int)Math.Round(t.Value / _bucket);
-        double at = key * _bucket;
+        int key = (int)Math.Round(t.Value / ThumbStep);
+        double at = key * ThumbStep;
         if (_cache.TryGetValue(key, out var cached))
         {
             ThumbnailReady?.Invoke(t.Value, at, cached);
@@ -97,7 +98,8 @@ internal sealed class Thumbnailer : IDisposable
 
         var m = _mpv!;
         _restart.Reset();
-        m.Command("seek", at.ToString("0.###", Inv), "absolute+keyframes");
+        // 精确跳转：从前一个关键帧解码到目标帧。只按关键帧跳会差好几秒（电影的关键帧间隔通常 1~5 秒）
+        m.Command("seek", at.ToString("0.###", Inv), "absolute+exact");
         if (!_restart.Wait(3000, _cts.Token)) return;
 
         var bmp = Grab(m);
@@ -125,8 +127,6 @@ internal sealed class Thumbnailer : IDisposable
         bool hasVideo = !string.IsNullOrEmpty(m.GetString("video-codec")) && m.GetFlag("current-tracks/video/image") != true;
         double duration = m.GetDouble("duration") ?? 0;
         if (!hasVideo || duration <= 0) return;
-        // 长片按时长分桶，相邻位置复用同一张缩略图（关键帧跳转本来也只能精确到关键帧）
-        _bucket = Math.Clamp(duration / 300, 1, 10);
         _usable = true;
     }
 
@@ -149,11 +149,12 @@ internal sealed class Thumbnailer : IDisposable
         m.SetOption("ytdl", "no");
         m.SetOption("input-default-bindings", "no");
         m.SetOption("cache", "no");
-        m.SetOption("hr-seek", "no");
+        m.SetOption("hr-seek-framedrop", "yes");
         // 硬解后拷回内存（截图要读像素）；显卡不支持的格式会自动改用软解
         m.SetOption("hwdec", "auto-copy");
         m.SetOption("vd-lavc-threads", "4");
-        m.SetOption("vd-lavc-skiploopfilter", "all");
+        // 只对非参考帧跳过环路滤波：精确跳转要连续解码一串帧，参考帧质量不能降，否则误差会累积成马赛克
+        m.SetOption("vd-lavc-skiploopfilter", "nonref");
         m.SetOption("vd-lavc-fast", "yes");
         // 先缩小再截图：保持宽高比，最大 384×216
         m.SetOption("vf", $"lavfi=[scale={MaxW}:{MaxH}:force_original_aspect_ratio=decrease:force_divisible_by=2]");
