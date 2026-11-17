@@ -118,6 +118,14 @@ internal static class Native
 
     [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
 
+    public const int VK_LBUTTON = 0x01, VK_RBUTTON = 0x02, SM_SWAPBUTTON = 23;
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+
+    /// <summary>逻辑上的鼠标右键是否按着（GetAsyncKeyState 看的是物理按键，左右键互换时要换过来）。</summary>
+    public static bool IsRightButtonDown() =>
+        (GetAsyncKeyState(GetSystemMetrics(SM_SWAPBUTTON) != 0 ? VK_LBUTTON : VK_RBUTTON) & 0x8000) != 0;
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFOEX info);
 

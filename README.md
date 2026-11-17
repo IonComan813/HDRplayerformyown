@@ -5,6 +5,10 @@
 
 ## 运行
 
+**安装版**：从 Release 下载 `HdrPlayer-<版本>-win-x64-setup.exe`，不需要管理员权限。安装时可以勾选把 mkv / mp4 等视频文件设为用 HdrPlayer 打开；装好后右键视频的“打开方式”里也会有 HdrPlayer。Windows 不允许程序自己改默认程序，所以安装完成时可以打开系统的“默认应用”设置页，点一下确认即可。安装包已带 libmpv，也需要下面第 1 步的 .NET 运行时。
+
+**便携版 / 自己编译**：
+
 1. 安装 **.NET 8 Desktop Runtime (x64)**：https://dotnet.microsoft.com/download/dotnet/8.0
 2. 下载 libmpv：https://github.com/shinchiro/mpv-winbuild-cmake/releases
    选最新的 `mpv-dev-x86_64-v3-*.7z`，解压出 **`libmpv-2.dll`**，放到 `HdrPlayer.exe` 同一目录。
@@ -14,7 +18,7 @@
 ## 自动构建
 
 推送 `v` 开头的标签（或在 GitHub 网页上新建 Release 时创建新标签）会触发 GitHub Actions：
-编译、下载最新的 libmpv-2.dll（shinchiro/mpv-winbuild-cmake），打包成 `HdrPlayer-<版本>-win-x64.zip` 上传到该 Release。
+编译、下载最新的 libmpv-2.dll（shinchiro/mpv-winbuild-cmake），打包成便携版 `HdrPlayer-<版本>-win-x64.zip` 和安装程序 `HdrPlayer-<版本>-win-x64-setup.exe`（Inno Setup，脚本在 `installer/`），上传到该 Release。
 
 ```
 git tag v0.3.0
@@ -44,7 +48,7 @@ dotnet build -c Release
 | 读取屏幕参数 | 运行时通过 DXGI `IDXGIOutput6::GetDesc1` 读取 EDID 的峰值/全屏亮度、原色等 |
 | 字幕 | 拖到画面上即可加载；Z/X 调整延迟；设置里可改字体、字号、自动加载规则 |
 | 播放列表 | 侧边栏（P），拖入的视频会加入列表 |
-| 视频参数 | 右键 → 视频参数（I），每秒刷新 |
+| 视频参数 | 右键 → 视频参数（I），每秒刷新；播放列表里右键其它文件也能查看（后台读取，不影响播放），并列出全部音轨 / 字幕轨 |
 | 悬浮控制栏 | 浮在画面底部，鼠标移动时出现、静止 2 秒后淡出（同时隐藏鼠标指针）；窗口和全屏下都一样，不占画面高度 |
 | 进度条预览 | 鼠标悬停在进度条上显示该位置的缩略图（后台另开一个不出画面的 mpv 实例截图，结果缓存）；仅本地文件，杜比视界 P5 只显示时间 |
 
@@ -52,7 +56,7 @@ dotnet build -c Release
 
 | 键 | 功能 |
 |---|---|
-| 空格 / 中键 | 播放 / 暂停 |
+| 空格 / 单击画面 / 中键 | 播放 / 暂停 |
 | ← / → | 后退 / 前进 5 秒（可设置） |
 | Shift + ← / → | 后退 / 前进 30 秒 |
 | ↑ / ↓ / 滚轮 | 音量 |
@@ -67,6 +71,7 @@ dotnet build -c Release
 | # | 切换音轨 |
 | . / , | 逐帧前进 / 后退 |
 | Ctrl+O | 打开文件 |
+| F5 | 重新载入当前文件（回到原位置），让“打开文件时才读取”的设置立即生效 |
 | 右键 | 菜单（音轨、字幕、解码方式、设置……） |
 
 设置保存在 `%APPDATA%\HdrPlayer\settings.json`。

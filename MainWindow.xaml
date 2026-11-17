@@ -112,6 +112,8 @@
                                 <MenuItem x:Name="PlMenuPlay" Header="播放" InputGestureText="Enter" />
                                 <MenuItem x:Name="PlMenuRemove" Header="移除" InputGestureText="Delete" />
                                 <MenuItem x:Name="PlMenuReveal" Header="在资源管理器中显示" />
+                                <Separator />
+                                <MenuItem x:Name="PlMenuInfo" Header="视频参数…" />
                             </ContextMenu>
                         </ListBox.ContextMenu>
                     </ListBox>

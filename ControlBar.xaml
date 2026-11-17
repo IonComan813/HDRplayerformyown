@@ -75,7 +75,7 @@
                             AllowsTransparency="True"
                             Focusable="False"
                             IsHitTestVisible="False"
-                            Placement="Relative"
+                            Placement="Custom"
                             PlacementTarget="{Binding ElementName=SeekSlider}"
                             StaysOpen="True">
                             <Border
@@ -168,6 +168,28 @@
                             IsMoveToPointEnabled="True"
                             Maximum="150"
                             Minimum="0" />
+                        <!-- 音量百分比：鼠标在音量条上或拖动时显示在滑块上方 -->
+                        <Popup
+                            x:Name="VolumePopup"
+                            AllowsTransparency="True"
+                            Focusable="False"
+                            IsHitTestVisible="False"
+                            Placement="Custom"
+                            PlacementTarget="{Binding ElementName=VolumeSlider}"
+                            StaysOpen="True">
+                            <Border
+                                Padding="8,3"
+                                Background="{DynamicResource SolidBackgroundFillColorQuarternaryBrush}"
+                                BorderBrush="{StaticResource OverlayStrokeBrush}"
+                                BorderThickness="1"
+                                CornerRadius="4">
+                                <TextBlock
+                                    x:Name="VolumeTipText"
+                                    FontFamily="Cascadia Mono, Consolas, Microsoft YaHei UI"
+                                    FontSize="12"
+                                    Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                            </Border>
+                        </Popup>
                         <!-- 不固定宽度，按文字自适应，避免 “HDR” 的 R 被裁掉 -->
                         <ui:Button
                             x:Name="BtnHdr"
@@ -180,6 +202,7 @@
                             FontSize="13"
                             FontWeight="Bold"
                             ToolTip="开关 HDR 输出 (H)" />
+                        <ui:Button x:Name="BtnReload" Style="{StaticResource BarButton}" ToolTip="重新载入当前文件，让设置立即生效 (F5)" Icon="{ui:SymbolIcon ArrowClockwise24}" />
                         <ui:Button x:Name="BtnPlaylist" Style="{StaticResource BarButton}" ToolTip="播放列表 (P)" Icon="{ui:SymbolIcon TextBulletListLtr24}" />
                         <ui:Button x:Name="BtnSettings" Style="{StaticResource BarButton}" ToolTip="设置" Icon="{ui:SymbolIcon Settings24}" />
                         <ui:Button x:Name="BtnFull" Style="{StaticResource BarButton}" ToolTip="全屏 (F / 双击)">
