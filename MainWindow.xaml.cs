@@ -62,6 +62,8 @@ public partial class MainWindow : FluentWindow
     private readonly string[] _startupFiles;
     private readonly ControlBar _bar;
     private readonly Thumbnailer _thumbs = new();
+    private readonly SubSync _subSync = new();
+    private DispatcherTimer? _subSyncOsd;
     private readonly DispatcherTimer _uiTimer;
     private InfoWindow? _infoWindow;
     private IntPtr _hwnd;
@@ -828,6 +830,7 @@ public partial class MainWindow : FluentWindow
             case "sub-delay-reset": m.SetProperty("sub-delay", 0.0); m.ShowText("字幕延迟：0 ms"); break;
             case "reveal": RevealFile(m.GetString("path")); break;
             case "load-sub": LoadSubtitle(); break;
+            case "sub-sync": StartSubSync(); break;
             case "load-audio": LoadAudioTrack(); break;
             case "settings": OpenSettings(); break;
             case "quit": Close(); break;
@@ -1032,6 +1035,137 @@ public partial class MainWindow : FluentWindow
     }
 
     // =====================================================================
+    //  自动同步字幕（ffsubsync）
+    // =====================================================================
+
+    private static readonly HashSet<string> TextSubCodecs = new(StringComparer.OrdinalIgnoreCase)
+        { "subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text" };
+    private static readonly HashSet<string> SyncableSubExts = new(StringComparer.OrdinalIgnoreCase)
+        { ".srt", ".ass", ".ssa", ".vtt", ".sub" };
+
+    /// <summary>
+    /// 用 ffsubsync 把当前字幕对齐到当前音轨的人声，生成“原名.synced.后缀”并切换过去（再选一次菜单项取消）。
+    /// 当前字幕是外挂文件就同步那个文件；是内嵌文字字幕就先提取出来；没有选字幕就让用户选一个文件。
+    /// </summary>
+    private async void StartSubSync()
+    {
+        var m = _mpv;
+        if (m == null || _idle) return;
+        if (_subSync.Running) { _subSync.Cancel(); return; }
+        if (SubSync.FindExe() == null)
+        {
+            await Dialogs.ShowAsync(this, "自动同步字幕",
+                "没有找到 ffsubsync。\n\n发布版（安装版 / 便携版）自带，在程序目录的 tools\\ffsubsync 里。" +
+                "自己编译的话可以 pip install ffsubsync，并把 ffmpeg / ffprobe 放进 PATH。");
+            return;
+        }
+        string? video = m.GetString("path");
+        if (video == null || !File.Exists(video)) { m.ShowText("只能同步本地文件的字幕"); return; }
+
+        var tracks = (m.GetNode("track-list") as List<object?>)?.OfType<Dictionary<string, object?>>().ToList() ?? new();
+        static string Str(Dictionary<string, object?> t, string k) => t.GetValueOrDefault(k) as string ?? "";
+        static long Id(Dictionary<string, object?> t) => t.GetValueOrDefault("id") is long l ? l : 0;
+        static bool Is(Dictionary<string, object?> t, string k) => t.GetValueOrDefault(k) is true;
+        // mpv 的内嵌轨按流的顺序编号，所以“同类内嵌轨里排第几”就是 ffmpeg 的 0:a:N / 0:s:N
+        int RelIndex(Dictionary<string, object?> t) =>
+            tracks.Count(o => Str(o, "type") == Str(t, "type") && !Is(o, "external") && Id(o) < Id(t));
+
+        // 参照音轨：当前选中的（外挂音轨就用那个音频文件）
+        var audio = tracks.FirstOrDefault(t => Str(t, "type") == "audio" && Is(t, "selected"));
+        if (audio == null) { m.ShowText("当前没有音轨，无法按人声同步字幕", 3000); return; }
+        string reference = video, audioStream;
+        if (Is(audio, "external") && File.Exists(Str(audio, "external-filename")))
+            (reference, audioStream) = (Str(audio, "external-filename"), "0:a:0");
+        else
+            audioStream = $"0:a:{RelIndex(audio)}";
+
+        // 要同步的字幕
+        var sub = tracks.FirstOrDefault(t => Str(t, "type") == "sub" && Is(t, "selected"));
+        string? subFile = null, embedded = null, lang = sub == null ? null : Str(sub, "lang");
+        string ext;
+        if (sub == null)
+        {
+            var picked = PickFiles(SubFilter, "选择要同步的字幕", false);
+            if (picked.Length == 0) return;
+            subFile = picked[0];
+            ext = Path.GetExtension(subFile);
+        }
+        else if (Is(sub, "external"))
+        {
+            subFile = Str(sub, "external-filename");
+            if (!File.Exists(subFile)) { m.ShowText("当前字幕不是本地文件，无法同步", 3000); return; }
+            ext = Path.GetExtension(subFile);
+        }
+        else
+        {
+            string codec = Str(sub, "codec");
+            if (!TextSubCodecs.Contains(codec)) { m.ShowText($"当前是图形字幕（{codec}），只能同步文字字幕", 3000); return; }
+            embedded = $"0:s:{RelIndex(sub)}";
+            ext = codec is "ass" or "ssa" ? ".ass" : ".srt";
+        }
+        if (!SyncableSubExts.Contains(ext)) { m.ShowText($"不支持同步 {ext} 字幕（支持 srt / ass / ssa / vtt）", 3000); return; }
+
+        // 输出：字幕旁边的“原名.synced.后缀”（内嵌字幕放在视频旁边）；目录不可写时放到 %LOCALAPPDATA%\HdrPlayer\synced
+        string baseName = subFile != null
+            ? Path.GetFileNameWithoutExtension(subFile)
+            : Path.GetFileNameWithoutExtension(video) + (string.IsNullOrEmpty(lang) ? "" : "." + lang);
+        if (baseName.EndsWith(".synced", StringComparison.OrdinalIgnoreCase)) baseName = baseName[..^".synced".Length];
+        string dir = Path.GetDirectoryName(subFile ?? video) ?? "";
+        if (!DirectoryWritable(dir))
+        {
+            dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HdrPlayer", "synced");
+            Directory.CreateDirectory(dir);
+        }
+        string output = Path.Combine(dir, baseName + ".synced" + ext.ToLowerInvariant());
+
+        string status = "正在同步字幕…";
+        var started = DateTime.UtcNow;
+        void ShowProgress() => m.ShowText($"{status}　{(DateTime.UtcNow - started).TotalSeconds:0} 秒\n（右键 → 字幕 → 取消自动同步）", 1500);
+        _subSyncOsd?.Stop();
+        _subSyncOsd = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        _subSyncOsd.Tick += (_, _) => ShowProgress();
+        _subSyncOsd.Start();
+        ShowProgress();
+
+        var res = await _subSync.RunAsync(video, reference, audioStream, subFile, embedded, output,
+            msg => Dispatcher.InvokeAsync(() => { status = msg; ShowProgress(); }));
+        _subSyncOsd.Stop();
+        if (_shuttingDown || _mpv == null) return;
+        if (!res.Ok) { m.ShowText(res.Message, 5000); return; }
+        if (m.GetString("path") != video)
+        {
+            m.ShowText("字幕已同步，保存为 " + Path.GetFileName(output), 4000);
+            return;
+        }
+
+        // 同名文件之前已经加载过（再次同步覆盖了它）：先移除旧的轨，避免出现两条一样的
+        if (m.GetNode("track-list") is List<object?> now)
+            foreach (var t in now.OfType<Dictionary<string, object?>>())
+                if (Str(t, "type") == "sub" && Is(t, "external") &&
+                    string.Equals(Str(t, "external-filename"), output, StringComparison.OrdinalIgnoreCase))
+                    m.Command("sub-remove", Id(t).ToString(Inv));
+        m.Command("sub-add", output, "select", "自动同步", lang ?? "");
+        // 偏移已经写进字幕文件，之前手动调的字幕延迟要清零，否则会叠加
+        m.SetProperty("sub-delay", 0.0);
+        string scale = Math.Abs(res.Scale - 1) > 0.0005 ? $"，帧率校正 ×{res.Scale.ToString("0.0000", Inv)}" : "";
+        m.ShowText($"字幕已同步：整体偏移 {res.Offset.ToString("+0.00;-0.00;0.00", Inv)} 秒{scale}\n已保存为 {Path.GetFileName(output)}", 5000);
+    }
+
+    private static bool DirectoryWritable(string dir)
+    {
+        try
+        {
+            string probe = Path.Combine(dir, $".hdrplayer-write-test-{Guid.NewGuid():N}");
+            using (File.Create(probe, 1, FileOptions.DeleteOnClose)) { }
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // =====================================================================
     //  右键菜单
     // =====================================================================
 
@@ -1078,6 +1212,10 @@ public partial class MainWindow : FluentWindow
                 (type == "audio" ? audio : subs).Add(entry);
             }
         }
+        subs.Add(Sep);
+        subs.Add(_subSync.Running
+            ? new MenuEntry("取消自动同步", Hp("sub-sync"))
+            : new MenuEntry("自动同步字幕（ffsubsync）…", Hp("sub-sync"), Enabled: path != null && File.Exists(path)));
         items.Add(new MenuEntry("音轨", Sub: audio, Enabled: audio.Count > 0));
         items.Add(new MenuEntry("字幕", Sub: subs, Enabled: playing));
 
@@ -1575,6 +1713,8 @@ public partial class MainWindow : FluentWindow
             SavePlaylistState();
 
             _uiTimer.Stop();
+            _subSyncOsd?.Stop();
+            _subSync.KillNow();
             _infoWindow?.Close();
             _bar.HideNow();
             Hide();

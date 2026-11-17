@@ -79,6 +79,10 @@ Name: "assoc\xmxf"; Description: ".mxf　MXF 专业视频"; Flags: unchecked
 Name: "assoc\xy4m"; Description: ".y4m　YUV4MPEG 原始视频"; Flags: unchecked
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式："; Flags: unchecked
 
+[InstallDelete]
+; tools 里是打包好的 ffsubsync（Python）和 ffmpeg，升级时先整个删掉，免得留下旧版本的文件
+Type: filesandordirs; Name: "{app}\tools"
+
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 

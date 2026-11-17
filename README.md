@@ -18,12 +18,13 @@
 2. 下载 libmpv：https://github.com/shinchiro/mpv-winbuild-cmake/releases
    选最新的 `mpv-dev-x86_64-v3-*.7z`，解压出 **`libmpv-2.dll`**，放到 `HdrPlayer.exe` 同一目录。
    （libmpv 要用 2025 年及以后的版本，否则杜比视界 Profile 检测、HDR10+ 属性等功能可能缺失。）
-3. 运行 `HdrPlayer.exe`。也可以把视频文件拖到 exe 上，或设为默认打开方式。
+3. （可选，自动同步字幕用）`pip install ffsubsync`，并把 ffmpeg / ffprobe 放进 PATH；或者从发布版里拷 `tools\` 目录过来。
+4. 运行 `HdrPlayer.exe`。也可以把视频文件拖到 exe 上，或设为默认打开方式。
 
 ## 自动构建
 
 推送 `v` 开头的标签（或在 GitHub 网页上新建 Release 时创建新标签）会触发 GitHub Actions：
-编译、下载最新的 libmpv-2.dll（shinchiro/mpv-winbuild-cmake），打包成便携版 `HdrPlayer-<版本>-win-x64.zip` 和安装程序 `HdrPlayer-<版本>-win-x64-setup.exe`（Inno Setup，脚本在 `installer/`），上传到该 Release。
+编译、下载最新的 libmpv-2.dll（shinchiro/mpv-winbuild-cmake），用 PyInstaller 把 ffsubsync 打包成 exe、下载 ffmpeg（BtbN/FFmpeg-Builds，LGPL 版），一起放进 `tools\`，打包成便携版 `HdrPlayer-<版本>-win-x64.zip` 和安装程序 `HdrPlayer-<版本>-win-x64-setup.exe`（Inno Setup，脚本在 `installer/`），上传到该 Release。
 
 ```
 git tag v0.3.0
@@ -52,6 +53,7 @@ dotnet build -c Release
 | 随时开关 HDR | 快捷键 H / 控制栏按钮 / 右键菜单，同样会切换 Windows 的“使用 HDR” |
 | 读取屏幕参数 | 运行时通过 DXGI `IDXGIOutput6::GetDesc1` 读取 EDID 的峰值/全屏亮度、原色等 |
 | 字幕 | 拖到画面上即可加载；Z/X 或右键菜单调整延迟（按文件记忆）；设置里可选字体（列出已安装字体）、字号、自动加载规则；首选音轨 / 字幕语言可从下拉框选（简体 / 繁体中文找不到时互相替代，再找不到用英语；其它语言找不到用英语），或手动输入语言代码列表（严格按顺序匹配，全角 / 半角逗号均可） |
+| 自动同步字幕 | 右键 → 字幕 → **自动同步字幕（ffsubsync）**：用 [ffsubsync](https://github.com/smacke/ffsubsync) 按当前音轨的人声对齐当前字幕（整体偏移 + 帧率差，如 23.976↔25），生成“原名.synced.srt/ass”并自动切换过去，原文件不动；内嵌的文字字幕会先提取出来再同步，没选字幕时让你选一个文件。GBK 等编码自动识别，输出 UTF-8；ASS 样式保留。同步期间画面上显示进度，同一菜单项可取消。图形字幕（PGS / VobSub）不支持 |
 | 播放列表 | 侧边栏（P），拖入的视频会加入列表；退出时保存，下次空着启动时恢复（只恢复列表，不自动播放），覆盖安装 / 升级后也保留 |
 | 记住进度和延迟 | 每个文件分别记住上次的播放进度、音频延迟、字幕延迟，再次打开时自动套用（Home 键从头开始）；看完的文件下次从头开始。设置 → 操作 里可分别关闭 |
 | 视频参数 | 右键 → 视频参数（I），每秒刷新；播放列表里右键其它文件也能查看（后台读取，不影响播放），并列出全部音轨 / 字幕轨 |
@@ -79,7 +81,7 @@ dotnet build -c Release
 | Ctrl+O | 打开文件 |
 | Home | 从头开始播放 |
 | F5 | 重新载入当前文件（回到原位置），让“打开文件时才读取”的设置立即生效 |
-| 右键 | 菜单：视频参数、在资源管理器中显示、切换音轨 / 字幕轨、音频 / 字幕延迟、HDR、解码方式、设置……（mpv 原生菜单） |
+| 右键 | 菜单：视频参数、在资源管理器中显示、切换音轨 / 字幕轨、自动同步字幕、音频 / 字幕延迟、HDR、解码方式、设置…… |
 
 设置保存在 `%APPDATA%\HdrPlayer\settings.json`，播放列表在同目录的 `playlist.json`，每个文件的进度和延迟在 `file-states.json`。
 
