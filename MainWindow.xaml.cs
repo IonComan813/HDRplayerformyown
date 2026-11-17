@@ -336,8 +336,8 @@ public partial class MainWindow : FluentWindow
         // 5.1 / 7.1 → 立体声由 mpv（libswresample）按标准矩阵下混
         set("audio-channels", S.DownmixToStereo ? "stereo" : "auto-safe");
         set("audio-normalize-downmix", S.NormalizeDownmix ? "yes" : "no");
-        set("alang", S.AudioLanguages);
-        set("slang", S.SubLanguages);
+        set("alang", AppSettings.NormalizeLanguageList(S.AudioLanguages));
+        set("slang", AppSettings.NormalizeLanguageList(S.SubLanguages));
         set("sub-auto", S.SubAuto);
         set("sub-font", S.SubFont);
         set("sub-font-size", S.SubFontSize.ToString(Inv));

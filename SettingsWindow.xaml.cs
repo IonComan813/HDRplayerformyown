@@ -36,13 +36,24 @@ public partial class SettingsWindow : FluentWindow
         ("strip", "剥离 RPU，只播放 HDR10 / HLG 基础层"),
     };
 
+    // 每个选项背后是一串语言代码：片源里的语言标记五花八门（ISO 639-2 的 chi / zho、639-1 的 zh、
+    // BCP 47 的 zh-Hans、民间常用的 chs / cht……），所以一种语言要列多个代码。mpv 按顺序依次匹配，用第一个找得到的。
     private static readonly (string, string)[] AudioLanguageChoices =
     {
         ("eng,en", "英语"),
         ("chi,zho,chs,cht,zh,zh-Hans,zh-Hant,cmn,yue", "中文（普通话 / 粤语）"),
         ("jpn,ja", "日语"),
         ("kor,ko", "韩语"),
-        ("", "不指定（用文件标记的默认音轨）"),
+    };
+
+    private static readonly (string, string)[] SubLanguageChoices =
+    {
+        ("chi,zho,chs,zh,zh-Hans,eng,en", "中文，没有就用英语"),
+        ("chs,sc,zh-Hans,zh-CN,chi,zho,zh", "简体中文"),
+        ("cht,tc,zh-Hant,zh-TW,zh-HK,chi,zho,zh", "繁体中文"),
+        ("eng,en", "英语"),
+        ("jpn,ja", "日语"),
+        ("kor,ko", "韩语"),
     };
 
     /// <summary>字幕字体：先列常用的中文字体（装了的才列），再列其余已安装字体；显示中文名（如果有）+ 英文名。</summary>
@@ -220,7 +231,7 @@ public partial class SettingsWindow : FluentWindow
         AddCombo(p, "输出设备", null, devices.ToArray(), _s.AudioDevice, v => _s.AudioDevice = v);
         AddToggle(p, "多声道下混到立体声", "5.1 / 7.1 → 2.0", _s.DownmixToStereo, v => _s.DownmixToStereo = v);
         AddToggle(p, "下混时归一化", "防削波，但整体音量会变小", _s.NormalizeDownmix, v => _s.NormalizeDownmix = v);
-        AddCombo(p, "首选音轨语言", "有多条音轨时优先选这种语言。" + ReloadNote, AudioLanguageChoices, _s.AudioLanguages,
+        AddLanguagePicker(p, "首选音轨语言", "有多条音轨时优先选这种语言。" + ReloadNote, AudioLanguageChoices, _s.AudioLanguages,
             v => _s.AudioLanguages = v);
         AddNote(p, "音频延迟按文件记忆，在画面右键菜单 → 音频延迟 里调整。");
         return p;
@@ -232,7 +243,8 @@ public partial class SettingsWindow : FluentWindow
         AddCombo(p, "字体", "SRT 等纯文本字幕使用（ASS 字幕自带字体样式）", FontChoices(), _s.SubFont, v => _s.SubFont = v);
         AddNumber(p, "字号", null, _s.SubFontSize, 10, 120, 1, v => _s.SubFontSize = (int)v);
         AddCombo(p, "自动加载外挂字幕", ReloadNote, SubAutoChoices, _s.SubAuto, v => _s.SubAuto = v);
-        AddText(p, "首选字幕语言", ReloadNote, _s.SubLanguages, v => _s.SubLanguages = v);
+        AddLanguagePicker(p, "首选字幕语言", "有多条字幕轨时优先选这种语言。" + ReloadNote, SubLanguageChoices, _s.SubLanguages,
+            v => _s.SubLanguages = v);
         AddNote(p, "把字幕文件直接拖到画面上即可加载。字幕延迟按文件记忆，在画面右键菜单 → 字幕延迟 里调整。\n" +
                    "快捷键：Z 提前 / X 延后 / V 显示开关 / J 切换字幕轨。");
         return p;
@@ -356,11 +368,43 @@ public partial class SettingsWindow : FluentWindow
         _commit.Add(() => setter(ReadNumber(nb, value)));
     }
 
-    private void AddText(Panel page, string title, string? description, string value, Action<string> setter)
+    /// <summary>
+    /// 语言下拉框 + “手动输入”。手动输入时显示输入框，按顺序填语言代码，例如 chi,zho,chs,zh,zh-Hans,eng,en；
+    /// 全角 / 半角逗号、逗号后有无空格都可以，保存时统一整理。输入框留空表示不指定（用文件标记的默认轨道）。
+    /// </summary>
+    private void AddLanguagePicker(Panel page, string title, string? description, (string Value, string Name)[] choices,
+        string current, Action<string> setter)
     {
-        var tb = new TextBox { Text = value, Width = 260, ClearButtonEnabled = false };
-        AddCard(page, title, description, tb);
-        _commit.Add(() => setter(tb.Text.Trim()));
+        const string Manual = "手动输入";
+        string cur = AppSettings.NormalizeLanguageList(current);
+        int idx = Array.FindIndex(choices, c => string.Equals(c.Value, cur, StringComparison.OrdinalIgnoreCase));
+
+        var combo = new ComboBox { MinWidth = 200 };
+        foreach (var c in choices) combo.Items.Add(c.Name);
+        combo.Items.Add(Manual);
+        var box = new TextBox
+        {
+            Width = 280, Margin = new Thickness(8, 0, 0, 0), ClearButtonEnabled = false,
+            PlaceholderText = "如 chi,zho,chs,zh,zh-Hans,eng,en",
+            Text = idx >= 0 ? choices[idx].Value : cur,
+        };
+        combo.SelectionChanged += (_, _) =>
+        {
+            bool manual = combo.SelectedIndex == choices.Length;
+            box.Visibility = manual ? Visibility.Visible : Visibility.Collapsed;
+            // 从某个预设切到手动输入时，用那个预设的代码作为起点，方便在它的基础上改
+            if (!manual && combo.SelectedIndex >= 0) box.Text = choices[combo.SelectedIndex].Value;
+        };
+        combo.SelectedIndex = idx >= 0 ? idx : choices.Length;
+        box.Visibility = idx >= 0 ? Visibility.Collapsed : Visibility.Visible;
+
+        var panel = new StackPanel { Orientation = Orientation.Horizontal };
+        panel.Children.Add(combo);
+        panel.Children.Add(box);
+        AddCard(page, title, description, panel);
+        _commit.Add(() => setter(combo.SelectedIndex >= 0 && combo.SelectedIndex < choices.Length
+            ? choices[combo.SelectedIndex].Value
+            : AppSettings.NormalizeLanguageList(box.Text)));
     }
 
     private static void AddNote(Panel page, string text)

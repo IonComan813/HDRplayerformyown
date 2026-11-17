@@ -77,6 +77,14 @@ internal sealed class AppSettings
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = true };
 
+    /// <summary>
+    /// 把语言列表整理成 mpv 要的格式：“chi，zho, chs ,eng”→“chi,zho,chs,eng”。
+    /// 全角 / 半角逗号（以及顿号、分号）都当作分隔符，去掉空格和空项，顺序不变（mpv 按顺序依次匹配）。
+    /// </summary>
+    public static string NormalizeLanguageList(string? list) =>
+        string.Join(",", (list ?? "").Split(new[] { ',', '，', '、', ';', '；' },
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+
     /// <summary>设置文件格式版本，用于升级时调整旧设置的默认值。</summary>
     public int SettingsVersion { get; set; }
     private const int CurrentVersion = 2;
