@@ -47,7 +47,7 @@ Name: "chs"; MessagesFile: "ChineseSimplified.isl"
 
 [Tasks]
 ; 每个后缀一个勾选框：勾选的设为用 HdrPlayer 打开；不勾的也会出现在右键“打开方式”里
-Name: "assoc"; Description: "用 HdrPlayer 作为以下文件的默认播放器（安装完成后在 Windows 设置里点一下确认）"; GroupDescription: "文件关联（不勾选的后缀也会出现在右键“打开方式”里）："
+Name: "assoc"; Description: "用 HdrPlayer 作为以下文件的默认播放器（安装完成时可一键设置）"; GroupDescription: "文件关联（不勾选的后缀也会出现在右键“打开方式”里）："
 Name: "assoc\xmkv"; Description: ".mkv　Matroska 视频"
 Name: "assoc\xmp4"; Description: ".mp4　MPEG-4 视频"
 Name: "assoc\xm4v"; Description: ".m4v　MPEG-4 视频（iTunes）"
@@ -328,7 +328,7 @@ begin
     WizardForm.FinishedLabel.Caption :=
       'HdrPlayer 已安装。' + #13#10 + #13#10 +
       '勾选下面的“一键设为默认播放器”并点“完成”，确认管理员权限后，注销并重新登录（或重启），' +
-      '刚才勾选的视频后缀就都会用 HdrPlayer 打开。之后可在 设置 → 操作 里取消。' + #13#10 + #13#10 +
+      '刚才勾选的视频后缀就都会用 HdrPlayer 打开。之后可在 HdrPlayer 的 全局设置 → 操作 里取消。' + #13#10 + #13#10 +
       '（Windows 家庭版官方不支持这种方式，可改用“打开 Windows 默认应用设置”手动设置。）';
     // 文字变长了：让标签按内容增高，并把下面的勾选列表往下挪，免得被挡住
     WizardForm.FinishedLabel.AdjustHeight;

@@ -126,6 +126,21 @@ internal static class MpvNative
     public static extern int mpv_command_string(IntPtr ctx, [MarshalAs(UnmanagedType.LPUTF8Str)] string args);
 
     [DllImport(Lib, CallingConvention = CC)]
+    public static extern int mpv_hook_add(IntPtr ctx, ulong replyUserdata,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string name, int priority);
+
+    [DllImport(Lib, CallingConvention = CC)]
+    public static extern int mpv_hook_continue(IntPtr ctx, ulong id);
+
+    /// <summary>mpv_event_hook</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MpvEventHook
+    {
+        public IntPtr name;
+        public ulong id;
+    }
+
+    [DllImport(Lib, CallingConvention = CC)]
     public static extern int mpv_observe_property(IntPtr ctx, ulong userdata,
         [MarshalAs(UnmanagedType.LPUTF8Str)] string name, MpvFormat format);
 }
@@ -148,6 +163,14 @@ internal sealed class Mpv : IDisposable
     public event Action? AudioReconfig;
     public event Action? PlaybackRestart;
     public event Action? Shutdown;
+
+    /// <summary>
+    /// mpv 钩子（先用 AddHook 注册）。在事件线程上同步调用，mpv 会一直等到处理函数返回才继续，
+    /// 所以这里可以设置只对当前文件生效的选项（file-local-options/…）。处理函数返回后自动调用 mpv_hook_continue。
+    /// </summary>
+    public event Action<string>? Hook;
+
+    public void AddHook(string name, int priority = 0) => MpvNative.mpv_hook_add(_ctx, 0, name, priority);
 
     public bool IsAlive => _ctx != IntPtr.Zero && !_stopping;
 
@@ -479,6 +502,14 @@ internal sealed class Mpv : IDisposable
                     case MpvEventId.PlaybackRestart:
                         PlaybackRestart?.Invoke();
                         break;
+                    case MpvEventId.Hook:
+                    {
+                        var he = Marshal.PtrToStructure<MpvNative.MpvEventHook>(ev.data);
+                        // 不管处理函数是否出错都必须 continue，否则 mpv 会一直卡在这个文件上
+                        try { Hook?.Invoke(Marshal.PtrToStringUTF8(he.name) ?? ""); }
+                        finally { MpvNative.mpv_hook_continue(_ctx, he.id); }
+                        break;
+                    }
                     case MpvEventId.ClientMessage:
                     {
                         var cm = Marshal.PtrToStructure<MpvNative.MpvEventClientMessage>(ev.data);
