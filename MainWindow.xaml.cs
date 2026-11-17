@@ -1341,7 +1341,14 @@ public partial class MainWindow : FluentWindow
         t.Start();
     }
 
-    private List<object> ToWpfMenu(List<MenuEntry> items) => items.Select(e =>
+    private List<object> ToWpfMenu(List<MenuEntry> items)
+    {
+        // 这一级菜单里有打勾的项时，所有项都留出对勾的位置，文字对齐；一项都没勾就都不留
+        bool reserveTick = items.Any(e => e.Checked == true);
+        return items.Select(e => ToWpfMenuItem(e, reserveTick)).ToList();
+    }
+
+    private object ToWpfMenuItem(MenuEntry e, bool reserveTick)
     {
         if (e.IsSeparator) return (object)new Separator();
         // MenuItem 会把 “_” 当作访问键，转义一下
@@ -1349,25 +1356,21 @@ public partial class MainWindow : FluentWindow
         {
             Header = e.Title.Replace("_", "__"), InputGestureText = e.Shortcut ?? "", IsEnabled = e.Enabled,
         };
-        // WPF-UI 的菜单只有 IsCheckable 时才画勾选框（而且每项都是一个框），这里自己在图标位置画对勾：
-        // 选中的显示对勾，同组没选中的留出同样宽度，文字对齐
-        if (e.Checked is bool isChecked)
+        // WPF-UI 的菜单只有 IsCheckable 时才画勾选框（而且每项都是一个框），这里自己在图标位置画对勾
+        if (e.Checked == true)
         {
-            if (isChecked)
-            {
-                var tick = new SymbolIcon { Symbol = SymbolRegular.Checkmark24, FontSize = 16, Width = 16 };
-                tick.SetResourceReference(Control.ForegroundProperty, "AccentTextFillColorPrimaryBrush");
-                mi.Icon = tick;
-            }
-            else
-            {
-                mi.Icon = new Border { Width = 16 };
-            }
+            var tick = new SymbolIcon { Symbol = SymbolRegular.Checkmark24, FontSize = 16, Width = 16 };
+            tick.SetResourceReference(Control.ForegroundProperty, "AccentTextFillColorPrimaryBrush");
+            mi.Icon = tick;
+        }
+        else if (reserveTick)
+        {
+            mi.Icon = new Border { Width = 16 };
         }
         if (e.Sub != null) foreach (var sub in ToWpfMenu(e.Sub)) mi.Items.Add(sub);
         if (e.Cmd != null) { string cmd = e.Cmd; mi.Click += (_, _) => _mpv?.CommandString(cmd); }
         return mi;
-    }).ToList();
+    }
 
     private static string TrackText(Dictionary<string, object?> t)
     {
