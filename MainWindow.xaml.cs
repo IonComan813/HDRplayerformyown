@@ -290,6 +290,8 @@ public partial class MainWindow : FluentWindow
     {
         Func<string, string, int> set = initial ? m.SetOption : m.SetProperty;
         set("hwdec", S.Hwdec);
+        // 软解线程数：运行时修改从下一个文件开始生效（解码器重新初始化时）
+        set("vd-lavc-threads", Math.Clamp(S.DecoderThreads, 0, 64).ToString(Inv));
         set("scale", S.Scale);
         set("dscale", S.Dscale);
         set("deband", S.Deband ? "yes" : "no");

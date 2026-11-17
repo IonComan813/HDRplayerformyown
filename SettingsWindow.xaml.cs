@@ -145,6 +145,8 @@ public partial class SettingsWindow : FluentWindow
     {
         var p = NewPage("解码 / 渲染");
         AddCombo(p, "解码方式", null, HwdecChoices, _s.Hwdec, v => _s.Hwdec = v);
+        AddNumber(p, "软解线程数", $"0 = 自动（按 CPU 逻辑核心数，最多 16；本机 {Environment.ProcessorCount} 个逻辑核心）。从下一个文件开始生效",
+            _s.DecoderThreads, 0, 64, 1, v => _s.DecoderThreads = (int)v);
         AddCombo(p, "渲染 API", "重启播放器后生效", GpuApiChoices, _s.GpuApi, v => _s.GpuApi = v);
         AddCombo(p, "放大算法", null, ScaleChoices, _s.Scale, v => _s.Scale = v);
         AddCombo(p, "缩小算法", null, DscaleChoices, _s.Dscale, v => _s.Dscale = v);

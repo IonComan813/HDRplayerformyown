@@ -37,6 +37,7 @@ dotnet build -c Release
 | HDR10 | mpv `vo=gpu-next` + D3D11，输出 PQ/BT.2020，按显示器 EDID 峰值做色调映射 |
 | HDR10+ | 检测到动态元数据后，自动改用 ST 2094-40 曲线并关闭逐帧峰值检测 |
 | 杜比视界 | 默认保留 RPU，由 gpu-next（libplacebo）按逐帧动态元数据重塑 + 色调映射，**Profile 5（IPTPQc2）也能正确播放**，P8.1 / P8.4 / P7 同样适用。设置里可改为“剥离 RPU”只播放基础层（此时 P5 会提示不兼容） |
+| 解码 | 默认 D3D11VA 硬解；显卡不支持的格式（如 H.264 10-bit / Hi10P）自动改用软解，硬解中途连续出错也会回退。软解线程数可在设置里改，默认自动（按逻辑核心数，最多 16） |
 | 5.1/7.1 → 立体声 | `audio-channels=stereo`（libswresample 标准下混矩阵） |
 | 自动 HDR | 空着启动播放器**不会**改动 Windows 的 HDR 开关；打开 HDR 片源（HDR10 / HDR10+ / HLG / 杜比视界，包括通过“打开方式”直接启动）时自动开启 HDR 输出并打开 Windows 的“使用 HDR”；SDR 片源自动关闭。切换期间短暂暂停，纯音频和带封面的音乐文件不触发切换。退出时把 Windows HDR 还原为启动前的状态 |
 | 随时开关 HDR | 快捷键 H / 控制栏按钮 / 右键菜单，同样会切换 Windows 的“使用 HDR” |

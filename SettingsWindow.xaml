@@ -8,6 +8,7 @@
     Height="700"
     MinWidth="760"
     MinHeight="480"
+    Icon="pack://application:,,,/Assets/HdrPlayer.ico"
     ExtendsContentIntoTitleBar="True"
     ShowInTaskbar="False"
     WindowBackdropType="Mica"
