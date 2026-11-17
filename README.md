@@ -38,7 +38,7 @@ dotnet build -c Release
 | HDR10+ | 检测到动态元数据后，自动改用 ST 2094-40 曲线并关闭逐帧峰值检测 |
 | 杜比视界 | 默认保留 RPU，由 gpu-next（libplacebo）按逐帧动态元数据重塑 + 色调映射，**Profile 5（IPTPQc2）也能正确播放**，P8.1 / P8.4 / P7 同样适用。设置里可改为“剥离 RPU”只播放基础层（此时 P5 会提示不兼容） |
 | 5.1/7.1 → 立体声 | `audio-channels=stereo`（libswresample 标准下混矩阵） |
-| 自动 HDR | 空着启动播放器**不会**改动 Windows 的 HDR 开关；打开 HDR 片源（HDR10 / HDR10+ / HLG / 杜比视界，包括通过“打开方式”直接启动）时自动开启 HDR 输出并打开 Windows 的“使用 HDR”，切换期间短暂暂停；SDR 片源不会关掉已开启的 HDR。退出时把 Windows HDR 还原为启动前的状态 |
+| 自动 HDR | 空着启动播放器**不会**改动 Windows 的 HDR 开关；打开 HDR 片源（HDR10 / HDR10+ / HLG / 杜比视界，包括通过“打开方式”直接启动）时自动开启 HDR 输出并打开 Windows 的“使用 HDR”；SDR 片源自动关闭。切换期间短暂暂停，纯音频和带封面的音乐文件不触发切换。退出时把 Windows HDR 还原为启动前的状态 |
 | 随时开关 HDR | 快捷键 H / 控制栏按钮 / 右键菜单，同样会切换 Windows 的“使用 HDR” |
 | 读取屏幕参数 | 运行时通过 DXGI `IDXGIOutput6::GetDesc1` 读取 EDID 的峰值/全屏亮度、原色等 |
 | 字幕 | 拖到画面上即可加载；Z/X 调整延迟；设置里可改字体、字号、自动加载规则 |

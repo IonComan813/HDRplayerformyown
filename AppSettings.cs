@@ -8,7 +8,7 @@ internal sealed class AppSettings
 {
     // ---- HDR ----
     // HDR 输出的开 / 关不保存：启动时跟随 Windows 当前的“使用 HDR”状态，空着启动不会去改系统设置。
-    /// <summary>打开 HDR 片源时自动开启 HDR 输出（必要时打开 Windows HDR）。</summary>
+    /// <summary>按片源自动切换 HDR 输出：HDR 片源开启、SDR 片源关闭（必要时同时切换 Windows HDR）。</summary>
     public bool AutoHdrForHdrVideo { get; set; } = true;
     /// <summary>开关 HDR 输出（手动或自动）时，同时切换 Windows 的“使用 HDR”。</summary>
     public bool AutoSwitchWindowsHdr { get; set; } = true;

@@ -321,7 +321,7 @@ public partial class MainWindow : FluentWindow
     }
 
     /// <summary>
-    /// 开关 HDR 输出。manual = 用户按 H / 按钮 / 菜单；否则是打开 HDR 片源时的自动开启。
+    /// 开关 HDR 输出。manual = 用户按 H / 按钮 / 菜单；否则是按片源自动切换（HDR 片源开，SDR 片源关）。
     /// 只有这里会去改 Windows 的“使用 HDR”。
     /// </summary>
     private void SetHdr(bool on, bool manual)
@@ -352,7 +352,7 @@ public partial class MainWindow : FluentWindow
         _hdrOn = on;
         ApplyMpvHdrProps();
         UpdateHdrButton();
-        m.ShowText(!manual ? "检测到 HDR 片源，已开启 HDR 输出"
+        m.ShowText(!manual ? (on ? "HDR 片源，已开启 HDR 输出" : "SDR 片源，已关闭 HDR 输出")
                    : on ? "HDR 输出：开" : "HDR 输出：关（HDR 片源色调映射到 SDR）");
 
         if (switched)
@@ -374,16 +374,21 @@ public partial class MainWindow : FluentWindow
         }
     }
 
-    /// <summary>视频参数确定后（每个文件第一次 video-reconfig），HDR 片源自动开启 HDR 输出。</summary>
+    /// <summary>
+    /// 视频参数确定后（每个文件第一次 video-reconfig）按片源自动切换：HDR 片源开启 HDR，SDR 片源关闭 HDR。
+    /// </summary>
     private void MaybeAutoHdr()
     {
         var m = _mpv;
         if (_autoHdrChecked || m == null || _idle) return;
         string? gamma = m.GetString("video-params/gamma");
-        if (gamma == null) return; // 还没解码出第一帧
+        if (gamma == null) return; // 还没解码出第一帧（纯音频文件永远不会到这里）
         _autoHdrChecked = true;
+        if (!S.AutoHdrForHdrVideo) return;
+        // 音乐文件的封面图也算“视频轨”，不能因为它把 HDR 关掉
+        if (m.GetFlag("current-tracks/video/image") == true) return;
         bool hdrSource = gamma is "pq" or "hlg" || _dvProfile != null;
-        if (hdrSource && S.AutoHdrForHdrVideo && !_hdrOn) SetHdr(true, manual: false);
+        if (hdrSource != _hdrOn) SetHdr(hdrSource, manual: false);
     }
 
     private float DisplayPeak()

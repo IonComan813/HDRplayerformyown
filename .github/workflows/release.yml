@@ -64,7 +64,8 @@ jobs:
           $archive = Get-ChildItem mpv -Filter *.7z | Select-Object -First 1
           if (-not $archive) { throw "没有找到 mpv-dev-x86_64-v3 压缩包" }
           Write-Host "libmpv: $($archive.Name)"
-          7z e $archive.FullName libmpv-2.dll -o"publish" -y | Out-Null
+          # 压缩包里还有 include/、libmpv.dll.a 等开发文件，只解出 libmpv-2.dll（-r：不管它在哪层目录）
+          7z e $archive.FullName libmpv-2.dll -r -o"publish" -y | Out-Null
           if (-not (Test-Path publish/libmpv-2.dll)) { throw "压缩包里没有 libmpv-2.dll" }
           "$($archive.Name)" | Out-File -Encoding utf8 publish/libmpv-version.txt
 

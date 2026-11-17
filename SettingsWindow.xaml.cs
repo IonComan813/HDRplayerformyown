@@ -118,11 +118,11 @@ public partial class SettingsWindow : FluentWindow
             : "无法读取显示器 HDR 信息";
         AddNote(p, disp);
 
-        AddToggle(p, "播放 HDR 片源时自动开启 HDR",
-            "HDR10 / HDR10+ / HLG / 杜比视界片源开始播放时自动开启 HDR 输出。空着启动播放器不会改动系统设置。",
+        AddToggle(p, "按片源自动切换 HDR",
+            "HDR10 / HDR10+ / HLG / 杜比视界片源开始播放时自动开启 HDR，SDR 片源自动关闭。空着启动播放器不会改动系统设置。",
             _s.AutoHdrForHdrVideo, v => _s.AutoHdrForHdrVideo = v);
         AddToggle(p, "开关 HDR 时同时切换 Windows 的“使用 HDR”",
-            "自动开启和手动按 H / 点 HDR 按钮都会切换系统 HDR。关闭此项则只改播放器的输出方式。",
+            "自动切换和手动按 H / 点 HDR 按钮都会切换系统 HDR。关闭此项则只改播放器的输出方式。",
             _s.AutoSwitchWindowsHdr, v => _s.AutoSwitchWindowsHdr = v);
         AddToggle(p, "退出时恢复原来的 Windows HDR 状态", "本次运行中播放器切换过 Windows HDR 时，退出后还原为启动前的状态。",
             _s.RestoreWindowsHdrOnExit, v => _s.RestoreWindowsHdrOnExit = v);
