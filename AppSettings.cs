@@ -54,6 +54,8 @@ internal sealed class AppSettings
     public int SubDelayStepMs { get; set; } = 100;
     /// <summary>鼠标悬停在进度条上时显示该位置的缩略图。</summary>
     public bool SeekThumbnails { get; set; } = true;
+    /// <summary>空着启动时恢复上次的播放列表（不自动播放，按播放从上次的位置继续）。</summary>
+    public bool RestorePlaylist { get; set; } = true;
     public bool DebugLog { get; set; } = false;
 
     // ---- 窗口 ----

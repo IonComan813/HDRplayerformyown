@@ -98,6 +98,9 @@ public partial class MainWindow : FluentWindow
     // 重新载入当前文件：期间临时设置了 mpv 的 start 选项，载入后要清掉
     private bool _reloading;
 
+    // 恢复的播放列表里“上次播到哪”：按播放时从这里继续；开始播放任何文件后清掉
+    private (int Index, double Position)? _resume;
+
     // 关闭流程
     private bool _shuttingDown, _closeReady;
 
@@ -212,6 +215,7 @@ public partial class MainWindow : FluentWindow
         }
         _uiTimer.Start();
         if (_startupFiles.Length > 0) AddFiles(_startupFiles, replace: true);
+        else if (S.RestorePlaylist) RestorePlaylist();
         PositionBar();
         _bar.Reveal();
     }
@@ -578,6 +582,7 @@ public partial class MainWindow : FluentWindow
 
     private void OnStartFile()
     {
+        _resume = null;
         _hdr10Plus = false;
         _dvProfile = null;
         _autoHdrChecked = false;
@@ -653,6 +658,61 @@ public partial class MainWindow : FluentWindow
         m.ShowText("重新载入…");
     }
 
+    /// <summary>从播放列表第 index 项的 position 秒开始播放（借用重新载入时的 start 选项，载入后自动清掉）。</summary>
+    private void PlayFrom(int index, double position)
+    {
+        var m = _mpv;
+        if (m == null) return;
+        _resume = null;
+        if (position > 1)
+        {
+            _reloading = true;
+            m.SetProperty("start", position.ToString("0.###", Inv));
+        }
+        m.Command("playlist-play-index", index.ToString(Inv));
+    }
+
+    /// <summary>空着启动时恢复上次的播放列表：只加入列表、不开始播放（免得一启动就切 HDR、出声音）。</summary>
+    private void RestorePlaylist()
+    {
+        var m = _mpv;
+        var saved = SavedPlaylist.Load();
+        if (m == null || saved == null || saved.Files.Count == 0) return;
+        int restored = 0, current = -1;
+        for (int i = 0; i < saved.Files.Count; i++)
+        {
+            string f = saved.Files[i];
+            if (!File.Exists(f)) continue; // 文件已删除 / 移动 / 所在的盘没接上
+            if (i == saved.Current) current = restored;
+            m.Command("loadfile", f, "append"); // append：空闲时只加入列表，不会开始播放
+            restored++;
+        }
+        if (restored == 0) return;
+        if (current >= 0) _resume = (current, saved.Position);
+        m.ShowText(current >= 0 && saved.Position > 1
+            ? $"已恢复上次的播放列表（{restored} 个文件），按空格从 {FormatTime(saved.Position)} 继续"
+            : $"已恢复上次的播放列表（{restored} 个文件），按空格开始播放", 4000);
+    }
+
+    /// <summary>退出时保存播放列表、正在播放的那一项和位置。</summary>
+    private void SavePlaylistState()
+    {
+        var saved = new SavedPlaylist { Files = _playlist.Select(e => e.Path).Where(p => p.Length > 0).ToList() };
+        int playing = _playlist.FindIndex(e => e.Current);
+        if (!_idle && playing >= 0)
+        {
+            saved.Current = playing;
+            // 已经快放完了就下次从头开始
+            saved.Position = _duration > 0 && _timePos > _duration - 10 ? 0 : _timePos;
+        }
+        else if (_resume is { } r)
+        {
+            // 恢复之后还没继续播放就又退出了：保留原来的位置
+            (saved.Current, saved.Position) = (r.Index, r.Position);
+        }
+        saved.Save();
+    }
+
     /// <summary>
     /// 单击画面：等双击时间过去、确认不是双击后再暂停 / 播放，免得双击全屏时画面先停一下。
     /// 窗口没激活时的那一下单击只用来激活窗口，不暂停。
@@ -711,7 +771,8 @@ public partial class MainWindow : FluentWindow
         switch (action)
         {
             case "pause":
-                if (_idle && _playlist.Count > 0) m.Command("playlist-play-index", "0");
+                if (_idle && _resume is { } r && r.Index < _playlist.Count) PlayFrom(r.Index, r.Position);
+                else if (_idle && _playlist.Count > 0) m.Command("playlist-play-index", "0");
                 else if (_idle) OpenFiles();
                 else m.CommandString("cycle pause");
                 break;
@@ -1404,6 +1465,7 @@ public partial class MainWindow : FluentWindow
             var b = WindowState == WindowState.Normal ? new Rect(Left, Top, Width, Height) : RestoreBounds;
             (S.WinX, S.WinY, S.WinW, S.WinH) = ((int)Math.Round(b.X), (int)Math.Round(b.Y), (int)Math.Round(b.Width), (int)Math.Round(b.Height));
             S.Save();
+            SavePlaylistState();
 
             _uiTimer.Stop();
             _infoWindow?.Close();
