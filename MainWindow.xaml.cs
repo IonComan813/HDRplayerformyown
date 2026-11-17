@@ -1,9 +1,24 @@
+using System.ComponentModel;
 using System.Globalization;
+using System.IO;
 using System.Text;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Input;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Threading;
+using Wpf.Ui.Controls;
+using ContextMenu = System.Windows.Controls.ContextMenu;
+using MenuItem = System.Windows.Controls.MenuItem;
 
 namespace HdrPlayer;
 
-internal sealed class MainForm : Form
+/// <summary>播放列表里的一项（XAML 模板里绑定 Display / Path / Current）。</summary>
+public sealed record PlaylistEntry(int Index, string Display, string Path, bool Current);
+
+public partial class MainWindow : FluentWindow
 {
     private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
 
@@ -32,22 +47,18 @@ internal sealed class MainForm : Form
         ("Ctrl+o", "open"), (".", "frame-step"), (",", "frame-back"),
     };
 
+    /// <summary>鼠标静止多久后隐藏悬浮控制栏（mpv 的鼠标指针也同时隐藏）。</summary>
+    private const int BarHideMs = 2000;
+    /// <summary>悬浮控制栏的最大宽度（DIP），超宽屏 / 全屏时居中显示。</summary>
+    private const double BarMaxWidth = 1280;
+
     private readonly AppSettings S;
     private Mpv? _mpv;
     private readonly string[] _startupFiles;
-
-    // UI
-    private readonly Panel _videoPanel;
-    private readonly TableLayoutPanel _controlBar;
-    private readonly SeekBar _seekBar, _volumeBar;
-    private readonly Button _btnPrev, _btnPlay, _btnNext, _btnHdr, _btnPlaylist, _btnSettings, _btnMute, _btnFull;
-    private static readonly ToolTip Tips = Theme.CreateToolTip();
-    private readonly Label _lblTime, _lblFormat;
-    private readonly Panel _playlistPanel;
-    private readonly ListBox _playlistBox;
-    private readonly ContextMenuStrip _menu;
-    private readonly System.Windows.Forms.Timer _uiTimer;
-    private InfoForm? _infoForm;
+    private readonly ControlBar _bar;
+    private readonly DispatcherTimer _uiTimer;
+    private InfoWindow? _infoWindow;
+    private IntPtr _hwnd;
 
     // 播放状态
     private volatile bool _timeDirty;
@@ -57,163 +68,135 @@ internal sealed class MainForm : Form
     private string? _dvProfile;
     private List<PlaylistEntry> _playlist = new();
 
+    // 悬浮控制栏
+    private Native.POINT _lastCursor;
+    private DateTime _lastActivity = DateTime.UtcNow;
+    private bool _menuOpen;
+
     // 全屏
     private bool _fullscreen;
-    private FormWindowState _prevState;
-    private Rectangle _prevBounds;
+    private WindowState _prevState;
+    private Rect _prevBounds;
     private bool _playlistWasVisible;
 
-    // Windows HDR
+    // HDR：_hdrOn 是本次运行的输出状态。启动时跟随 Windows 当前的 HDR 开关（空着启动不改系统设置），
+    // 打开 HDR 片源时自动开启；_originalWindowsHdr 记录第一次切换前的系统状态，退出时还原。
+    private bool _hdrOn;
+    private bool _autoHdrChecked;
     private bool? _originalWindowsHdr;
     private float _displayPeak;
 
     // 关闭流程
     private bool _shuttingDown, _closeReady;
 
-    private sealed record PlaylistEntry(int Index, string Name, string Path, bool Current);
-
-    public MainForm(string[] args)
+    public MainWindow(string[] args)
     {
         S = AppSettings.Load();
         _startupFiles = args.Where(a => File.Exists(a) || Directory.Exists(a)).ToArray();
 
-        Text = "HdrPlayer";
-        BackColor = Theme.Back;
-        ForeColor = Theme.Text;
-        KeyPreview = true;
-        AllowDrop = true;
-        MinimumSize = new Size(640, 400);
-        Font = new Font("Microsoft YaHei UI", 9f);
-        StartPosition = FormStartPosition.Manual;
-        var wa = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1920, 1080);
-        if (S.WinX < 0 || S.WinY < 0)
-            Bounds = new Rectangle(wa.X + (wa.Width - S.WinW) / 2, wa.Y + (wa.Height - S.WinH) / 2, S.WinW, S.WinH);
-        else
-            Bounds = new Rectangle(S.WinX, S.WinY, S.WinW, S.WinH);
-        if (S.WinMaximized) WindowState = FormWindowState.Maximized;
+        InitializeComponent();
+        RestorePlacement();
+        PlaylistPanel.Visibility = S.PlaylistVisible ? Visibility.Visible : Visibility.Collapsed;
 
-        // ---- 视频区域（mpv 会在这个 Panel 里创建自己的子窗口）----
-        _videoPanel = new Panel { Dock = DockStyle.Fill, BackColor = Color.Black };
+        // ---- 悬浮控制栏 ----
+        _bar = new ControlBar { FormatTime = FormatTime };
+        _bar.BtnOpen.Click += (_, _) => DoAction("open");
+        _bar.BtnPrev.Click += (_, _) => DoAction("prev");
+        _bar.BtnPlay.Click += (_, _) => DoAction("pause");
+        _bar.BtnNext.Click += (_, _) => DoAction("next");
+        _bar.BtnMute.Click += (_, _) => DoAction("mute");
+        _bar.BtnHdr.Click += (_, _) => DoAction("hdr");
+        _bar.BtnPlaylist.Click += (_, _) => DoAction("playlist");
+        _bar.BtnSettings.Click += (_, _) => OpenSettings();
+        _bar.BtnFull.Click += (_, _) => DoAction("fullscreen");
+        _bar.SeekRequested += (v, final) =>
+            _mpv?.Command("seek", v.ToString("0.###", Inv), final ? "absolute+exact" : "absolute+keyframes");
+        _bar.VolumeRequested += v => _mpv?.SetProperty("volume", v);
+        _bar.SetVolume(S.Volume);
+        _bar.BtnPrev.IsEnabled = _bar.BtnNext.IsEnabled = false;
+        _bar.DragOver += OnFileDragOver;
+        _bar.Drop += OnFileDrop;
+        _bar.SizeChanged += (_, _) => PositionBar();
+        _bar.MouseRightButtonUp += (_, e) => { ShowContextMenu(); e.Handled = true; };
 
         // ---- 播放列表 ----
-        _playlistBox = new ListBox
+        BtnPlAdd.Click += (_, _) => OpenFiles();
+        BtnPlRemove.Click += (_, _) => RemoveSelected();
+        BtnPlClear.Click += (_, _) => _mpv?.Command("playlist-clear");
+        BtnPlClose.Click += (_, _) => TogglePlaylist();
+        PlMenuPlay.Click += (_, _) => PlaySelected();
+        PlMenuRemove.Click += (_, _) => RemoveSelected();
+        PlMenuReveal.Click += (_, _) => RevealSelected();
+        PlaylistBox.MouseDoubleClick += (_, e) =>
         {
-            Dock = DockStyle.Fill, BorderStyle = BorderStyle.None, BackColor = Theme.Panel,
-            ForeColor = Theme.Text, DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 26,
-            IntegralHeight = false, HorizontalScrollbar = false,
-        };
-        _playlistBox.DrawItem += PlaylistDrawItem;
-        _playlistBox.DoubleClick += (_, _) => PlaySelected();
-        var plHeader = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Top, Height = 34, BackColor = Theme.Bar, Padding = new Padding(4, 3, 4, 0),
-            FlowDirection = FlowDirection.LeftToRight, WrapContents = false,
-        };
-        plHeader.Controls.Add(new Label
-        {
-            Text = "播放列表", AutoSize = true, ForeColor = Theme.Text, Margin = new Padding(4, 6, 12, 0),
-        });
-        plHeader.Controls.Add(MakeSmallButton("添加", (_, _) => OpenFiles()));
-        plHeader.Controls.Add(MakeSmallButton("移除", (_, _) => RemoveSelected()));
-        plHeader.Controls.Add(MakeSmallButton("清空", (_, _) => _mpv?.Command("playlist-clear")));
-        var plMenu = Theme.NewMenu();
-        plMenu.Items.Add("播放", null, (_, _) => PlaySelected());
-        plMenu.Items.Add("移除", null, (_, _) => RemoveSelected());
-        plMenu.Items.Add("在资源管理器中显示", null, (_, _) => RevealSelected());
-        _playlistBox.ContextMenuStrip = plMenu;
-        _playlistPanel = new Panel { Dock = DockStyle.Right, Width = 320, BackColor = Theme.Panel, Visible = S.PlaylistVisible };
-        _playlistPanel.Controls.Add(_playlistBox);
-        _playlistPanel.Controls.Add(plHeader);
-
-        // ---- 控制栏 ----
-        _btnPrev = MakeButton(Theme.IcoPrev, "上一个 (PgUp)", (_, _) => DoAction("prev"));
-        _btnPlay = MakeButton(Theme.IcoPlay, "播放/暂停 (空格)", (_, _) => DoAction("pause"));
-        _btnNext = MakeButton(Theme.IcoNext, "下一个 (PgDn)", (_, _) => DoAction("next"));
-        _seekBar = new SeekBar { Dock = DockStyle.Fill, Margin = new Padding(6, 0, 6, 0) };
-        _seekBar.ValueRequested += (v, final) =>
-            _mpv?.Command("seek", v.ToString("0.###", Inv), final ? "absolute+exact" : "absolute+keyframes");
-        _seekBar.TipFormatter = v => FormatTime(v);
-        _lblTime = new Label
-        {
-            Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Theme.Text,
-            Text = "00:00 / 00:00", Font = new Font("Consolas", 10f),
-        };
-        _lblFormat = new Label
-        {
-            Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Theme.Dim,
-            Text = "", AutoEllipsis = true,
-        };
-        _btnMute = MakeButton(Theme.IcoVolume, "静音 (M)", (_, _) => DoAction("mute"));
-        _volumeBar = new SeekBar { Dock = DockStyle.Fill, Maximum = 150, Margin = new Padding(0, 0, 6, 0) };
-        _volumeBar.Value = S.Volume;
-        _volumeBar.ValueRequested += (v, _) => _mpv?.SetProperty("volume", Math.Round(v));
-        _volumeBar.TipFormatter = v => $"音量 {Math.Round(v)}";
-        _btnHdr = MakeButton("HDR", "开关 HDR 输出 (H)", (_, _) => DoAction("hdr"));
-        _btnHdr.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
-        _btnPlaylist = MakeButton(Theme.IcoList, "播放列表 (P)", (_, _) => DoAction("playlist"));
-        _btnSettings = MakeButton(Theme.IcoSettings, "设置", (_, _) => OpenSettings());
-        _btnFull = MakeButton(Theme.IcoFullscreen, "全屏 (F / 双击)", (_, _) => DoAction("fullscreen"));
-
-        _controlBar = new TableLayoutPanel
-        {
-            Dock = DockStyle.Bottom, Height = 44, BackColor = Theme.Bar, ColumnCount = 12, RowCount = 1,
-            Padding = new Padding(4, 2, 4, 2),
-        };
-        float[] widths = { 40, 44, 40, -1, 150, 260, 40, 100, 56, 40, 40, 40 };
-        foreach (var w in widths)
-            _controlBar.ColumnStyles.Add(w < 0 ? new ColumnStyle(SizeType.Percent, 100) : new ColumnStyle(SizeType.Absolute, w));
-        _controlBar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        Control[] bar = { _btnPrev, _btnPlay, _btnNext, _seekBar, _lblTime, _lblFormat, _btnMute, _volumeBar, _btnHdr, _btnPlaylist, _btnSettings, _btnFull };
-        for (int i = 0; i < bar.Length; i++) _controlBar.Controls.Add(bar[i], i, 0);
-
-        Controls.Add(_videoPanel);
-        Controls.Add(_playlistPanel);
-        Controls.Add(_controlBar);
-
-        _menu = BuildContextMenu();
-
-        // 画面上的拖放由 mpv 自己处理；播放列表和控制栏上的拖放由这里处理
-        foreach (var c in new Control[] { _playlistBox, _playlistPanel, _controlBar, _lblTime, _lblFormat, _seekBar, _volumeBar })
-        {
-            c.AllowDrop = true;
-            c.DragEnter += (_, e) => OnDragEnter(e);
-            c.DragDrop += (_, e) => OnDragDrop(e);
-        }
-
-        Theme.DarkTitleBar(this);
-        Theme.DarkScrollBars(_playlistBox);
-        _controlBar.Paint += (_, e) =>
-        {
-            using var pen = new Pen(Theme.Border);
-            e.Graphics.DrawLine(pen, 0, 0, _controlBar.Width, 0);
+            if (ItemsControl.ContainerFromElement(PlaylistBox, e.OriginalSource as DependencyObject) is ListBoxItem)
+                PlaySelected();
         };
 
-        _uiTimer = new System.Windows.Forms.Timer { Interval = 100 };
+        // 画面上的拖放由 mpv 自己处理；播放列表、标题栏和控制栏上的拖放由这里处理
+        DragOver += OnFileDragOver;
+        Drop += OnFileDrop;
+        PreviewKeyDown += OnPreviewKeyDown;
+
+        SourceInitialized += (_, _) => _hwnd = new WindowInteropHelper(this).Handle;
+        ContentRendered += OnContentRendered;
+        LocationChanged += (_, _) => PositionBar();
+        SizeChanged += (_, _) => PositionBar();
+        VideoFrame.SizeChanged += (_, _) => PositionBar();
+        DpiChanged += (_, _) => PositionBar();
+        StateChanged += (_, _) =>
+        {
+            UpdateFrameMargins();
+            if (WindowState == WindowState.Minimized) _bar.HideNow();
+            else PositionBar();
+        };
+        UpdateFrameMargins();
+
+        _uiTimer = new DispatcherTimer(DispatcherPriority.Normal) { Interval = TimeSpan.FromMilliseconds(100) };
         _uiTimer.Tick += (_, _) => UiTick();
 
         UpdateHdrButton();
     }
 
-    // =====================================================================
-    //  mpv 初始化
-    // =====================================================================
-
-    protected override void OnShown(EventArgs e)
+    private void RestorePlacement()
     {
-        base.OnShown(e);
+        var work = SystemParameters.WorkArea;
+        double w = Math.Clamp(S.WinW, MinWidth, Math.Max(MinWidth, work.Width));
+        double h = Math.Clamp(S.WinH, MinHeight, Math.Max(MinHeight, work.Height));
+        var saved = new Rect(S.WinX, S.WinY, w, h);
+        var virt = new Rect(SystemParameters.VirtualScreenLeft, SystemParameters.VirtualScreenTop,
+            SystemParameters.VirtualScreenWidth, SystemParameters.VirtualScreenHeight);
+        bool unset = S.WinX == -1 && S.WinY == -1;
+        if (unset || !virt.IntersectsWith(saved))
+            saved = new Rect(work.X + (work.Width - w) / 2, work.Y + (work.Height - h) / 2, w, h);
+        (Left, Top, Width, Height) = (saved.X, saved.Y, saved.Width, saved.Height);
+        if (S.WinMaximized) WindowState = WindowState.Maximized;
+    }
+
+    private async void OnContentRendered(object? sender, EventArgs e)
+    {
+        _bar.Owner = this;
         try
         {
+            if (Video.Hwnd == IntPtr.Zero) throw new InvalidOperationException("视频窗口没有创建");
             InitMpv();
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, "mpv 初始化失败：\n" + ex.Message, "HdrPlayer", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            await Dialogs.ShowAsync(this, "HdrPlayer", "mpv 初始化失败：\n" + ex.Message);
+            _closeReady = true;
             Close();
             return;
         }
         _uiTimer.Start();
         if (_startupFiles.Length > 0) AddFiles(_startupFiles, replace: true);
+        PositionBar();
+        _bar.Reveal();
     }
+
+    // =====================================================================
+    //  mpv 初始化
+    // =====================================================================
 
     private void InitMpv()
     {
@@ -226,7 +209,7 @@ internal sealed class MainForm : Form
         var m = new Mpv();
         _mpv = m;
 
-        m.SetOption("wid", _videoPanel.Handle.ToInt64().ToString(Inv));
+        m.SetOption("wid", Video.Hwnd.ToInt64().ToString(Inv));
         m.SetOption("vo", "gpu-next");
         m.SetOption("gpu-api", S.GpuApi);
         m.SetOption("idle", "yes");
@@ -239,11 +222,12 @@ internal sealed class MainForm : Form
         m.SetOption("input-conf", inputConf);
         m.SetOption("input-vo-keyboard", "yes");
         m.SetOption("input-cursor", "yes");
-        m.SetOption("cursor-autohide", "1000");
+        // 和悬浮控制栏同时隐藏
+        m.SetOption("cursor-autohide", BarHideMs.ToString(Inv));
         // 拖到画面上：字幕文件 → sub-add；视频 → 加入播放列表（空闲时自动开始播放）
         m.SetOption("drag-and-drop", "append");
-        // 杜比视界：剥离 RPU，只用 HDR10 / HLG / SDR 基础层
-        m.SetOption("vf", "format:dolbyvision=no");
+        // 杜比视界：默认保留 RPU，由 gpu-next（libplacebo）做重塑，Profile 5 也能正确显示
+        m.SetOption("vf", DolbyVisionFilter());
         m.SetOption("osd-font", "Microsoft YaHei");
         m.SetOption("osd-font-size", "30");
         m.SetOption("osd-duration", "1500");
@@ -267,7 +251,7 @@ internal sealed class MainForm : Form
         m.StartFile += () => Ui(OnStartFile);
         m.FileLoaded += () => Ui(OnFileLoaded);
         m.EndFile += (r, err) => Ui(() => OnEndFile(r, err));
-        m.VideoReconfig += () => Ui(UpdateFormatLabel);
+        m.VideoReconfig += () => Ui(OnVideoReconfig);
         m.AudioReconfig += () => Ui(UpdateFormatLabel);
         m.ClientMessage += a => Ui(() => OnClientMessage(a));
 
@@ -287,8 +271,19 @@ internal sealed class MainForm : Form
         m.Observe("video-params/scene-max-r", MpvFormat.String);
         m.Observe("video-params/scene-avg", MpvFormat.String);
 
-        ApplyHdrState(showOsd: false);
+        // 启动时不碰 Windows 的 HDR 开关：只读取当前状态，播放器的 HDR 输出跟随它
+        _hdrOn = WindowsHdrIsOn();
+        ApplyMpvHdrProps();
+        UpdateHdrButton();
     }
+
+    /// <summary>
+    /// 杜比视界处理方式对应的视频滤镜。mpv 默认就保留 RPU（dolbyvision=yes），所以“应用 RPU”时不加滤镜；
+    /// 只有“剥离 RPU”时才用 format 滤镜去掉元数据。
+    /// </summary>
+    private string DolbyVisionFilter() => S.DolbyVisionMode == "strip" ? "format:dolbyvision=no" : "";
+
+    private bool DvStripped => S.DolbyVisionMode == "strip";
 
     /// <summary>可在初始化前（option）或运行时（property）应用的播放设置。</summary>
     private void ApplyPlaybackOptions(Mpv m, bool initial)
@@ -317,36 +312,83 @@ internal sealed class MainForm : Form
     //  HDR
     // =====================================================================
 
-    private string CurrentGdiName() => Screen.FromControl(this).DeviceName;
+    private string CurrentGdiName() => _hwnd != IntPtr.Zero ? Native.MonitorOf(_hwnd).Device : "";
 
-    private void ApplyHdrState(bool showOsd)
+    private bool WindowsHdrIsOn()
     {
+        var info = DisplayHelper.Query(CurrentGdiName());
+        return info is { AdvancedColorSupported: true, AdvancedColorEnabled: true } || info is { HasDxgi: true, DxgiIsHdr: true };
+    }
+
+    /// <summary>
+    /// 开关 HDR 输出。manual = 用户按 H / 按钮 / 菜单；否则是按片源自动切换（HDR 片源开，SDR 片源关）。
+    /// 只有这里会去改 Windows 的“使用 HDR”。
+    /// </summary>
+    private void SetHdr(bool on, bool manual)
+    {
+        var m = _mpv;
+        if (m == null || on == _hdrOn) return;
+
         bool switched = false;
-        if (S.AutoSwitchWindowsHdr)
+        string gdi = CurrentGdiName();
+        var info = DisplayHelper.Query(gdi);
+        if (S.AutoSwitchWindowsHdr && info is { AdvancedColorSupported: true } && info.AdvancedColorEnabled != on)
         {
-            string gdi = CurrentGdiName();
-            var info = DisplayHelper.Query(gdi);
-            if (info is { AdvancedColorSupported: true } && info.AdvancedColorEnabled != S.HdrEnabled)
+            bool before = info.AdvancedColorEnabled;
+            if (DisplayHelper.SetWindowsHdr(gdi, on, out string err))
             {
-                _originalWindowsHdr ??= info.AdvancedColorEnabled;
-                if (DisplayHelper.SetWindowsHdr(gdi, S.HdrEnabled, out string err))
-                    switched = true;
-                else if (showOsd)
-                    _mpv?.ShowText("切换 Windows HDR 失败：" + err, 3000);
+                _originalWindowsHdr ??= before;
+                switched = true;
+            }
+            else
+            {
+                m.ShowText("切换 Windows HDR 失败：" + err, 3000);
+                if (!manual) return;
             }
         }
+        // 自动开启时，如果系统 HDR 既没开、也没能切换（显示器不支持 / 设置里不允许切换），就什么都不做
+        if (!manual && on && !switched && !WindowsHdrIsOn()) return;
 
+        _hdrOn = on;
         ApplyMpvHdrProps();
         UpdateHdrButton();
-        if (showOsd) _mpv?.ShowText(S.HdrEnabled ? "HDR 输出：开" : "HDR 输出：关（HDR 片源色调映射到 SDR）");
+        m.ShowText(!manual ? (on ? "HDR 片源，已开启 HDR 输出" : "SDR 片源，已关闭 HDR 输出")
+                   : on ? "HDR 输出：开" : "HDR 输出：关（HDR 片源色调映射到 SDR）");
 
         if (switched)
         {
-            // 显示器切换模式需要一点时间，稍后重新读取 EDID 峰值并重新应用
-            var t = new System.Windows.Forms.Timer { Interval = 1500 };
-            t.Tick += (_, _) => { t.Stop(); t.Dispose(); _displayPeak = 0; ApplyMpvHdrProps(); UpdateFormatLabel(); };
+            // 显示器切换模式（黑屏一下）需要一点时间：自动切换时先暂停，免得错过开头；
+            // 稍后重新读取 EDID 峰值、重新应用 HDR 参数，再继续播放
+            bool resume = !manual && !_idle && m.GetFlag("pause") == false;
+            if (resume) m.SetProperty("pause", true);
+            var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1500) };
+            t.Tick += (_, _) =>
+            {
+                t.Stop();
+                _displayPeak = 0;
+                ApplyMpvHdrProps();
+                UpdateFormatLabel();
+                if (resume) _mpv?.SetProperty("pause", false);
+            };
             t.Start();
         }
+    }
+
+    /// <summary>
+    /// 视频参数确定后（每个文件第一次 video-reconfig）按片源自动切换：HDR 片源开启 HDR，SDR 片源关闭 HDR。
+    /// </summary>
+    private void MaybeAutoHdr()
+    {
+        var m = _mpv;
+        if (_autoHdrChecked || m == null || _idle) return;
+        string? gamma = m.GetString("video-params/gamma");
+        if (gamma == null) return; // 还没解码出第一帧（纯音频文件永远不会到这里）
+        _autoHdrChecked = true;
+        if (!S.AutoHdrForHdrVideo) return;
+        // 音乐文件的封面图也算“视频轨”，不能因为它把 HDR 关掉
+        if (m.GetFlag("current-tracks/video/image") == true) return;
+        bool hdrSource = gamma is "pq" or "hlg" || _dvProfile != null;
+        if (hdrSource != _hdrOn) SetHdr(hdrSource, manual: false);
     }
 
     private float DisplayPeak()
@@ -365,7 +407,7 @@ internal sealed class MainForm : Form
     {
         var m = _mpv;
         if (m == null) return;
-        if (S.HdrEnabled)
+        if (_hdrOn)
         {
             // 让 mpv 按片源切换 swapchain 色彩空间（HDR 片源 → PQ/BT.2020，SDR 片源 → sRGB）
             m.SetProperty("target-colorspace-hint", "yes");
@@ -401,8 +443,8 @@ internal sealed class MainForm : Form
 
     private void UpdateHdrButton()
     {
-        _btnHdr.ForeColor = S.HdrEnabled ? Theme.HdrOn : Theme.Dim;
-        _btnHdr.Text = S.HdrEnabled ? "HDR" : "SDR";
+        _bar.BtnHdr.Content = _hdrOn ? "HDR" : "SDR";
+        _bar.BtnHdr.Foreground = (Brush)FindResource(_hdrOn ? "HdrOnBrush" : "TextFillColorSecondaryBrush");
     }
 
     private void RestoreWindowsHdr()
@@ -417,8 +459,8 @@ internal sealed class MainForm : Form
 
     private void Ui(Action a)
     {
-        if (_shuttingDown || IsDisposed || !IsHandleCreated) return;
-        try { BeginInvoke(a); } catch (InvalidOperationException) { }
+        if (_shuttingDown) return;
+        try { Dispatcher.InvokeAsync(a); } catch (InvalidOperationException) { }
     }
 
     /// <summary>在 mpv 事件线程上调用。time-pos 刷新很频繁，只记录值，由 UI 定时器取用。</summary>
@@ -439,30 +481,32 @@ internal sealed class MainForm : Form
         {
             case "pause":
                 _paused = value is true;
-                _btnPlay.Text = _paused ? Theme.IcoPlay : Theme.IcoPause;
+                _bar.PlayIcon.Symbol = _paused ? SymbolRegular.Play24 : SymbolRegular.Pause24;
                 break;
             case "idle-active":
                 _idle = value is true;
                 if (_idle)
                 {
-                    Text = "HdrPlayer";
+                    SetTitle("HdrPlayer");
                     _duration = 0; _timePos = 0; _timeDirty = true;
-                    _lblFormat.Text = "";
+                    _bar.SetDuration(0);
+                    _bar.FormatText.Text = "";
                 }
+                ShowIdleHint(_idle);
                 break;
             case "duration":
                 _duration = value is double d ? d : 0;
-                _seekBar.Maximum = Math.Max(_duration, 0.001);
+                _bar.SetDuration(_duration);
                 _timeDirty = true;
                 break;
             case "volume":
-                if (value is double v) { _volumeBar.Value = v; S.Volume = v; }
+                if (value is double v) { _bar.SetVolume(v); S.Volume = v; }
                 break;
             case "mute":
-                _btnMute.Text = value is true ? Theme.IcoMute : Theme.IcoVolume;
+                _bar.MuteIcon.Symbol = value is true ? SymbolRegular.SpeakerMute24 : SymbolRegular.Speaker224;
                 break;
             case "media-title":
-                Text = value is string t && t.Length > 0 ? $"{t} - HdrPlayer" : "HdrPlayer";
+                SetTitle(value is string t && t.Length > 0 ? $"{t} - HdrPlayer" : "HdrPlayer");
                 break;
             case "playlist-count":
             case "playlist-pos":
@@ -484,30 +528,56 @@ internal sealed class MainForm : Form
         }
     }
 
+    private void SetTitle(string text)
+    {
+        Title = text;
+        AppTitleBar.Title = text;
+    }
+
+    /// <summary>没有在播放时，画面中央显示一行提示。</summary>
+    private void ShowIdleHint(bool show)
+    {
+        var m = _mpv;
+        if (m == null) return;
+        if (show)
+            m.Command("osd-overlay", "1", "ass-events", @"{\an5\fs26\bord1\1c&HC8C8C8&}拖入视频文件，或按 Ctrl+O 打开");
+        else
+            m.Command("osd-overlay", "1", "none", "");
+    }
+
     private void OnStartFile()
     {
         _hdr10Plus = false;
         _dvProfile = null;
+        _autoHdrChecked = false;
         ApplyToneMapping();
     }
 
-    private void OnFileLoaded()
+    private async void OnFileLoaded()
     {
         var m = _mpv;
         if (m == null) return;
         _dvProfile = m.GetString("current-tracks/video/dolby-vision-profile");
-        if (_dvProfile == "5")
+        // 剥离 RPU 时 Profile 5 没有可用的基础层（IPTPQc2 色彩空间），只能跳过；应用 RPU 时可以正常播放
+        if (_dvProfile == "5" && DvStripped)
         {
             string file = m.GetString("filename") ?? "";
             long pos = m.GetInt("playlist-pos") ?? -1, count = m.GetInt("playlist-count") ?? 0;
             if (pos >= 0 && pos < count - 1) m.Command("playlist-next", "force");
             else m.Command("stop");
-            MessageBox.Show(this,
-                $"{file}\n\n这是杜比视界 Profile 5 片源，没有可直接显示的 HDR10 基础层（使用 IPTPQc2 色彩空间），本播放器不支持。",
-                "不兼容的杜比视界", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            await Dialogs.ShowAsync(this, "不兼容的杜比视界",
+                $"{file}\n\n这是杜比视界 Profile 5 片源，没有可直接显示的 HDR10 基础层（使用 IPTPQc2 色彩空间）。\n" +
+                "当前设置为“剥离 RPU”，无法播放。请在 设置 → HDR → 杜比视界 中改为“应用 RPU”。");
             return;
         }
         UpdateFormatLabel();
+        MaybeAutoHdr();
+    }
+
+    private void OnVideoReconfig()
+    {
+        UpdateFormatLabel();
+        MaybeAutoHdr();
     }
 
     private void OnEndFile(MpvEndReason reason, int error)
@@ -546,12 +616,8 @@ internal sealed class MainForm : Form
             case "mute": m.CommandString("no-osd cycle mute"); m.ShowText("静音：${mute}"); break;
             case "fullscreen": ToggleFullscreen(); break;
             case "exit-fullscreen": if (_fullscreen) ToggleFullscreen(); break;
-            case "menu": _menu.Show(Cursor.Position); break;
-            case "hdr":
-                S.HdrEnabled = !S.HdrEnabled;
-                ApplyHdrState(showOsd: true);
-                S.Save();
-                break;
+            case "menu": ShowContextMenu(); break;
+            case "hdr": SetHdr(!_hdrOn, manual: true); break;
             case "sub-delay-dec": AdjustSubDelay(-S.SubDelayStepMs); break;
             case "sub-delay-inc": AdjustSubDelay(S.SubDelayStepMs); break;
             case "sub-toggle": m.CommandString("no-osd cycle sub-visibility"); m.ShowText("字幕显示：${sub-visibility}"); break;
@@ -576,52 +642,54 @@ internal sealed class MainForm : Form
         m.ShowText($"字幕延迟：{d * 1000:+0;-0;0} ms（{(d < 0 ? "提前" : d > 0 ? "延后" : "无")}）");
     }
 
-    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    private void OnPreviewKeyDown(object sender, KeyEventArgs e)
     {
+        Key key = e.Key == Key.System ? e.SystemKey : e.Key;
+
         // 播放列表获得焦点时，上下键 / 回车 / Delete 留给列表
-        if (_playlistBox.Focused)
+        if (PlaylistBox.IsKeyboardFocusWithin)
         {
-            switch (keyData)
+            switch (key)
             {
-                case Keys.Up: case Keys.Down: case Keys.Home: case Keys.End: return base.ProcessCmdKey(ref msg, keyData);
-                case Keys.Enter: PlaySelected(); return true;
-                case Keys.Delete: RemoveSelected(); return true;
+                case Key.Up: case Key.Down: case Key.Home: case Key.End: return;
+                case Key.Enter: PlaySelected(); e.Handled = true; return;
+                case Key.Delete: RemoveSelected(); e.Handled = true; return;
             }
         }
 
-        string? action = keyData switch
+        string? action = (Keyboard.Modifiers, key) switch
         {
-            Keys.Space => "pause",
-            Keys.Left => "seek-back",
-            Keys.Right => "seek-fwd",
-            Keys.Shift | Keys.Left => "seek-back-big",
-            Keys.Shift | Keys.Right => "seek-fwd-big",
-            Keys.Up => "vol-up",
-            Keys.Down => "vol-down",
-            Keys.M => "mute",
-            Keys.F => "fullscreen",
-            Keys.Enter => "fullscreen",
-            Keys.Escape => "exit-fullscreen",
-            Keys.H => "hdr",
-            Keys.Z => "sub-delay-dec",
-            Keys.X => "sub-delay-inc",
-            Keys.V => "sub-toggle",
-            Keys.J => "sub-cycle",
-            Keys.I => "info",
-            Keys.P => "playlist",
-            Keys.PageUp => "prev",
-            Keys.PageDown => "next",
-            Keys.Control | Keys.O => "open",
-            Keys.OemPeriod => "frame-step",
-            Keys.Oemcomma => "frame-back",
+            (ModifierKeys.None, Key.Space) => "pause",
+            (ModifierKeys.None, Key.Left) => "seek-back",
+            (ModifierKeys.None, Key.Right) => "seek-fwd",
+            (ModifierKeys.Shift, Key.Left) => "seek-back-big",
+            (ModifierKeys.Shift, Key.Right) => "seek-fwd-big",
+            (ModifierKeys.None, Key.Up) => "vol-up",
+            (ModifierKeys.None, Key.Down) => "vol-down",
+            (ModifierKeys.None, Key.M) => "mute",
+            (ModifierKeys.None, Key.F) => "fullscreen",
+            (ModifierKeys.None, Key.Enter) => "fullscreen",
+            (ModifierKeys.None, Key.Escape) => "exit-fullscreen",
+            (ModifierKeys.None, Key.H) => "hdr",
+            (ModifierKeys.None, Key.Z) => "sub-delay-dec",
+            (ModifierKeys.None, Key.X) => "sub-delay-inc",
+            (ModifierKeys.None, Key.V) => "sub-toggle",
+            (ModifierKeys.None, Key.J) => "sub-cycle",
+            (ModifierKeys.Shift, Key.D3) => "audio-cycle",
+            (ModifierKeys.None, Key.I) => "info",
+            (ModifierKeys.None, Key.P) => "playlist",
+            (ModifierKeys.None, Key.PageUp) => "prev",
+            (ModifierKeys.None, Key.PageDown) => "next",
+            (ModifierKeys.Control, Key.O) => "open",
+            (ModifierKeys.None, Key.OemPeriod) => "frame-step",
+            (ModifierKeys.None, Key.OemComma) => "frame-back",
             _ => null,
         };
         if (action != null)
         {
             DoAction(action);
-            return true;
+            e.Handled = true;
         }
-        return base.ProcessCmdKey(ref msg, keyData);
     }
 
     // =====================================================================
@@ -654,35 +722,34 @@ internal sealed class MainForm : Form
         }
     }
 
-    protected override void OnDragEnter(DragEventArgs e)
+    private void OnFileDragOver(object sender, DragEventArgs e)
     {
-        if (e.Data?.GetDataPresent(DataFormats.FileDrop) == true) e.Effect = DragDropEffects.Copy;
-        base.OnDragEnter(e);
+        e.Effects = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
+        e.Handled = true;
     }
 
-    protected override void OnDragDrop(DragEventArgs e)
+    private void OnFileDrop(object sender, DragEventArgs e)
     {
-        if (e.Data?.GetData(DataFormats.FileDrop) is string[] files) AddFiles(files);
-        base.OnDragDrop(e);
+        if (e.Data.GetData(DataFormats.FileDrop) is string[] files) AddFiles(files);
+        e.Handled = true;
     }
 
-    private void OpenFiles()
+    private string[] PickFiles(string filter, string title, bool multi)
     {
-        using var dlg = new OpenFileDialog { Multiselect = true, Filter = VideoFilter, Title = "打开视频" };
-        if (dlg.ShowDialog(this) == DialogResult.OK) AddFiles(dlg.FileNames);
+        var dlg = new Microsoft.Win32.OpenFileDialog { Multiselect = multi, Filter = filter, Title = title };
+        return dlg.ShowDialog(this) == true ? dlg.FileNames : Array.Empty<string>();
     }
+
+    private void OpenFiles() => AddFiles(PickFiles(VideoFilter, "打开视频", true));
 
     private void LoadSubtitle()
     {
-        using var dlg = new OpenFileDialog { Multiselect = true, Filter = SubFilter, Title = "加载字幕" };
-        if (dlg.ShowDialog(this) != DialogResult.OK) return;
-        foreach (var f in dlg.FileNames) _mpv?.Command("sub-add", f, "select");
+        foreach (var f in PickFiles(SubFilter, "加载字幕", true)) _mpv?.Command("sub-add", f, "select");
     }
 
     private void LoadAudioTrack()
     {
-        using var dlg = new OpenFileDialog { Filter = AudioFilter, Title = "加载外部音轨" };
-        if (dlg.ShowDialog(this) == DialogResult.OK) _mpv?.Command("audio-add", dlg.FileName, "select");
+        foreach (var f in PickFiles(AudioFilter, "加载外部音轨", false)) _mpv?.Command("audio-add", f, "select");
     }
 
     private void RefreshPlaylist()
@@ -696,86 +763,68 @@ internal sealed class MainForm : Form
                 string path = d.GetValueOrDefault("filename") as string ?? "";
                 string name = d.GetValueOrDefault("title") as string ?? Path.GetFileName(path);
                 bool cur = d.GetValueOrDefault("current") is true || d.GetValueOrDefault("playing") is true;
-                list.Add(new PlaylistEntry(i, name, path, cur));
+                list.Add(new PlaylistEntry(i, $"{i + 1}. {name}", path, cur));
             }
         }
         _playlist = list;
-        int sel = _playlistBox.SelectedIndex;
-        _playlistBox.BeginUpdate();
-        _playlistBox.Items.Clear();
-        foreach (var e in list) _playlistBox.Items.Add(e);
-        if (sel >= 0 && sel < list.Count) _playlistBox.SelectedIndex = sel;
-        _playlistBox.EndUpdate();
-        _btnPrev.Enabled = _btnNext.Enabled = list.Count > 1;
-    }
-
-    private void PlaylistDrawItem(object? sender, DrawItemEventArgs e)
-    {
-        if (e.Index < 0 || e.Index >= _playlistBox.Items.Count) return;
-        var item = (PlaylistEntry)_playlistBox.Items[e.Index];
-        bool selected = (e.State & DrawItemState.Selected) != 0;
-        using var bg = new SolidBrush(selected ? Color.FromArgb(50, 60, 80) : Theme.Panel);
-        e.Graphics.FillRectangle(bg, e.Bounds);
-        var color = item.Current ? Theme.Accent : Theme.Text;
-        string text = (item.Current ? "▶ " : "   ") + $"{item.Index + 1}. {item.Name}";
-        TextRenderer.DrawText(e.Graphics, text, _playlistBox.Font, Rectangle.Inflate(e.Bounds, -6, 0), color,
-            TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        int sel = PlaylistBox.SelectedIndex;
+        PlaylistBox.ItemsSource = list;
+        if (sel >= 0 && sel < list.Count) PlaylistBox.SelectedIndex = sel;
+        _bar.BtnPrev.IsEnabled = _bar.BtnNext.IsEnabled = list.Count > 1;
     }
 
     private void PlaySelected()
     {
-        if (_playlistBox.SelectedItem is PlaylistEntry e)
+        if (PlaylistBox.SelectedItem is PlaylistEntry e)
             _mpv?.Command("playlist-play-index", e.Index.ToString(Inv));
     }
 
     private void RemoveSelected()
     {
-        if (_playlistBox.SelectedItem is PlaylistEntry e)
+        if (PlaylistBox.SelectedItem is PlaylistEntry e)
             _mpv?.Command("playlist-remove", e.Index.ToString(Inv));
     }
 
     private void RevealSelected()
     {
-        if (_playlistBox.SelectedItem is PlaylistEntry e && File.Exists(e.Path))
+        if (PlaylistBox.SelectedItem is PlaylistEntry e && File.Exists(e.Path))
             System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{e.Path}\"");
     }
 
     private void TogglePlaylist()
     {
         if (_fullscreen) return;
-        _playlistPanel.Visible = !_playlistPanel.Visible;
-        S.PlaylistVisible = _playlistPanel.Visible;
+        bool show = PlaylistPanel.Visibility != Visibility.Visible;
+        PlaylistPanel.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+        S.PlaylistVisible = show;
     }
 
     // =====================================================================
     //  右键菜单
     // =====================================================================
 
-    private ContextMenuStrip BuildContextMenu()
+    private static MenuItem Item(string header, Action? click, string? gesture = null, bool isChecked = false, bool enabled = true)
     {
-        var menu = Theme.NewMenu();
-        // 菜单为空时 WinForms 会默认取消打开，填充后要显式设回 false
-        menu.Opening += (_, e) => { PopulateMenu(menu); e.Cancel = false; };
-        return menu;
+        var mi = new MenuItem { Header = header, InputGestureText = gesture ?? "", IsChecked = isChecked, IsEnabled = enabled };
+        if (click != null) mi.Click += (_, _) => click();
+        return mi;
     }
 
-    private void PopulateMenu(ContextMenuStrip menu)
+    private void ShowContextMenu()
     {
         var m = _mpv;
-        menu.Items.Clear();
-        menu.Items.Add(new ToolStripMenuItem("视频参数…", null, (_, _) => ShowInfo()) { ShortcutKeyDisplayString = "I" });
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(new ToolStripMenuItem("打开文件…", null, (_, _) => OpenFiles()) { ShortcutKeyDisplayString = "Ctrl+O" });
-        menu.Items.Add(new ToolStripMenuItem("加载字幕…", null, (_, _) => LoadSubtitle()) { Enabled = !_idle });
-        menu.Items.Add(new ToolStripMenuItem("加载外部音轨…", null, (_, _) => LoadAudioTrack()) { Enabled = !_idle });
-        menu.Items.Add(new ToolStripSeparator());
+        var menu = new ContextMenu();
+        var items = menu.Items;
+        items.Add(Item("视频参数…", ShowInfo, "I"));
+        items.Add(new Separator());
+        items.Add(Item("打开文件…", OpenFiles, "Ctrl+O"));
+        items.Add(Item("加载字幕…", LoadSubtitle, enabled: !_idle));
+        items.Add(Item("加载外部音轨…", LoadAudioTrack, enabled: !_idle));
+        items.Add(new Separator());
 
-        var audioMenu = new ToolStripMenuItem("音轨");
-        var subMenu = new ToolStripMenuItem("字幕");
-        subMenu.DropDownItems.Add(new ToolStripMenuItem("关闭字幕", null, (_, _) => m?.SetProperty("sid", "no"))
-        {
-            Checked = m?.GetString("sid") is "no" or null,
-        });
+        var audioMenu = Item("音轨", null);
+        var subMenu = Item("字幕", null);
+        subMenu.Items.Add(Item("关闭字幕", () => m?.SetProperty("sid", "no"), isChecked: m?.GetString("sid") is "no" or null));
         if (m?.GetNode("track-list") is List<object?> tracks)
         {
             foreach (var t in tracks.OfType<Dictionary<string, object?>>())
@@ -783,68 +832,49 @@ internal sealed class MainForm : Form
                 string type = t.GetValueOrDefault("type") as string ?? "";
                 if (type != "audio" && type != "sub") continue;
                 long id = t.GetValueOrDefault("id") is long l ? l : 0;
-                string label = TrackLabel(t);
-                bool selected = t.GetValueOrDefault("selected") is true;
-                var item = new ToolStripMenuItem(label) { Checked = selected };
                 string prop = type == "audio" ? "aid" : "sid";
-                item.Click += (_, _) => m?.SetProperty(prop, id.ToString(Inv));
-                (type == "audio" ? audioMenu : subMenu).DropDownItems.Add(item);
+                var item = Item(TrackLabel(t), () => m?.SetProperty(prop, id.ToString(Inv)),
+                    isChecked: t.GetValueOrDefault("selected") is true);
+                (type == "audio" ? audioMenu : subMenu).Items.Add(item);
             }
         }
-        audioMenu.Enabled = audioMenu.DropDownItems.Count > 0;
-        menu.Items.Add(audioMenu);
-        menu.Items.Add(subMenu);
+        audioMenu.IsEnabled = audioMenu.Items.Count > 0;
+        items.Add(audioMenu);
+        items.Add(subMenu);
 
-        var delayMenu = new ToolStripMenuItem("字幕延迟");
-        delayMenu.DropDownItems.Add(new ToolStripMenuItem($"提前 {S.SubDelayStepMs} ms", null, (_, _) => AdjustSubDelay(-S.SubDelayStepMs)) { ShortcutKeyDisplayString = "Z" });
-        delayMenu.DropDownItems.Add(new ToolStripMenuItem($"延后 {S.SubDelayStepMs} ms", null, (_, _) => AdjustSubDelay(S.SubDelayStepMs)) { ShortcutKeyDisplayString = "X" });
-        delayMenu.DropDownItems.Add(new ToolStripMenuItem("重置", null, (_, _) => { m?.SetProperty("sub-delay", "0"); m?.ShowText("字幕延迟：0 ms"); }));
-        menu.Items.Add(delayMenu);
-        menu.Items.Add(new ToolStripSeparator());
+        var delayMenu = Item("字幕延迟", null);
+        delayMenu.Items.Add(Item($"提前 {S.SubDelayStepMs} ms", () => AdjustSubDelay(-S.SubDelayStepMs), "Z"));
+        delayMenu.Items.Add(Item($"延后 {S.SubDelayStepMs} ms", () => AdjustSubDelay(S.SubDelayStepMs), "X"));
+        delayMenu.Items.Add(Item("重置", () => { m?.SetProperty("sub-delay", "0"); m?.ShowText("字幕延迟：0 ms"); }));
+        items.Add(delayMenu);
+        items.Add(new Separator());
 
-        menu.Items.Add(new ToolStripMenuItem("HDR 输出", null, (_, _) => DoAction("hdr"))
+        items.Add(Item("HDR 输出", () => DoAction("hdr"), "H", isChecked: _hdrOn));
+        var decMenu = Item("解码方式", null);
+        foreach (var (val, name) in SettingsWindow.HwdecChoices)
         {
-            Checked = S.HdrEnabled, ShortcutKeyDisplayString = "H",
-        });
-        var decMenu = new ToolStripMenuItem("解码方式");
-        foreach (var (val, name) in SettingsForm.HwdecChoices)
-        {
-            string v = val;
-            decMenu.DropDownItems.Add(new ToolStripMenuItem(name, null, (_, _) =>
+            string v = val, n = name;
+            decMenu.Items.Add(Item(n, () =>
             {
                 S.Hwdec = v;
                 m?.SetProperty("hwdec", v);
-                m?.ShowText("解码方式：" + name);
+                m?.ShowText("解码方式：" + n);
                 S.Save();
-            }) { Checked = S.Hwdec == v });
+            }, isChecked: S.Hwdec == v));
         }
-        menu.Items.Add(decMenu);
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(new ToolStripMenuItem("播放列表", null, (_, _) => TogglePlaylist())
-        {
-            Checked = _playlistPanel.Visible, ShortcutKeyDisplayString = "P",
-        });
-        menu.Items.Add(new ToolStripMenuItem("全屏", null, (_, _) => ToggleFullscreen())
-        {
-            Checked = _fullscreen, ShortcutKeyDisplayString = "F / 双击",
-        });
-        menu.Items.Add(new ToolStripMenuItem("设置…", null, (_, _) => OpenSettings()));
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(new ToolStripMenuItem("退出", null, (_, _) => Close()));
-        StyleDropDowns(menu.Items);
-    }
+        items.Add(decMenu);
+        items.Add(new Separator());
+        items.Add(Item("播放列表", TogglePlaylist, "P", isChecked: PlaylistPanel.Visibility == Visibility.Visible, enabled: !_fullscreen));
+        items.Add(Item("全屏", ToggleFullscreen, "F / 双击", isChecked: _fullscreen));
+        items.Add(Item("设置…", OpenSettings));
+        items.Add(new Separator());
+        items.Add(Item("退出", Close));
 
-    /// <summary>子菜单也套上深色渲染器。</summary>
-    private static void StyleDropDowns(ToolStripItemCollection items)
-    {
-        foreach (var item in items.OfType<ToolStripMenuItem>())
-        {
-            if (!item.HasDropDownItems) continue;
-            item.DropDown.Renderer = Theme.MenuRenderer;
-            item.DropDown.BackColor = Theme.Surface;
-            item.DropDown.ForeColor = Theme.Text;
-            StyleDropDowns(item.DropDownItems);
-        }
+        menu.Closed += (_, _) => _menuOpen = false;
+        menu.PlacementTarget = this;
+        menu.Placement = PlacementMode.MousePoint;
+        _menuOpen = true;
+        menu.IsOpen = true;
     }
 
     private static string TrackLabel(Dictionary<string, object?> t)
@@ -857,38 +887,88 @@ internal sealed class MainForm : Form
         if (t.GetValueOrDefault("demux-channel-count") is long ch) parts.Add(ch + "ch");
         if (t.GetValueOrDefault("default") is true) parts.Add("(默认)");
         if (t.GetValueOrDefault("external") is true) parts.Add("(外部)");
-        return string.Join(" ", parts);
+        // MenuItem 会把 “_” 当作访问键，转义一下
+        return string.Join(" ", parts).Replace("_", "__");
     }
 
     // =====================================================================
-    //  窗口 / 全屏 / UI 刷新
+    //  窗口 / 全屏 / 悬浮控制栏
     // =====================================================================
+
+    /// <summary>窗口化时视频四周留 4px 给缩放边框；最大化 / 全屏时铺满。</summary>
+    private void UpdateFrameMargins()
+    {
+        if (_fullscreen) return;
+        bool max = WindowState == WindowState.Maximized;
+        VideoFrame.Margin = max ? new Thickness(0) : new Thickness(4, 0, 4, 4);
+        PlaylistPanel.Margin = max ? new Thickness(0, 0, 0, 0) : new Thickness(0, 0, 4, 4);
+    }
+
+    private void SetResizeBorder(bool on)
+    {
+        try
+        {
+            if (System.Windows.Shell.WindowChrome.GetWindowChrome(this) is { IsFrozen: false } chrome)
+                chrome.ResizeBorderThickness = on ? new Thickness(4) : new Thickness(0);
+        }
+        catch { }
+    }
+
+    private Matrix FromDevice() =>
+        PresentationSource.FromVisual(this)?.CompositionTarget?.TransformFromDevice ?? Matrix.Identity;
 
     private void ToggleFullscreen()
     {
-        SuspendLayout();
+        _bar.HideNow();
         if (!_fullscreen)
         {
             _prevState = WindowState;
-            _prevBounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
-            _playlistWasVisible = _playlistPanel.Visible;
-            _playlistPanel.Visible = false;
-            _controlBar.Visible = false;
-            FormBorderStyle = FormBorderStyle.None;
-            if (WindowState == FormWindowState.Maximized) WindowState = FormWindowState.Normal;
-            WindowState = FormWindowState.Maximized;
+            _prevBounds = WindowState == WindowState.Normal ? new Rect(Left, Top, Width, Height) : RestoreBounds;
+            _playlistWasVisible = PlaylistPanel.Visibility == Visibility.Visible;
             _fullscreen = true;
+
+            PlaylistPanel.Visibility = Visibility.Collapsed;
+            AppTitleBar.Visibility = Visibility.Collapsed;
+            VideoFrame.Margin = new Thickness(0);
+            SetResizeBorder(false);
+            WindowCornerPreference = WindowCornerPreference.DoNotRound;
+
+            // 普通窗口状态 + 尺寸等于整块屏幕：Windows 会把它当作全屏窗口，任务栏自动让开
+            var (_, mon) = Native.MonitorOf(_hwnd);
+            if (WindowState != WindowState.Normal) WindowState = WindowState.Normal;
+            var m = FromDevice();
+            var tl = m.Transform(new Point(mon.Left, mon.Top));
+            var br = m.Transform(new Point(mon.Right, mon.Bottom));
+            (Left, Top, Width, Height) = (tl.X, tl.Y, br.X - tl.X, br.Y - tl.Y);
         }
         else
         {
-            FormBorderStyle = FormBorderStyle.Sizable;
-            WindowState = _prevState;
-            if (_prevState == FormWindowState.Normal) Bounds = _prevBounds;
-            _controlBar.Visible = true;
-            _playlistPanel.Visible = _playlistWasVisible;
             _fullscreen = false;
+            AppTitleBar.Visibility = Visibility.Visible;
+            PlaylistPanel.Visibility = _playlistWasVisible ? Visibility.Visible : Visibility.Collapsed;
+            SetResizeBorder(true);
+            WindowCornerPreference = WindowCornerPreference.Round;
+            (Left, Top, Width, Height) = (_prevBounds.X, _prevBounds.Y, _prevBounds.Width, _prevBounds.Height);
+            WindowState = _prevState;
+            UpdateFrameMargins();
         }
-        ResumeLayout();
+        _bar.FullIcon.Symbol = _fullscreen ? SymbolRegular.FullScreenMinimize24 : SymbolRegular.FullScreenMaximize24;
+        _lastActivity = DateTime.UtcNow;
+        Dispatcher.InvokeAsync(PositionBar, DispatcherPriority.Loaded);
+    }
+
+    /// <summary>把悬浮控制栏摆到视频区域底部居中。</summary>
+    private void PositionBar()
+    {
+        if (_hwnd == IntPtr.Zero || WindowState == WindowState.Minimized || !VideoFrame.IsVisible) return;
+        var src = PresentationSource.FromVisual(VideoFrame);
+        if (src?.CompositionTarget == null) return;
+        var tl = src.CompositionTarget.TransformFromDevice.Transform(VideoFrame.PointToScreen(new Point(0, 0)));
+        double vw = VideoFrame.ActualWidth, vh = VideoFrame.ActualHeight;
+        double w = Math.Min(vw, BarMaxWidth);
+        _bar.Width = w;
+        _bar.Left = tl.X + (vw - w) / 2;
+        _bar.Top = tl.Y + vh - _bar.ActualHeight;
     }
 
     private void UiTick()
@@ -896,18 +976,38 @@ internal sealed class MainForm : Form
         if (_timeDirty)
         {
             _timeDirty = false;
-            _seekBar.Value = _timePos;
-            _lblTime.Text = $"{FormatTime(_timePos)} / {FormatTime(_duration)}";
+            _bar.SetPosition(_timePos);
         }
+        UpdateBarVisibility();
+    }
 
-        // 全屏时鼠标移到屏幕底部显示控制栏
-        if (_fullscreen)
+    /// <summary>
+    /// 鼠标在画面或控制栏上移动时显示控制栏，静止 2 秒后淡出。
+    /// mpv 的画面是别的线程的原生窗口，收不到 WPF 的鼠标事件，所以用轮询光标位置的方式判断。
+    /// </summary>
+    private void UpdateBarVisibility()
+    {
+        if (_shuttingDown || _mpv == null || !IsVisible || WindowState == WindowState.Minimized) return;
+
+        Native.GetCursorPos(out var p);
+        bool moved = p.X != _lastCursor.X || p.Y != _lastCursor.Y;
+        _lastCursor = p;
+
+        IntPtr root = Native.GetAncestor(Native.WindowFromPoint(p), Native.GA_ROOT);
+        bool overBar = _bar.IsRevealed && root == _bar.Handle;
+        bool overVideo = root == _hwnd && Native.GetWindowRect(Video.Hwnd, out var vr) && vr.Contains(p);
+        if (moved && (overVideo || overBar)) _lastActivity = DateTime.UtcNow;
+
+        bool keep = _idle || overBar || _bar.IsSeekDragging || _menuOpen ||
+                    (DateTime.UtcNow - _lastActivity).TotalMilliseconds < BarHideMs;
+        if (keep)
         {
-            var p = PointToClient(Cursor.Position);
-            bool inside = ClientRectangle.Contains(p) && ActiveForm == this;
-            int threshold = _controlBar.Visible ? _controlBar.Height + 30 : 60;
-            bool show = inside && p.Y >= ClientSize.Height - threshold;
-            if (show != _controlBar.Visible) _controlBar.Visible = show;
+            if (!_bar.IsRevealed) PositionBar();
+            _bar.Reveal();
+        }
+        else
+        {
+            _bar.Conceal();
         }
     }
 
@@ -922,7 +1022,7 @@ internal sealed class MainForm : Form
     private void UpdateFormatLabel()
     {
         var m = _mpv;
-        if (m == null || _idle) { _lblFormat.Text = ""; return; }
+        if (m == null || _idle) { _bar.FormatText.Text = ""; return; }
         var parts = new List<string>();
 
         string? gamma = m.GetString("video-params/gamma");
@@ -933,7 +1033,8 @@ internal sealed class MainForm : Form
             null => "",
             _ => "SDR",
         };
-        if (_dvProfile != null) hdr = $"DV P{_dvProfile}→{(hdr.Length > 0 ? hdr : "基础层")}";
+        if (_dvProfile != null)
+            hdr = DvStripped ? $"DV P{_dvProfile}→{(hdr.Length > 0 ? hdr : "基础层")}" : $"杜比视界 P{_dvProfile}";
         if (hdr.Length > 0) parts.Add(hdr);
 
         string? hw = m.GetString("hwdec-current");
@@ -945,7 +1046,7 @@ internal sealed class MainForm : Form
         if (inCh is long a && outCh is long b)
             parts.Add(a == b ? $"{ChName(a)}" : $"{ChName(a)}→{ChName(b)}");
 
-        _lblFormat.Text = string.Join(" · ", parts);
+        _bar.FormatText.Text = string.Join(" · ", parts);
     }
 
     private static string ChName(long ch) => ch switch
@@ -953,75 +1054,44 @@ internal sealed class MainForm : Form
         1 => "单声道", 2 => "立体声", 6 => "5.1", 8 => "7.1", _ => ch + "ch",
     };
 
-    private static Button MakeButton(string text, string tip, EventHandler onClick)
-    {
-        var b = new Button
-        {
-            Text = text, Dock = DockStyle.Fill, FlatStyle = FlatStyle.Flat, ForeColor = Theme.Text,
-            BackColor = Theme.Bar, TabStop = false, Margin = new Padding(1),
-            Font = Theme.IconFont(12f), Cursor = Cursors.Hand,
-        };
-        b.FlatAppearance.BorderSize = 0;
-        b.FlatAppearance.MouseOverBackColor = Theme.Hover;
-        b.FlatAppearance.MouseDownBackColor = Theme.Surface;
-        b.Click += onClick;
-        Tips.SetToolTip(b, tip);
-        return b;
-    }
-
-    private static Button MakeSmallButton(string text, EventHandler onClick)
-    {
-        var b = new Button
-        {
-            Text = text, AutoSize = true, FlatStyle = FlatStyle.Flat, ForeColor = Theme.Text, BackColor = Theme.Panel,
-            TabStop = false, Margin = new Padding(2, 0, 2, 0), Height = 26,
-        };
-        b.FlatAppearance.BorderColor = Theme.Border;
-        b.FlatAppearance.MouseOverBackColor = Theme.Hover;
-        b.Cursor = Cursors.Hand;
-        b.Click += onClick;
-        return b;
-    }
-
     // =====================================================================
     //  信息窗口 / 设置窗口
     // =====================================================================
 
     private void ShowInfo()
     {
-        if (_infoForm == null || _infoForm.IsDisposed)
+        if (_infoWindow is { IsLoaded: true })
         {
-            _infoForm = new InfoForm(BuildInfoText);
-            _infoForm.Show(this);
+            _infoWindow.RefreshText();
+            _infoWindow.Activate();
+            return;
         }
-        else
-        {
-            _infoForm.RefreshText();
-            _infoForm.Activate();
-        }
+        _infoWindow = new InfoWindow(BuildInfoText) { Owner = this };
+        _infoWindow.Closed += (_, _) => _infoWindow = null;
+        _infoWindow.Show();
     }
 
-    private void OpenSettings()
+    private async void OpenSettings()
     {
         var m = _mpv;
         if (m == null) return;
-        bool wasFull = _fullscreen;
-        if (wasFull) ToggleFullscreen();
+        if (_fullscreen) ToggleFullscreen();
         var copy = S.Clone();
-        using var dlg = new SettingsForm(copy, m);
-        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+        var dlg = new SettingsWindow(copy, m, CurrentGdiName(), _hdrOn) { Owner = this };
+        if (dlg.ShowDialog() != true) return;
 
         bool gpuApiChanged = copy.GpuApi != S.GpuApi;
-        bool hdrChanged = copy.HdrEnabled != S.HdrEnabled || copy.AutoSwitchWindowsHdr != S.AutoSwitchWindowsHdr ||
-                          copy.TargetPeakNits != S.TargetPeakNits;
+        bool dvChanged = copy.DolbyVisionMode != S.DolbyVisionMode;
+        if (copy.TargetPeakNits != S.TargetPeakNits) _displayPeak = 0;
         CopySettings(copy, S);
         S.Save();
         ApplyPlaybackOptions(m, initial: false);
-        if (hdrChanged) { _displayPeak = 0; ApplyHdrState(showOsd: true); }
-        else ApplyMpvHdrProps();
+        if (dvChanged) m.SetProperty("vf", DolbyVisionFilter());
+        // 改设置不会去切换 Windows HDR，只重新应用 mpv 的 HDR 参数
+        ApplyMpvHdrProps();
         UpdateHdrButton();
         if (gpuApiChanged)
-            MessageBox.Show(this, "渲染 API 的修改将在重启播放器后生效。", "HdrPlayer", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            await Dialogs.ShowAsync(this, "HdrPlayer", "渲染 API 的修改将在重启播放器后生效。");
     }
 
     private static void CopySettings(AppSettings from, AppSettings to)
@@ -1039,12 +1109,12 @@ internal sealed class MainForm : Form
 
         string P(string name) => m.GetString(name) is { Length: > 0 } s ? s : "—";
         string O(string name) => m.GetOsdString(name) is { Length: > 0 } s ? s : "—";
-        void Line(string k, string v) => sb.Append("  ").Append(k.PadRight(14 - CountWide(k))).Append(v).Append("\r\n");
-        void Head(string h) => sb.Append("\r\n【").Append(h).Append("】\r\n");
+        void Line(string k, string v) => sb.Append("  ").Append(k.PadRight(14 - CountWide(k))).Append(v).Append('\n');
+        void Head(string h) => sb.Append("\n【").Append(h).Append("】\n");
 
         if (_idle)
         {
-            sb.Append("当前没有在播放。\r\n");
+            sb.Append("当前没有在播放。\n");
         }
         else
         {
@@ -1080,7 +1150,8 @@ internal sealed class MainForm : Form
                 Line("", $"场景平均 {P("video-params/scene-avg")} nit");
             }
             if (_dvProfile != null)
-                Line("杜比视界", $"Profile {_dvProfile}  Level {P("current-tracks/video/dolby-vision-level")}  → 已剥离 RPU，仅播放基础层");
+                Line("杜比视界", $"Profile {_dvProfile}  Level {P("current-tracks/video/dolby-vision-level")}  → " +
+                    (DvStripped ? "已剥离 RPU，仅播放基础层" : "已应用 RPU 动态元数据（libplacebo 重塑）"));
             string hw = P("hwdec-current");
             Line("解码", hw is "—" or "no" ? "软解 (CPU)" : $"硬解 ({hw})");
             Line("丢帧", $"解码 {P("decoder-frame-drop-count")}  输出 {P("frame-drop-count")}  延迟 {P("vo-delayed-frame-count")}");
@@ -1088,7 +1159,7 @@ internal sealed class MainForm : Form
             Head("渲染输出");
             Line("VO", $"{P("current-vo")}  API {P("gpu-api")}");
             Line("输出色彩", $"{P("video-target-params/primaries")} / {P("video-target-params/gamma")}  峰值 {P("video-target-params/max-luma")} nit");
-            Line("HDR 输出", S.HdrEnabled ? $"开  目标峰值 {Math.Round(DisplayPeak())} nit" : "关（色调映射到 SDR）");
+            Line("HDR 输出", _hdrOn ? $"开  目标峰值 {Math.Round(DisplayPeak())} nit" : "关（色调映射到 SDR）");
             Line("色调映射", $"{P("tone-mapping")}  峰值检测 {P("hdr-compute-peak")}  色域映射 {P("gamut-mapping-mode")}");
             Line("缩放", $"{P("scale")} / {P("dscale")}  去色带 {P("deband")}");
 
@@ -1130,7 +1201,7 @@ internal sealed class MainForm : Form
     //  关闭
     // =====================================================================
 
-    protected override void OnFormClosing(FormClosingEventArgs e)
+    protected override void OnClosing(CancelEventArgs e)
     {
         if (!_closeReady && _mpv != null)
         {
@@ -1138,13 +1209,14 @@ internal sealed class MainForm : Form
             if (_shuttingDown) return;
 
             if (_fullscreen) ToggleFullscreen();
-            S.WinMaximized = WindowState == FormWindowState.Maximized;
-            var b = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
-            (S.WinX, S.WinY, S.WinW, S.WinH) = (b.X, b.Y, b.Width, b.Height);
+            S.WinMaximized = WindowState == WindowState.Maximized;
+            var b = WindowState == WindowState.Normal ? new Rect(Left, Top, Width, Height) : RestoreBounds;
+            (S.WinX, S.WinY, S.WinW, S.WinH) = ((int)Math.Round(b.X), (int)Math.Round(b.Y), (int)Math.Round(b.Width), (int)Math.Round(b.Height));
             S.Save();
 
             _uiTimer.Stop();
-            _infoForm?.Close();
+            _infoWindow?.Close();
+            _bar.HideNow();
             Hide();
             _shuttingDown = true;
             var m = _mpv;
@@ -1154,7 +1226,7 @@ internal sealed class MainForm : Form
             {
                 try
                 {
-                    BeginInvoke(() =>
+                    Dispatcher.InvokeAsync(() =>
                     {
                         RestoreWindowsHdr();
                         _closeReady = true;
@@ -1165,6 +1237,6 @@ internal sealed class MainForm : Form
             });
             return;
         }
-        base.OnFormClosing(e);
+        base.OnClosing(e);
     }
 }
