@@ -328,8 +328,8 @@ internal sealed class Mpv : IDisposable
 
     public void ShowText(string text, int ms = 1500)
     {
-        // show-text 会展开 ${property}，这里只需要转义引号和反斜杠
-        string esc = text.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        // show-text 会展开 ${property}，这里只需要转义引号和反斜杠；换行写成 mpv 引号字符串里的 \n 转义
+        string esc = text.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n");
         CommandString($"show-text \"{esc}\" {ms}");
     }
 

@@ -45,7 +45,7 @@ public partial class MainWindow : FluentWindow
         ("m", "mute"), ("f", "fullscreen"), ("ENTER", "fullscreen"), ("ESC", "exit-fullscreen"),
         ("h", "hdr"), ("z", "sub-delay-dec"), ("x", "sub-delay-inc"), ("v", "sub-toggle"), ("j", "sub-cycle"),
         ("SHARP", "audio-cycle"), ("i", "info"), ("p", "playlist"), ("PGUP", "prev"), ("PGDWN", "next"),
-        ("Ctrl+o", "open"), (".", "frame-step"), (",", "frame-back"), ("F5", "reload"),
+        ("Ctrl+o", "open"), (".", "frame-step"), (",", "frame-back"), ("F5", "reload"), ("HOME", "restart"),
     };
 
     /// <summary>双击判定时间，和 mpv 的 input-doubleclick-time 保持一致。单击画面要等这么久确认不是双击才暂停。</summary>
@@ -98,8 +98,11 @@ public partial class MainWindow : FluentWindow
     // 重新载入当前文件：期间临时设置了 mpv 的 start 选项，载入后要清掉
     private bool _reloading;
 
-    // 恢复的播放列表里“上次播到哪”：按播放时从这里继续；开始播放任何文件后清掉
-    private (int Index, double Position)? _resume;
+    // 每个文件记住的进度 / 音频延迟 / 字幕延迟
+    private readonly FileStateStore _fileStates = FileStateStore.Load();
+    private string? _currentPath;      // 当前已载入的文件（file-loaded 时设置，记录状态后清空）
+    private double _currentDuration;
+    private double _lastPos;           // 只在 mpv 事件线程上读写：最后一个有效的 time-pos（文件卸载时 time-pos 会变成空）
 
     // 关闭流程
     private bool _shuttingDown, _closeReady;
@@ -279,9 +282,10 @@ public partial class MainWindow : FluentWindow
         ApplyPlaybackOptions(m, initial: true);
 
         m.PropertyChanged += OnMpvProperty;
-        m.StartFile += () => Ui(OnStartFile);
+        m.StartFile += () => { _lastPos = 0; Ui(OnStartFile); };
         m.FileLoaded += () => Ui(OnFileLoaded);
-        m.EndFile += (r, err) => Ui(() => OnEndFile(r, err));
+        // 在事件线程上先取下结束时的位置，再交给 UI 线程（那时新文件的 time-pos 可能已经开始刷新了）
+        m.EndFile += (r, err) => { double pos = _lastPos; Ui(() => OnEndFile(r, err, pos)); };
         m.VideoReconfig += () => Ui(OnVideoReconfig);
         m.AudioReconfig += () => Ui(UpdateFormatLabel);
         m.ClientMessage += a => Ui(() => OnClientMessage(a));
@@ -501,6 +505,7 @@ public partial class MainWindow : FluentWindow
     {
         if (name == "time-pos")
         {
+            if (value is double p && p > 0) _lastPos = p;
             _timePos = value is double d ? d : 0;
             _timeDirty = true;
             return;
@@ -582,7 +587,6 @@ public partial class MainWindow : FluentWindow
 
     private void OnStartFile()
     {
-        _resume = null;
         _hdr10Plus = false;
         _dvProfile = null;
         _autoHdrChecked = false;
@@ -593,6 +597,7 @@ public partial class MainWindow : FluentWindow
     {
         var m = _mpv;
         if (m == null) return;
+        bool reloaded = _reloading;
         if (_reloading)
         {
             // start 是全局选项，不清掉的话之后打开的每个文件都会从这个位置开始
@@ -612,9 +617,58 @@ public partial class MainWindow : FluentWindow
                 "当前设置为“剥离 RPU”，无法播放。请在 设置 → HDR → 杜比视界 中改为“应用 RPU”。");
             return;
         }
+        _currentPath = m.GetString("path");
+        _currentDuration = m.GetDouble("duration") ?? 0;
+        ApplyFileState(m, resumePosition: !reloaded);
         UpdateFormatLabel();
         UpdateThumbnailSource();
         MaybeAutoHdr();
+    }
+
+    /// <summary>
+    /// 打开文件时套用这个文件记住的状态：音频 / 字幕延迟（没记录过的文件归零，延迟是按文件的），
+    /// 以及上次的播放进度。重新载入（F5）时位置已经由 start 选项定好，不再跳。
+    /// </summary>
+    private void ApplyFileState(Mpv m, bool resumePosition)
+    {
+        if (_currentPath == null) return;
+        var st = _fileStates.Get(_currentPath);
+        var notes = new List<string>();
+        if (S.RememberDelays)
+        {
+            double ad = st?.AudioDelay ?? 0, sd = st?.SubDelay ?? 0;
+            m.SetProperty("audio-delay", ad);
+            m.SetProperty("sub-delay", sd);
+            if (ad != 0) notes.Add($"音频延迟 {ad * 1000:+0;-0} ms");
+            if (sd != 0) notes.Add($"字幕延迟 {sd * 1000:+0;-0} ms");
+        }
+        double pos = st?.Position ?? 0;
+        if (S.RememberPosition && resumePosition && pos > 0 && (_currentDuration <= 0 || pos < _currentDuration - 10))
+        {
+            m.Command("seek", pos.ToString("0.###", Inv), "absolute+exact");
+            notes.Insert(0, $"从上次的位置 {FormatTime(pos)} 继续（Home 键从头开始）");
+        }
+        if (notes.Count > 0) m.ShowText(string.Join("\n", notes), 3000);
+    }
+
+    /// <summary>文件结束 / 切换 / 退出时，记下这个文件的进度和延迟。</summary>
+    private void CommitFileState(double position, bool finished)
+    {
+        var m = _mpv;
+        string? path = _currentPath;
+        _currentPath = null;
+        if (m == null || path == null) return;
+        // 看完了（或只剩最后 10 秒）、刚开头几秒：下次从头开始
+        if (finished || position < 5 || (_currentDuration > 0 && position > _currentDuration - 10)) position = 0;
+        var old = _fileStates.Get(path);
+        var st = new FileState
+        {
+            Position = S.RememberPosition ? position : 0,
+            AudioDelay = S.RememberDelays ? m.GetDouble("audio-delay") ?? 0 : old?.AudioDelay ?? 0,
+            SubDelay = S.RememberDelays ? m.GetDouble("sub-delay") ?? 0 : old?.SubDelay ?? 0,
+            LastPlayed = DateTime.UtcNow,
+        };
+        _fileStates.Set(path, st);
     }
 
     /// <summary>当前文件是有画面的本地文件、且设置里开启时，让缩略图线程跟着打开它。</summary>
@@ -636,8 +690,10 @@ public partial class MainWindow : FluentWindow
         MaybeAutoHdr();
     }
 
-    private void OnEndFile(MpvEndReason reason, int error)
+    private void OnEndFile(MpvEndReason reason, int error, double position)
     {
+        // 放完（EOF）就下次从头开始；切换文件 / 停止 / 重新载入则记下当时的位置
+        CommitFileState(position, finished: reason == MpvEndReason.Eof);
         if (reason != MpvEndReason.Error) return;
         if (_reloading) { _reloading = false; _mpv?.SetProperty("start", "none"); }
         _mpv?.ShowText("播放失败：" + Mpv.ErrorString(error), 4000);
@@ -658,60 +714,26 @@ public partial class MainWindow : FluentWindow
         m.ShowText("重新载入…");
     }
 
-    /// <summary>从播放列表第 index 项的 position 秒开始播放（借用重新载入时的 start 选项，载入后自动清掉）。</summary>
-    private void PlayFrom(int index, double position)
-    {
-        var m = _mpv;
-        if (m == null) return;
-        _resume = null;
-        if (position > 1)
-        {
-            _reloading = true;
-            m.SetProperty("start", position.ToString("0.###", Inv));
-        }
-        m.Command("playlist-play-index", index.ToString(Inv));
-    }
-
     /// <summary>空着启动时恢复上次的播放列表：只加入列表、不开始播放（免得一启动就切 HDR、出声音）。</summary>
     private void RestorePlaylist()
     {
         var m = _mpv;
         var saved = SavedPlaylist.Load();
         if (m == null || saved == null || saved.Files.Count == 0) return;
-        int restored = 0, current = -1;
-        for (int i = 0; i < saved.Files.Count; i++)
+        int restored = 0;
+        foreach (string f in saved.Files)
         {
-            string f = saved.Files[i];
             if (!File.Exists(f)) continue; // 文件已删除 / 移动 / 所在的盘没接上
-            if (i == saved.Current) current = restored;
             m.Command("loadfile", f, "append"); // append：空闲时只加入列表，不会开始播放
             restored++;
         }
-        if (restored == 0) return;
-        if (current >= 0) _resume = (current, saved.Position);
-        m.ShowText(current >= 0 && saved.Position > 1
-            ? $"已恢复上次的播放列表（{restored} 个文件），按空格从 {FormatTime(saved.Position)} 继续"
-            : $"已恢复上次的播放列表（{restored} 个文件），按空格开始播放", 4000);
+        if (restored > 0)
+            m.ShowText($"已恢复上次的播放列表（{restored} 个文件），在播放列表（P）里双击要看的文件", 4000);
     }
 
-    /// <summary>退出时保存播放列表、正在播放的那一项和位置。</summary>
-    private void SavePlaylistState()
-    {
-        var saved = new SavedPlaylist { Files = _playlist.Select(e => e.Path).Where(p => p.Length > 0).ToList() };
-        int playing = _playlist.FindIndex(e => e.Current);
-        if (!_idle && playing >= 0)
-        {
-            saved.Current = playing;
-            // 已经快放完了就下次从头开始
-            saved.Position = _duration > 0 && _timePos > _duration - 10 ? 0 : _timePos;
-        }
-        else if (_resume is { } r)
-        {
-            // 恢复之后还没继续播放就又退出了：保留原来的位置
-            (saved.Current, saved.Position) = (r.Index, r.Position);
-        }
-        saved.Save();
-    }
+    /// <summary>退出时保存播放列表（只保存文件列表；每个文件的进度单独记在 file-states.json 里）。</summary>
+    private void SavePlaylistState() =>
+        new SavedPlaylist { Files = _playlist.Select(e => e.Path).Where(p => p.Length > 0).ToList() }.Save();
 
     /// <summary>
     /// 单击画面：等双击时间过去、确认不是双击后再暂停 / 播放，免得双击全屏时画面先停一下。
@@ -771,8 +793,7 @@ public partial class MainWindow : FluentWindow
         switch (action)
         {
             case "pause":
-                if (_idle && _resume is { } r && r.Index < _playlist.Count) PlayFrom(r.Index, r.Position);
-                else if (_idle && _playlist.Count > 0) m.Command("playlist-play-index", "0");
+                if (_idle && _playlist.Count > 0) m.Command("playlist-play-index", "0");
                 else if (_idle) OpenFiles();
                 else m.CommandString("cycle pause");
                 break;
@@ -791,6 +812,7 @@ public partial class MainWindow : FluentWindow
                 ToggleFullscreen();
                 break;
             case "reload": ReloadCurrent(); break;
+            case "restart": if (!_idle) m.CommandString("osd-msg-bar seek 0 absolute+exact"); break;
             case "exit-fullscreen": if (_fullscreen) ToggleFullscreen(); break;
             case "menu": ShowContextMenuAfterRightButtonUp(); break;
             case "hdr": SetHdr(!_hdrOn, manual: true); break;
@@ -860,6 +882,7 @@ public partial class MainWindow : FluentWindow
             (ModifierKeys.None, Key.OemPeriod) => "frame-step",
             (ModifierKeys.None, Key.OemComma) => "frame-back",
             (ModifierKeys.None, Key.F5) => "reload",
+            (ModifierKeys.None, Key.Home) => "restart",
             _ => null,
         };
         if (action != null)
@@ -1465,6 +1488,7 @@ public partial class MainWindow : FluentWindow
             var b = WindowState == WindowState.Normal ? new Rect(Left, Top, Width, Height) : RestoreBounds;
             (S.WinX, S.WinY, S.WinW, S.WinH) = ((int)Math.Round(b.X), (int)Math.Round(b.Y), (int)Math.Round(b.Width), (int)Math.Round(b.Height));
             S.Save();
+            if (!_idle) CommitFileState(_timePos, finished: false);
             SavePlaylistState();
 
             _uiTimer.Stop();

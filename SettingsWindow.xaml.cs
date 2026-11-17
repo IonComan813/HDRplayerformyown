@@ -206,8 +206,12 @@ public partial class SettingsWindow : FluentWindow
         AddNumber(p, "←/→ 跳转秒数", null, _s.SeekStep, 1, 600, 1, v => _s.SeekStep = v);
         AddNumber(p, "Shift+←/→ 跳转秒数", null, _s.SeekStepLarge, 1, 3600, 5, v => _s.SeekStepLarge = v);
         AddToggle(p, "精确跳转", "关闭则跳到关键帧，更快", _s.ExactSeek, v => _s.ExactSeek = v);
-        AddToggle(p, "启动时恢复上次的播放列表", "不会自动开始播放；按空格 / 播放从上次的文件和位置继续。双击视频文件打开时不恢复",
+        AddToggle(p, "启动时恢复上次的播放列表", "只恢复列表，不会自动开始播放。双击视频文件打开时不恢复",
             _s.RestorePlaylist, v => _s.RestorePlaylist = v);
+        AddToggle(p, "记住每个文件的播放进度", "再次打开时从上次的位置继续（Home 键从头开始）；看完或只剩最后 10 秒的下次从头开始",
+            _s.RememberPosition, v => _s.RememberPosition = v);
+        AddToggle(p, "记住每个文件的音频 / 字幕延迟", "关闭则延迟在切换文件时保持不变，退出后归零",
+            _s.RememberDelays, v => _s.RememberDelays = v);
         AddToggle(p, "进度条悬停预览缩略图", "后台另开一个不出画面的 mpv 实例截图；仅本地文件。HDR 片源的缩略图高光会被裁切",
             _s.SeekThumbnails, v => _s.SeekThumbnails = v);
         AddNumber(p, "音量步进", null, _s.VolumeStep, 1, 50, 1, v => _s.VolumeStep = v);
