@@ -93,7 +93,7 @@ public partial class MainWindow : FluentWindow
 
     // 单击画面暂停
     private DispatcherTimer? _clickTimer;
-    private DateTime _activatedAt = DateTime.MinValue, _lastDblClick = DateTime.MinValue;
+    private DateTime _activatedAt = DateTime.MinValue, _deactivatedAt = DateTime.MinValue, _lastDblClick = DateTime.MinValue;
 
     // 重新载入当前文件：期间临时设置了 mpv 的 start 选项，载入后要清掉
     private bool _reloading;
@@ -160,6 +160,7 @@ public partial class MainWindow : FluentWindow
 
         SourceInitialized += (_, _) => _hwnd = new WindowInteropHelper(this).Handle;
         Activated += (_, _) => _activatedAt = DateTime.UtcNow;
+        Deactivated += (_, _) => _deactivatedAt = DateTime.UtcNow;
         ContentRendered += OnContentRendered;
         LocationChanged += (_, _) => PositionBar();
         SizeChanged += (_, _) => PositionBar();
@@ -244,6 +245,10 @@ public partial class MainWindow : FluentWindow
         m.SetOption("input-vo-keyboard", "yes");
         m.SetOption("input-cursor", "yes");
         m.SetOption("input-doubleclick-time", DoubleClickMs.ToString(Inv));
+        // mpv 默认会把“按住左键并移动超过 3 像素”当作拖动窗口，并吞掉这次单击（MBTN_LEFT 不触发）。
+        // 画面嵌在本程序里，拖动没有意义，关掉，单击暂停才可靠
+        m.SetOption("window-dragging", "no");
+        m.SetOption("input-builtin-dragging", "no");
         // 和悬浮控制栏同时隐藏
         m.SetOption("cursor-autohide", BarHideMs.ToString(Inv));
         // 拖到画面上：字幕文件 → sub-add；视频 → 加入播放列表（空闲时自动开始播放）
@@ -522,7 +527,6 @@ public partial class MainWindow : FluentWindow
             case "duration":
                 _duration = value is double d ? d : 0;
                 _bar.SetDuration(_duration);
-                _bar.ThumbnailTolerance = Math.Max(3, _duration / 120);
                 _timeDirty = true;
                 break;
             case "volume":
@@ -658,7 +662,10 @@ public partial class MainWindow : FluentWindow
         if (_idle) return;
         var now = DateTime.UtcNow;
         if ((now - _lastDblClick).TotalMilliseconds < DoubleClickMs + 100) return; // 双击的第二下
-        if ((now - _activatedAt).TotalMilliseconds < 300) return;
+        // 点在后台窗口上的那一下只用来激活窗口：窗口之前确实在后台待过（不是一闪而过的焦点变化），
+        // 并且刚刚才激活（mpv 在松开按键时才发来单击，所以留 600ms）
+        bool wasInBackground = _activatedAt - _deactivatedAt > TimeSpan.FromMilliseconds(500);
+        if (wasInBackground && (now - _activatedAt).TotalMilliseconds < 600) return;
         if (_clickTimer == null)
         {
             _clickTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(DoubleClickMs) };

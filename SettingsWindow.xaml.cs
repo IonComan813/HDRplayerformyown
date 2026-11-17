@@ -210,6 +210,18 @@ public partial class SettingsWindow : FluentWindow
             _s.SeekThumbnails, v => _s.SeekThumbnails = v);
         AddNumber(p, "音量步进", null, _s.VolumeStep, 1, 50, 1, v => _s.VolumeStep = v);
         AddNumber(p, "字幕延迟步进 (ms)", null, _s.SubDelayStepMs, 10, 5000, 10, v => _s.SubDelayStepMs = (int)v);
+        var assocBtn = new Wpf.Ui.Controls.Button { Content = "打开默认应用设置", Icon = new SymbolIcon { Symbol = SymbolRegular.Open24 } };
+        assocBtn.Click += (_, _) =>
+        {
+            // 用安装版时直接跳到 HdrPlayer 的页面（Windows 11），页面顶部“设为默认值”一键设置安装时勾选的后缀
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                    "ms-settings:defaultapps?registeredAppUser=HdrPlayer") { UseShellExecute = true });
+            }
+            catch { }
+        };
+        AddCard(p, "用 HdrPlayer 打开视频文件", "安装版：在打开的页面点顶部的“设为默认值”。Windows 不允许程序自己修改默认程序", assocBtn);
         AddNote(p,
             "空格 播放/暂停　←/→ 快退/快进　Shift+←/→ 大步跳转\n" +
             "↑/↓/滚轮 音量　M 静音　F/回车/双击 全屏　Esc 退出全屏\n" +

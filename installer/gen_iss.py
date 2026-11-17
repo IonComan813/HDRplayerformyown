@@ -4,7 +4,8 @@
 """
 import sys
 p=sys.argv[1]
-s=open(p,encoding='utf-8-sig').read().replace('\r\n','\n')
+with open(p,encoding='utf-8-sig') as f:
+    s=f.read().replace('\r\n','\n')
 
 # (后缀, 说明, 默认勾选)
 EXTS=[
@@ -29,7 +30,7 @@ def section(name):
 
 tasks='''[Tasks]
 ; 每个后缀一个勾选框：勾选的设为用 HdrPlayer 打开；不勾的也会出现在右键“打开方式”里
-Name: "assoc"; Description: "设为以下文件的默认播放器（会替换你之前在 Windows 里为它们选的程序）"; GroupDescription: "文件关联（不勾选的后缀也会出现在右键“打开方式”里）："
+Name: "assoc"; Description: "用 HdrPlayer 作为以下文件的默认播放器（安装完成后在 Windows 设置里点一下确认）"; GroupDescription: "文件关联（不勾选的后缀也会出现在右键“打开方式”里）："
 '''
 for e,d,on in EXTS:
     tasks+=f'Name: "assoc\\x{e}"; Description: ".{e}　{d}"{"" if on else "; Flags: unchecked"}\n'
@@ -40,31 +41,33 @@ i,j=section('Registry')
 reg=s[i:j]
 k=reg.index('; ---- 每个后缀 ----')
 reg=reg[:k]+'''; ---- 每个后缀 ----
-; 所有后缀：OpenWithProgids / SupportedTypes / Capabilities 让 HdrPlayer 出现在“打开方式”和“默认应用”里。
-; 勾选的后缀：再把后缀的默认 ProgID 写成 HdrPlayer，并在安装后删掉 Windows 记录的旧选择（UserChoice，见下面的代码段），
-; 否则 Windows 会继续用用户之前选的程序（只写默认值时“没绑定上”就是这个原因）。
+; 所有后缀：OpenWithProgids / SupportedTypes 让 HdrPlayer 出现在右键“打开方式”里。
+; 勾选的后缀：写进 Capabilities\\FileAssociations（Windows“默认应用”里 HdrPlayer 页面列出的类型），并写入后缀的默认 ProgID。
+; Windows 10/11 不允许程序自己改默认程序（用户的选择带系统校验，新版 Windows 11 还有驱动保护），
+; 所以由用户在 HdrPlayer 的“默认应用”页面点“设为默认值”确认：这个按钮只作用于 Capabilities 里列出的类型，正好就是勾选的这些。
 '''
 for e,d,on in EXTS:
     reg+=f'''; .{e}
 Root: HKCU; Subkey: "Software\\Classes\\.{e}\\OpenWithProgids"; ValueType: string; ValueName: "{{#ProgId}}"; ValueData: ""; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\\Classes\\Applications\\{{#AppExe}}\\SupportedTypes"; ValueType: string; ValueName: ".{e}"; ValueData: ""
-Root: HKCU; Subkey: "Software\\{{#AppName}}\\Capabilities\\FileAssociations"; ValueType: string; ValueName: ".{e}"; ValueData: "{{#ProgId}}"
+Root: HKCU; Subkey: "Software\\{{#AppName}}\\Capabilities\\FileAssociations"; ValueType: string; ValueName: ".{e}"; ValueData: "{{#ProgId}}"; Tasks: assoc\\x{e}
 Root: HKCU; Subkey: "Software\\Classes\\.{e}"; ValueType: string; ValueName: ""; ValueData: "{{#ProgId}}"; Flags: uninsdeletevalue; Tasks: assoc\\x{e}
 '''
 s=s[:i]+reg+'\n'+s[j:]
 
 run='''[Run]
 Filename: "{app}\\{#AppExe}"; Description: "启动 HdrPlayer"; Flags: nowait postinstall skipifsilent
-; 可选：打开 Windows“默认应用”里 HdrPlayer 的页面检查结果（Windows 11 直接跳到该页面，旧版本打开默认应用总页面）
-Filename: "ms-settings:defaultapps?registeredAppUser={#AppName}"; Description: "打开 Windows“默认应用”设置检查文件关联"; Flags: shellexec nowait postinstall skipifsilent unchecked
+; 勾选了后缀时默认打开 Windows“默认应用”里 HdrPlayer 的页面，点顶部的“设为默认值”完成绑定
+; （Windows 11 直接跳到该页面；Windows 10 打开默认应用总页面，选“按应用设置默认值”→ HdrPlayer）
+Filename: "ms-settings:defaultapps?registeredAppUser={#AppName}"; Description: "打开 Windows“默认应用”设置，点“设为默认值”完成文件关联"; Flags: shellexec nowait postinstall skipifsilent; Check: AnyAssocSelected
 
 '''
 i,j=section('Run'); s=s[:i]+run+s[j:]
 
-ext_array=', '.join(f"'{e}'" for e,_,_ in EXTS)
+ext_array=' '.join(e for e,_,_ in EXTS)
 code='''[Code]
 const
-  FileExtsKey = 'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.';
+  AssocExts = 'EXTLIST';
 
 // HdrPlayer 是依赖框架的程序，需要 .NET 8 桌面运行时（x64）。没装的话装完提示去下载。
 function HasDesktopRuntime8: Boolean;
@@ -76,34 +79,50 @@ begin
     FindClose(FindRec);
 end;
 
-// 删掉勾选后缀在 Windows 里记录的“用户选择”。程序不能写入这个键（有系统校验），但可以删除；
-// 删除后 Windows 按 Software\\Classes\\.后缀 的默认值（上面写成了 HdrPlayer）打开文件。
-procedure ApplyChosenAssociations(const Exts: array of String);
+// 是否勾选了任何一个要设为默认的后缀（AssocExts 是以空格分隔的后缀列表）
+function AnyAssocSelected: Boolean;
 var
-  I: Integer;
+  Rest, Ext: String;
+  P: Integer;
 begin
-  for I := 0 to GetArrayLength(Exts) - 1 do
-    if WizardIsTaskSelected('assoc\\x' + Exts[I]) then
-    begin
-      RegDeleteKeyIncludingSubkeys(HKCU, FileExtsKey + Exts[I] + '\\UserChoice');
-      RegDeleteKeyIncludingSubkeys(HKCU, FileExtsKey + Exts[I] + '\\UserChoiceLatest');
-    end;
+  Result := False;
+  Rest := AssocExts + ' ';
+  while (not Result) and (Length(Rest) > 0) do
+  begin
+    P := Pos(' ', Rest);
+    Ext := Copy(Rest, 1, P - 1);
+    Delete(Rest, 1, P);
+    if (Ext <> '') and WizardIsTaskSelected('assoc\\x' + Ext) then
+      Result := True;
+  end;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpFinished) and AnyAssocSelected then
+  begin
+    WizardForm.FinishedLabel.Caption :=
+      'HdrPlayer 已安装。' + #13#10 + #13#10 +
+      'Windows 不允许安装程序直接修改默认程序，还差最后一步：点“完成”后会打开 HdrPlayer 的“默认应用”页面，' +
+      '点页面顶部的“设为默认值”，刚才勾选的视频后缀就都会用 HdrPlayer 打开。' + #13#10 + #13#10 +
+      'Windows 10 上请在打开的页面选“按应用设置默认值”→ HdrPlayer → 管理。';
+    // 文字变长了：让标签按内容增高，并把下面的勾选列表往下挪，免得被挡住
+    WizardForm.FinishedLabel.AdjustHeight;
+    WizardForm.RunList.Top := WizardForm.FinishedLabel.Top + WizardForm.FinishedLabel.Height + ScaleY(12);
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ErrCode: Integer;
 begin
-  if CurStep = ssPostInstall then
-  begin
-    ApplyChosenAssociations([EXTLIST]);
-    if (not WizardSilent) and (not HasDesktopRuntime8) then
-      if MsgBox('没有检测到 .NET 8 桌面运行时（x64），HdrPlayer 需要它才能运行。' + #13#10 + #13#10 +
-                '现在打开下载页面吗？（选择“.NET Desktop Runtime 8.0 - Windows x64”）',
-                mbConfirmation, MB_YESNO) = IDYES then
-        ShellExec('open', 'https://dotnet.microsoft.com/download/dotnet/8.0', '', '', SW_SHOWNORMAL, ewNoWait, ErrCode);
-  end;
+  if (CurStep = ssPostInstall) and (not WizardSilent) and (not HasDesktopRuntime8) then
+    if MsgBox('没有检测到 .NET 8 桌面运行时（x64），HdrPlayer 需要它才能运行。' + #13#10 + #13#10 +
+              '现在打开下载页面吗？（选择“.NET Desktop Runtime 8.0 - Windows x64”）',
+              mbConfirmation, MB_YESNO) = IDYES then
+      ShellExec('open', 'https://dotnet.microsoft.com/download/dotnet/8.0', '', '', SW_SHOWNORMAL, ewNoWait, ErrCode);
 end;
 '''.replace('EXTLIST', ext_array)
 i,j=section('Code'); s=s[:i]+code
-open(p,'w',encoding='utf-8-sig',newline='\r\n').write(s)
+with open(p,'w',encoding='utf-8-sig',newline='\r\n') as f:
+    f.write(s)
