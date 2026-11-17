@@ -69,41 +69,6 @@
                             IsMoveToPointEnabled="True"
                             Maximum="1"
                             Minimum="0" />
-                        <!-- 悬停预览：缩略图 + 时间。用 Popup 而不是画在控制栏里，控制栏窗口就不用为它留出一大块透明区域 -->
-                        <Popup
-                            x:Name="SeekPopup"
-                            AllowsTransparency="True"
-                            Focusable="False"
-                            IsHitTestVisible="False"
-                            Placement="Custom"
-                            PlacementTarget="{Binding ElementName=SeekSlider}"
-                            StaysOpen="True">
-                            <Border
-                                x:Name="SeekTip"
-                                Padding="4"
-                                Background="{DynamicResource SolidBackgroundFillColorQuarternaryBrush}"
-                                BorderBrush="{StaticResource OverlayStrokeBrush}"
-                                BorderThickness="1"
-                                CornerRadius="6">
-                                <StackPanel>
-                                    <Image
-                                        x:Name="SeekThumb"
-                                        MaxWidth="256"
-                                        MaxHeight="144"
-                                        Margin="0,0,0,3"
-                                        RenderOptions.BitmapScalingMode="HighQuality"
-                                        Stretch="Uniform"
-                                        Visibility="Collapsed" />
-                                    <TextBlock
-                                        x:Name="SeekTipText"
-                                        Margin="6,0,6,1"
-                                        HorizontalAlignment="Center"
-                                        FontFamily="Cascadia Mono, Consolas"
-                                        FontSize="12"
-                                        Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
-                                </StackPanel>
-                            </Border>
-                        </Popup>
                     </Grid>
                     <TextBlock
                         x:Name="DurationText"
@@ -168,28 +133,6 @@
                             IsMoveToPointEnabled="True"
                             Maximum="150"
                             Minimum="0" />
-                        <!-- 音量百分比：鼠标在音量条上或拖动时显示在滑块上方 -->
-                        <Popup
-                            x:Name="VolumePopup"
-                            AllowsTransparency="True"
-                            Focusable="False"
-                            IsHitTestVisible="False"
-                            Placement="Custom"
-                            PlacementTarget="{Binding ElementName=VolumeSlider}"
-                            StaysOpen="True">
-                            <Border
-                                Padding="8,3"
-                                Background="{DynamicResource SolidBackgroundFillColorQuarternaryBrush}"
-                                BorderBrush="{StaticResource OverlayStrokeBrush}"
-                                BorderThickness="1"
-                                CornerRadius="4">
-                                <TextBlock
-                                    x:Name="VolumeTipText"
-                                    FontFamily="Cascadia Mono, Consolas, Microsoft YaHei UI"
-                                    FontSize="12"
-                                    Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
-                            </Border>
-                        </Popup>
                         <!-- 不固定宽度，按文字自适应，避免 “HDR” 的 R 被裁掉 -->
                         <ui:Button
                             x:Name="BtnHdr"

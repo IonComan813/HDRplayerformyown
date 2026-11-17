@@ -79,17 +79,19 @@ jobs:
           Compress-Archive -Path publish/* -DestinationPath $name -Force
           "zip=$name" >> $env:GITHUB_OUTPUT
 
-      - name: 安装 Inno Setup
+      - name: 下载 Inno Setup
         shell: pwsh
-        # 中文语言文件需要 6.5 以上；choco upgrade 在没装时会直接安装
-        run: choco upgrade innosetup -y --no-progress
+        # 固定 6.7.1：中文语言文件需要 6.5+，也避免以后自动装到 7.x 时行为变化（这个版本在 wine 下实测编译、安装、卸载过）。
+        # 从 nuget.org 的 Tools.InnoSetup 包取，不依赖 runner 上预装的版本
+        run: |
+          Invoke-WebRequest https://api.nuget.org/v3-flatcontainer/tools.innosetup/6.7.1/tools.innosetup.6.7.1.nupkg -OutFile inno.zip
+          Expand-Archive inno.zip -DestinationPath inno -Force
 
       - name: 生成安装程序
         id: setup
         shell: pwsh
         run: |
-          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { $iscc = (Get-Command ISCC.exe -ErrorAction Stop).Source }
+          $iscc = "$PWD\inno\tools\ISCC.exe"
           & $iscc /Qp "/DAppVersion=${{ steps.ver.outputs.version }}" "/DSourceDir=$PWD\publish" "/DOutputDir=$PWD\dist" installer\HdrPlayer.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC 失败" }
           $exe = Get-ChildItem dist -Filter *-setup.exe | Select-Object -First 1
