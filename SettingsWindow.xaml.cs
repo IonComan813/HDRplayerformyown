@@ -30,6 +30,12 @@ public partial class SettingsWindow : FluentWindow
         ("mobius", "Mobius"), ("reinhard", "Reinhard"), ("clip", "裁切 (clip)"),
     };
 
+    private static readonly (string, string)[] DolbyVisionChoices =
+    {
+        ("rpu", "应用 RPU 动态元数据（推荐，支持 Profile 5）"),
+        ("strip", "剥离 RPU，只播放 HDR10 / HLG 基础层"),
+    };
+
     private static readonly (string, string)[] PeakDetectChoices =
         { ("auto", "自动"), ("yes", "开"), ("no", "关") };
 
@@ -112,11 +118,16 @@ public partial class SettingsWindow : FluentWindow
             : "无法读取显示器 HDR 信息";
         AddNote(p, disp);
 
-        AddToggle(p, "切换 HDR 时同时切换 Windows 的“使用 HDR”",
-            "只有手动按 H / 点控制栏的 HDR 按钮时才会切换。启动播放器时不会改动系统设置，HDR 输出跟随 Windows 当前状态。",
+        AddToggle(p, "播放 HDR 片源时自动开启 HDR",
+            "HDR10 / HDR10+ / HLG / 杜比视界片源开始播放时自动开启 HDR 输出。空着启动播放器不会改动系统设置。",
+            _s.AutoHdrForHdrVideo, v => _s.AutoHdrForHdrVideo = v);
+        AddToggle(p, "开关 HDR 时同时切换 Windows 的“使用 HDR”",
+            "自动开启和手动按 H / 点 HDR 按钮都会切换系统 HDR。关闭此项则只改播放器的输出方式。",
             _s.AutoSwitchWindowsHdr, v => _s.AutoSwitchWindowsHdr = v);
-        AddToggle(p, "退出时恢复原来的 Windows HDR 状态", "仅在本次运行中播放器切换过 Windows HDR 时生效。",
+        AddToggle(p, "退出时恢复原来的 Windows HDR 状态", "本次运行中播放器切换过 Windows HDR 时，退出后还原为启动前的状态。",
             _s.RestoreWindowsHdrOnExit, v => _s.RestoreWindowsHdrOnExit = v);
+        AddCombo(p, "杜比视界", "应用 RPU 需要 vo=gpu-next（本播放器默认）；Profile 7 双层片源的增强层由新版 mpv 自动处理",
+            DolbyVisionChoices, _s.DolbyVisionMode, v => _s.DolbyVisionMode = v);
         AddNumber(p, "目标峰值亮度 (nit)", "0 = 读取显示器 EDID 上报的峰值", _s.TargetPeakNits, 0, 10000, 50,
             v => _s.TargetPeakNits = (int)v);
         AddCombo(p, "色调映射算法", null, ToneMappingChoices, _s.ToneMapping, v => _s.ToneMapping = v);
@@ -124,7 +135,9 @@ public partial class SettingsWindow : FluentWindow
             _s.Hdr10PlusUseMetadata, v => _s.Hdr10PlusUseMetadata = v);
         AddCombo(p, "逐帧峰值检测", null, PeakDetectChoices, _s.HdrComputePeak, v => _s.HdrComputePeak = v);
         AddCombo(p, "色域映射", "BT.2020 → 显示器色域", GamutChoices, _s.GamutMapping, v => _s.GamutMapping = v);
-        AddNote(p, "片源亮度不超过目标峰值时不做色调映射，直接透传。\n杜比视界 Profile 7/8 只播放基础层；Profile 5 会提示不兼容。");
+        AddNote(p, "片源亮度不超过目标峰值时不做色调映射，直接透传。\n" +
+                   "杜比视界“应用 RPU”时按逐帧动态元数据重塑和色调映射，Profile 5 / 8.1 / 8.4 都能正确显示；\n" +
+                   "“剥离 RPU”时 Profile 7/8 只播放基础层，Profile 5 会提示不兼容。");
         return p;
     }
 

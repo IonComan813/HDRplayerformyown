@@ -7,8 +7,10 @@ namespace HdrPlayer;
 internal sealed class AppSettings
 {
     // ---- HDR ----
-    // HDR 输出的开 / 关不再保存：每次启动都跟随 Windows 当前的“使用 HDR”状态，启动时不会去改系统设置。
-    /// <summary>手动切换 HDR（H 键 / 按钮）时，同时切换 Windows 的“使用 HDR”。</summary>
+    // HDR 输出的开 / 关不保存：启动时跟随 Windows 当前的“使用 HDR”状态，空着启动不会去改系统设置。
+    /// <summary>打开 HDR 片源时自动开启 HDR 输出（必要时打开 Windows HDR）。</summary>
+    public bool AutoHdrForHdrVideo { get; set; } = true;
+    /// <summary>开关 HDR 输出（手动或自动）时，同时切换 Windows 的“使用 HDR”。</summary>
     public bool AutoSwitchWindowsHdr { get; set; } = true;
     public bool RestoreWindowsHdrOnExit { get; set; } = true;
     /// <summary>0 = 自动读取显示器 EDID 上报的峰值亮度</summary>
@@ -17,6 +19,8 @@ internal sealed class AppSettings
     public bool Hdr10PlusUseMetadata { get; set; } = true;
     public string HdrComputePeak { get; set; } = "auto";
     public string GamutMapping { get; set; } = "auto";
+    /// <summary>杜比视界："rpu" = 应用 RPU 动态元数据（支持 Profile 5）；"strip" = 剥离 RPU，只播放基础层。</summary>
+    public string DolbyVisionMode { get; set; } = "rpu";
 
     // ---- 解码 / 渲染 ----
     public string Hwdec { get; set; } = "d3d11va";

@@ -79,8 +79,10 @@ public partial class MainWindow : FluentWindow
     private Rect _prevBounds;
     private bool _playlistWasVisible;
 
-    // HDR：_hdrOn 是本次运行的输出状态，启动时跟随 Windows 当前的 HDR 开关，不会主动去改系统设置
+    // HDR：_hdrOn 是本次运行的输出状态。启动时跟随 Windows 当前的 HDR 开关（空着启动不改系统设置），
+    // 打开 HDR 片源时自动开启；_originalWindowsHdr 记录第一次切换前的系统状态，退出时还原。
     private bool _hdrOn;
+    private bool _autoHdrChecked;
     private bool? _originalWindowsHdr;
     private float _displayPeak;
 
@@ -224,8 +226,8 @@ public partial class MainWindow : FluentWindow
         m.SetOption("cursor-autohide", BarHideMs.ToString(Inv));
         // 拖到画面上：字幕文件 → sub-add；视频 → 加入播放列表（空闲时自动开始播放）
         m.SetOption("drag-and-drop", "append");
-        // 杜比视界：剥离 RPU，只用 HDR10 / HLG / SDR 基础层
-        m.SetOption("vf", "format:dolbyvision=no");
+        // 杜比视界：默认保留 RPU，由 gpu-next（libplacebo）做重塑，Profile 5 也能正确显示
+        m.SetOption("vf", DolbyVisionFilter());
         m.SetOption("osd-font", "Microsoft YaHei");
         m.SetOption("osd-font-size", "30");
         m.SetOption("osd-duration", "1500");
@@ -249,7 +251,7 @@ public partial class MainWindow : FluentWindow
         m.StartFile += () => Ui(OnStartFile);
         m.FileLoaded += () => Ui(OnFileLoaded);
         m.EndFile += (r, err) => Ui(() => OnEndFile(r, err));
-        m.VideoReconfig += () => Ui(UpdateFormatLabel);
+        m.VideoReconfig += () => Ui(OnVideoReconfig);
         m.AudioReconfig += () => Ui(UpdateFormatLabel);
         m.ClientMessage += a => Ui(() => OnClientMessage(a));
 
@@ -274,6 +276,14 @@ public partial class MainWindow : FluentWindow
         ApplyMpvHdrProps();
         UpdateHdrButton();
     }
+
+    /// <summary>
+    /// 杜比视界处理方式对应的视频滤镜。mpv 默认就保留 RPU（dolbyvision=yes），所以“应用 RPU”时不加滤镜；
+    /// 只有“剥离 RPU”时才用 format 滤镜去掉元数据。
+    /// </summary>
+    private string DolbyVisionFilter() => S.DolbyVisionMode == "strip" ? "format:dolbyvision=no" : "";
+
+    private bool DvStripped => S.DolbyVisionMode == "strip";
 
     /// <summary>可在初始化前（option）或运行时（property）应用的播放设置。</summary>
     private void ApplyPlaybackOptions(Mpv m, bool initial)
@@ -310,36 +320,70 @@ public partial class MainWindow : FluentWindow
         return info is { AdvancedColorSupported: true, AdvancedColorEnabled: true } || info is { HasDxgi: true, DxgiIsHdr: true };
     }
 
-    /// <summary>用户手动切换 HDR（H 键 / 按钮 / 菜单）时调用。只有这里会去改 Windows 的“使用 HDR”。</summary>
-    private void ToggleHdr()
+    /// <summary>
+    /// 开关 HDR 输出。manual = 用户按 H / 按钮 / 菜单；否则是打开 HDR 片源时的自动开启。
+    /// 只有这里会去改 Windows 的“使用 HDR”。
+    /// </summary>
+    private void SetHdr(bool on, bool manual)
     {
-        _hdrOn = !_hdrOn;
+        var m = _mpv;
+        if (m == null || on == _hdrOn) return;
+
         bool switched = false;
-        if (S.AutoSwitchWindowsHdr)
+        string gdi = CurrentGdiName();
+        var info = DisplayHelper.Query(gdi);
+        if (S.AutoSwitchWindowsHdr && info is { AdvancedColorSupported: true } && info.AdvancedColorEnabled != on)
         {
-            string gdi = CurrentGdiName();
-            var info = DisplayHelper.Query(gdi);
-            if (info is { AdvancedColorSupported: true } && info.AdvancedColorEnabled != _hdrOn)
+            bool before = info.AdvancedColorEnabled;
+            if (DisplayHelper.SetWindowsHdr(gdi, on, out string err))
             {
-                _originalWindowsHdr ??= info.AdvancedColorEnabled;
-                if (DisplayHelper.SetWindowsHdr(gdi, _hdrOn, out string err))
-                    switched = true;
-                else
-                    _mpv?.ShowText("切换 Windows HDR 失败：" + err, 3000);
+                _originalWindowsHdr ??= before;
+                switched = true;
+            }
+            else
+            {
+                m.ShowText("切换 Windows HDR 失败：" + err, 3000);
+                if (!manual) return;
             }
         }
+        // 自动开启时，如果系统 HDR 既没开、也没能切换（显示器不支持 / 设置里不允许切换），就什么都不做
+        if (!manual && on && !switched && !WindowsHdrIsOn()) return;
 
+        _hdrOn = on;
         ApplyMpvHdrProps();
         UpdateHdrButton();
-        _mpv?.ShowText(_hdrOn ? "HDR 输出：开" : "HDR 输出：关（HDR 片源色调映射到 SDR）");
+        m.ShowText(!manual ? "检测到 HDR 片源，已开启 HDR 输出"
+                   : on ? "HDR 输出：开" : "HDR 输出：关（HDR 片源色调映射到 SDR）");
 
         if (switched)
         {
-            // 显示器切换模式需要一点时间，稍后重新读取 EDID 峰值并重新应用
+            // 显示器切换模式（黑屏一下）需要一点时间：自动切换时先暂停，免得错过开头；
+            // 稍后重新读取 EDID 峰值、重新应用 HDR 参数，再继续播放
+            bool resume = !manual && !_idle && m.GetFlag("pause") == false;
+            if (resume) m.SetProperty("pause", true);
             var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1500) };
-            t.Tick += (_, _) => { t.Stop(); _displayPeak = 0; ApplyMpvHdrProps(); UpdateFormatLabel(); };
+            t.Tick += (_, _) =>
+            {
+                t.Stop();
+                _displayPeak = 0;
+                ApplyMpvHdrProps();
+                UpdateFormatLabel();
+                if (resume) _mpv?.SetProperty("pause", false);
+            };
             t.Start();
         }
+    }
+
+    /// <summary>视频参数确定后（每个文件第一次 video-reconfig），HDR 片源自动开启 HDR 输出。</summary>
+    private void MaybeAutoHdr()
+    {
+        var m = _mpv;
+        if (_autoHdrChecked || m == null || _idle) return;
+        string? gamma = m.GetString("video-params/gamma");
+        if (gamma == null) return; // 还没解码出第一帧
+        _autoHdrChecked = true;
+        bool hdrSource = gamma is "pq" or "hlg" || _dvProfile != null;
+        if (hdrSource && S.AutoHdrForHdrVideo && !_hdrOn) SetHdr(true, manual: false);
     }
 
     private float DisplayPeak()
@@ -500,6 +544,7 @@ public partial class MainWindow : FluentWindow
     {
         _hdr10Plus = false;
         _dvProfile = null;
+        _autoHdrChecked = false;
         ApplyToneMapping();
     }
 
@@ -508,17 +553,26 @@ public partial class MainWindow : FluentWindow
         var m = _mpv;
         if (m == null) return;
         _dvProfile = m.GetString("current-tracks/video/dolby-vision-profile");
-        if (_dvProfile == "5")
+        // 剥离 RPU 时 Profile 5 没有可用的基础层（IPTPQc2 色彩空间），只能跳过；应用 RPU 时可以正常播放
+        if (_dvProfile == "5" && DvStripped)
         {
             string file = m.GetString("filename") ?? "";
             long pos = m.GetInt("playlist-pos") ?? -1, count = m.GetInt("playlist-count") ?? 0;
             if (pos >= 0 && pos < count - 1) m.Command("playlist-next", "force");
             else m.Command("stop");
             await Dialogs.ShowAsync(this, "不兼容的杜比视界",
-                $"{file}\n\n这是杜比视界 Profile 5 片源，没有可直接显示的 HDR10 基础层（使用 IPTPQc2 色彩空间），本播放器不支持。");
+                $"{file}\n\n这是杜比视界 Profile 5 片源，没有可直接显示的 HDR10 基础层（使用 IPTPQc2 色彩空间）。\n" +
+                "当前设置为“剥离 RPU”，无法播放。请在 设置 → HDR → 杜比视界 中改为“应用 RPU”。");
             return;
         }
         UpdateFormatLabel();
+        MaybeAutoHdr();
+    }
+
+    private void OnVideoReconfig()
+    {
+        UpdateFormatLabel();
+        MaybeAutoHdr();
     }
 
     private void OnEndFile(MpvEndReason reason, int error)
@@ -558,7 +612,7 @@ public partial class MainWindow : FluentWindow
             case "fullscreen": ToggleFullscreen(); break;
             case "exit-fullscreen": if (_fullscreen) ToggleFullscreen(); break;
             case "menu": ShowContextMenu(); break;
-            case "hdr": ToggleHdr(); break;
+            case "hdr": SetHdr(!_hdrOn, manual: true); break;
             case "sub-delay-dec": AdjustSubDelay(-S.SubDelayStepMs); break;
             case "sub-delay-inc": AdjustSubDelay(S.SubDelayStepMs); break;
             case "sub-toggle": m.CommandString("no-osd cycle sub-visibility"); m.ShowText("字幕显示：${sub-visibility}"); break;
@@ -974,7 +1028,8 @@ public partial class MainWindow : FluentWindow
             null => "",
             _ => "SDR",
         };
-        if (_dvProfile != null) hdr = $"DV P{_dvProfile}→{(hdr.Length > 0 ? hdr : "基础层")}";
+        if (_dvProfile != null)
+            hdr = DvStripped ? $"DV P{_dvProfile}→{(hdr.Length > 0 ? hdr : "基础层")}" : $"杜比视界 P{_dvProfile}";
         if (hdr.Length > 0) parts.Add(hdr);
 
         string? hw = m.GetString("hwdec-current");
@@ -1021,10 +1076,12 @@ public partial class MainWindow : FluentWindow
         if (dlg.ShowDialog() != true) return;
 
         bool gpuApiChanged = copy.GpuApi != S.GpuApi;
+        bool dvChanged = copy.DolbyVisionMode != S.DolbyVisionMode;
         if (copy.TargetPeakNits != S.TargetPeakNits) _displayPeak = 0;
         CopySettings(copy, S);
         S.Save();
         ApplyPlaybackOptions(m, initial: false);
+        if (dvChanged) m.SetProperty("vf", DolbyVisionFilter());
         // 改设置不会去切换 Windows HDR，只重新应用 mpv 的 HDR 参数
         ApplyMpvHdrProps();
         UpdateHdrButton();
@@ -1088,7 +1145,8 @@ public partial class MainWindow : FluentWindow
                 Line("", $"场景平均 {P("video-params/scene-avg")} nit");
             }
             if (_dvProfile != null)
-                Line("杜比视界", $"Profile {_dvProfile}  Level {P("current-tracks/video/dolby-vision-level")}  → 已剥离 RPU，仅播放基础层");
+                Line("杜比视界", $"Profile {_dvProfile}  Level {P("current-tracks/video/dolby-vision-level")}  → " +
+                    (DvStripped ? "已剥离 RPU，仅播放基础层" : "已应用 RPU 动态元数据（libplacebo 重塑）"));
             string hw = P("hwdec-current");
             Line("解码", hw is "—" or "no" ? "软解 (CPU)" : $"硬解 ({hw})");
             Line("丢帧", $"解码 {P("decoder-frame-drop-count")}  输出 {P("frame-drop-count")}  延迟 {P("vo-delayed-frame-count")}");

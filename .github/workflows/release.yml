@@ -1,0 +1,102 @@
+# 推送 v* 标签（或在 GitHub 网页上新建 Release 并创建新标签）时自动构建，
+# 打包 HdrPlayer + libmpv-2.dll，上传到对应的 Release。
+# 手动运行（Actions → Build → Run workflow）只构建并上传 artifact，不发布。
+name: Build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: 计算版本号
+        id: ver
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+            $ver = $tag.TrimStart("v", "V")
+          } else {
+            $tag = ""
+            $ver = "0.0.0-ci.${{ github.run_number }}"
+          }
+          # 程序集版本只能是数字，去掉 -beta 之类的后缀
+          $num = ($ver -split "[-+]")[0]
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "number=$num" >> $env:GITHUB_OUTPUT
+
+      - name: 编译
+        shell: pwsh
+        run: >
+          dotnet publish HdrPlayer.csproj -c Release -r win-x64 --self-contained false
+          -p:Version=${{ steps.ver.outputs.number }}
+          -p:InformationalVersion=${{ steps.ver.outputs.version }}
+          -o publish
+
+      - name: 下载 libmpv（shinchiro/mpv-winbuild-cmake 最新版）
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force mpv | Out-Null
+          gh release download --repo shinchiro/mpv-winbuild-cmake --pattern "mpv-dev-x86_64-v3-*.7z" --dir mpv
+          $archive = Get-ChildItem mpv -Filter *.7z | Select-Object -First 1
+          if (-not $archive) { throw "没有找到 mpv-dev-x86_64-v3 压缩包" }
+          Write-Host "libmpv: $($archive.Name)"
+          7z e $archive.FullName libmpv-2.dll -o"publish" -y | Out-Null
+          if (-not (Test-Path publish/libmpv-2.dll)) { throw "压缩包里没有 libmpv-2.dll" }
+          "$($archive.Name)" | Out-File -Encoding utf8 publish/libmpv-version.txt
+
+      - name: 打包
+        id: pack
+        shell: pwsh
+        run: |
+          Copy-Item README.md, LICENSE publish/
+          Remove-Item publish/*.pdb -ErrorAction SilentlyContinue
+          $name = "HdrPlayer-${{ steps.ver.outputs.version }}-win-x64.zip"
+          Compress-Archive -Path publish/* -DestinationPath $name -Force
+          "zip=$name" >> $env:GITHUB_OUTPUT
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HdrPlayer-${{ steps.ver.outputs.version }}-win-x64
+          path: ${{ steps.pack.outputs.zip }}
+
+      - name: 发布到 Release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.ver.outputs.tag }}"
+          $zip = "${{ steps.pack.outputs.zip }}"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            # 已经在网页上建好了 Release：只上传文件
+            gh release upload $tag $zip --clobber
+          } else {
+            $ghArgs = @($tag, $zip, "--title", "HdrPlayer $tag", "--generate-notes")
+            if ($tag -match "-") { $ghArgs += "--prerelease" }   # v1.0-beta 这类标签发成预发布
+            gh release create @args
+          }
+          if ($LASTEXITCODE -ne 0) { throw "发布失败" }
