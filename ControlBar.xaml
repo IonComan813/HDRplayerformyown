@@ -147,7 +147,7 @@
                             ToolTip="开关 HDR 输出 (H)" />
                         <ui:Button x:Name="BtnReload" Style="{StaticResource BarButton}" ToolTip="重新载入当前文件，让设置立即生效 (F5)" Icon="{ui:SymbolIcon ArrowClockwise24}" />
                         <ui:Button x:Name="BtnPlaylist" Style="{StaticResource BarButton}" ToolTip="播放列表 (P)" Icon="{ui:SymbolIcon TextBulletListLtr24}" />
-                        <ui:Button x:Name="BtnSettings" Style="{StaticResource BarButton}" ToolTip="设置" Icon="{ui:SymbolIcon Settings24}" />
+                        <ui:Button x:Name="BtnSettings" Style="{StaticResource BarButton}" ToolTip="全局设置" Icon="{ui:SymbolIcon Settings24}" />
                         <ui:Button x:Name="BtnFull" Style="{StaticResource BarButton}" ToolTip="全屏 (F / 双击)">
                             <ui:Button.Icon>
                                 <ui:SymbolIcon x:Name="FullIcon" Symbol="FullScreenMaximize24" />

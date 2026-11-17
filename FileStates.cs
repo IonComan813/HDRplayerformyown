@@ -3,7 +3,7 @@ using System.Text.Json;
 
 namespace HdrPlayer;
 
-/// <summary>每个文件记住的状态：上次的播放进度、音频延迟、字幕延迟。</summary>
+/// <summary>每个文件记住的状态：上次的播放进度、音频延迟、字幕延迟、解码方式。</summary>
 internal sealed class FileState
 {
     /// <summary>上次的播放位置（秒），0 = 从头开始。</summary>
@@ -12,15 +12,17 @@ internal sealed class FileState
     public double AudioDelay { get; set; }
     /// <summary>字幕延迟（秒，mpv 的 sub-delay）。</summary>
     public double SubDelay { get; set; }
+    /// <summary>只对这个文件生效的解码方式（mpv 的 hwdec 值），null = 跟随全局设置。</summary>
+    public string? Hwdec { get; set; }
     /// <summary>最后一次播放的时间，记录太多时先淘汰最久没播的。</summary>
     public DateTime LastPlayed { get; set; }
 
-    public bool IsEmpty => Position <= 0 && AudioDelay == 0 && SubDelay == 0;
+    public bool IsEmpty => Position <= 0 && AudioDelay == 0 && SubDelay == 0 && Hwdec == null;
 }
 
 /// <summary>
 /// 按文件路径保存 <see cref="FileState"/>，存在 %APPDATA%\HdrPlayer\file-states.json（和设置文件放在一起，升级 / 重装不受影响）。
-/// 只在 UI 线程上使用。
+/// 主要在 UI 线程上使用；mpv 的 on_load 钩子会在事件线程上读，所以加了锁。
 /// </summary>
 internal sealed class FileStateStore
 {
@@ -52,17 +54,24 @@ internal sealed class FileStateStore
         try { return Path.GetFullPath(path); } catch { return path; }
     }
 
-    public FileState? Get(string path) => _map.GetValueOrDefault(Key(path));
+    public FileState? Get(string path)
+    {
+        string key = Key(path);
+        lock (_map) return _map.GetValueOrDefault(key);
+    }
 
     public void Set(string path, FileState state)
     {
         string key = Key(path);
-        if (state.IsEmpty) _map.Remove(key);
-        else _map[key] = state;
-        if (_map.Count > Limit)
-            foreach (var old in _map.OrderBy(kv => kv.Value.LastPlayed).Take(_map.Count - Limit).Select(kv => kv.Key).ToList())
-                _map.Remove(old);
-        Save();
+        lock (_map)
+        {
+            if (state.IsEmpty) _map.Remove(key);
+            else _map[key] = state;
+            if (_map.Count > Limit)
+                foreach (var old in _map.OrderBy(kv => kv.Value.LastPlayed).Take(_map.Count - Limit).Select(kv => kv.Key).ToList())
+                    _map.Remove(old);
+            Save();
+        }
     }
 
     private void Save()

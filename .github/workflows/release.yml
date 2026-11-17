@@ -25,9 +25,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: "8.0.x"
 
@@ -70,7 +70,7 @@ jobs:
           "$($archive.Name)" | Out-File -Encoding utf8 publish/libmpv-version.txt
 
       # ---- 自动同步字幕：ffsubsync（https://github.com/smacke/ffsubsync）+ ffmpeg，放在 publish/tools 下 ----
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -138,7 +138,7 @@ jobs:
           "exe=dist/$($exe.Name)" >> $env:GITHUB_OUTPUT
 
       - name: 上传 artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: HdrPlayer-${{ steps.ver.outputs.version }}-win-x64
           path: |

@@ -299,8 +299,10 @@ public partial class MainWindow : FluentWindow
         m.VideoReconfig += () => Ui(OnVideoReconfig);
         m.AudioReconfig += () => Ui(UpdateFormatLabel);
         m.ClientMessage += a => Ui(() => OnClientMessage(a));
+        m.Hook += name => { if (name == "on_load") OnLoadHook(m); };
 
         m.Initialize();
+        m.AddHook("on_load");
 
         m.Observe("pause", MpvFormat.Flag);
         m.Observe("idle-active", MpvFormat.Flag);
@@ -334,7 +336,10 @@ public partial class MainWindow : FluentWindow
     private void ApplyPlaybackOptions(Mpv m, bool initial)
     {
         Func<string, string, int> set = initial ? m.SetOption : m.SetProperty;
-        set("hwdec", S.Hwdec);
+        // 解码方式：每个文件打开时由 on_load 钩子按“本视频的选择 ?? 全局设置”设置；
+        // 播放中改了全局设置，当前文件没有单独选择时立即生效
+        if (initial || _idle) set("hwdec", S.Hwdec);
+        else m.SetProperty("file-local-options/hwdec", EffectiveHwdec());
         // 软解线程数：运行时修改从下一个文件开始生效（解码器重新初始化时）
         set("vd-lavc-threads", Math.Clamp(S.DecoderThreads, 0, 64).ToString(Inv));
         set("scale", S.Scale);
@@ -624,7 +629,7 @@ public partial class MainWindow : FluentWindow
             else m.Command("stop");
             await Dialogs.ShowAsync(this, "不兼容的杜比视界",
                 $"{file}\n\n这是杜比视界 Profile 5 片源，没有可直接显示的 HDR10 基础层（使用 IPTPQc2 色彩空间）。\n" +
-                "当前设置为“剥离 RPU”，无法播放。请在 设置 → HDR → 杜比视界 中改为“应用 RPU”。");
+                "当前设置为“剥离 RPU”，无法播放。请在 全局设置 → HDR → 杜比视界 中改为“应用 RPU”。");
             return;
         }
         _currentPath = m.GetString("path");
@@ -676,6 +681,7 @@ public partial class MainWindow : FluentWindow
             Position = S.RememberPosition ? position : 0,
             AudioDelay = S.RememberDelays ? m.GetDouble("audio-delay") ?? 0 : old?.AudioDelay ?? 0,
             SubDelay = S.RememberDelays ? m.GetDouble("sub-delay") ?? 0 : old?.SubDelay ?? 0,
+            Hwdec = old?.Hwdec,
             LastPlayed = DateTime.UtcNow,
         };
         _fileStates.Set(path, st);
@@ -818,11 +824,7 @@ public partial class MainWindow : FluentWindow
                 m.ShowText(arg == "no" ? "字幕：关" : "字幕：${sid} ${current-tracks/sub/lang:} ${current-tracks/sub/title:}");
                 break;
             case "hwdec":
-                if (arg == null) break;
-                S.Hwdec = arg;
-                m.SetProperty("hwdec", arg);
-                m.ShowText("解码方式：" + (SettingsWindow.HwdecChoices.FirstOrDefault(c => c.Value == arg).Name ?? arg));
-                S.Save();
+                if (arg != null) SetFileHwdec(arg == "global" ? null : arg);
                 break;
             case "audio-delay-dec": AdjustAudioDelay(-S.SubDelayStepMs); break;
             case "audio-delay-inc": AdjustAudioDelay(S.SubDelayStepMs); break;
@@ -1035,6 +1037,49 @@ public partial class MainWindow : FluentWindow
     }
 
     // =====================================================================
+    //  每个视频单独的解码方式
+    // =====================================================================
+
+    private static string HwdecName(string value) =>
+        SettingsWindow.HwdecChoices.FirstOrDefault(c => c.Value == value).Name ?? value;
+
+    /// <summary>当前文件单独选的解码方式；null = 跟随全局设置（或没在播放）。</summary>
+    private string? FileHwdec()
+    {
+        string? path = _currentPath ?? (_idle ? null : _mpv?.GetString("path"));
+        return path == null ? null : _fileStates.Get(path)?.Hwdec;
+    }
+
+    /// <summary>当前文件实际使用的解码方式：本视频的选择优先，否则用全局设置。</summary>
+    private string EffectiveHwdec() => FileHwdec() ?? S.Hwdec;
+
+    /// <summary>
+    /// mpv 的 on_load 钩子（事件线程，mpv 等它返回才继续打开文件）：在解码器创建之前，
+    /// 用 file-local-options 设置这个文件的解码方式。file-local 的值在文件结束时自动失效，不影响下一个文件。
+    /// </summary>
+    private void OnLoadHook(Mpv m)
+    {
+        string? path = m.GetString("path");
+        string? perFile = path == null ? null : _fileStates.Get(path)?.Hwdec;
+        m.SetProperty("file-local-options/hwdec", perFile ?? S.Hwdec);
+    }
+
+    /// <summary>右键菜单里改当前视频的解码方式（null = 跟随全局设置），立即生效并记住。</summary>
+    private void SetFileHwdec(string? value)
+    {
+        var m = _mpv;
+        string? path = _currentPath ?? (_idle ? null : m?.GetString("path"));
+        if (m == null || path == null) return;
+        var st = _fileStates.Get(path) ?? new FileState { LastPlayed = DateTime.UtcNow };
+        st.Hwdec = value;
+        _fileStates.Set(path, st);
+        m.SetProperty("file-local-options/hwdec", value ?? S.Hwdec);
+        m.ShowText(value == null
+            ? $"本视频的解码方式：跟随全局设置（{HwdecName(S.Hwdec)}）"
+            : $"本视频的解码方式：{HwdecName(value)}");
+    }
+
+    // =====================================================================
     //  自动同步字幕（ffsubsync）
     // =====================================================================
 
@@ -1120,7 +1165,7 @@ public partial class MainWindow : FluentWindow
 
         string status = "正在同步字幕…";
         var started = DateTime.UtcNow;
-        void ShowProgress() => m.ShowText($"{status}　{(DateTime.UtcNow - started).TotalSeconds:0} 秒\n（右键 → 字幕 → 取消自动同步）", 1500);
+        void ShowProgress() => m.ShowText($"{status}　{(DateTime.UtcNow - started).TotalSeconds:0} 秒\n（右键 → 字幕延迟 → 取消自动同步）", 1500);
         _subSyncOsd?.Stop();
         _subSyncOsd = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         _subSyncOsd.Tick += (_, _) => ShowProgress();
@@ -1169,9 +1214,12 @@ public partial class MainWindow : FluentWindow
     //  右键菜单
     // =====================================================================
 
-    /// <summary>菜单项：Cmd 是点击时执行的 mpv 命令（一般是 script-message hp …，回到 DoAction 处理）。</summary>
+    /// <summary>
+    /// 菜单项：Cmd 是点击时执行的 mpv 命令（一般是 script-message hp …，回到 DoAction 处理）。
+    /// Checked 为 null 表示不是可勾选的项；true / false 的项前面留出对勾的位置，选中的显示对勾。
+    /// </summary>
     private sealed record MenuEntry(string Title, string? Cmd = null, string? Shortcut = null,
-        bool Checked = false, bool Enabled = true, List<MenuEntry>? Sub = null)
+        bool? Checked = null, bool Enabled = true, List<MenuEntry>? Sub = null)
     {
         public bool IsSeparator => Title.Length == 0 && Cmd == null && Sub == null;
     }
@@ -1212,10 +1260,6 @@ public partial class MainWindow : FluentWindow
                 (type == "audio" ? audio : subs).Add(entry);
             }
         }
-        subs.Add(Sep);
-        subs.Add(_subSync.Running
-            ? new MenuEntry("取消自动同步", Hp("sub-sync"))
-            : new MenuEntry("自动同步字幕（ffsubsync）…", Hp("sub-sync"), Enabled: path != null && File.Exists(path)));
         items.Add(new MenuEntry("音轨", Sub: audio, Enabled: audio.Count > 0));
         items.Add(new MenuEntry("字幕", Sub: subs, Enabled: playing));
 
@@ -1235,16 +1279,27 @@ public partial class MainWindow : FluentWindow
             new($"提前 {step} ms", Hp("sub-delay-dec"), "Z"),
             new($"延后 {step} ms", Hp("sub-delay-inc"), "X"),
             new("重置", Hp("sub-delay-reset")),
+            Sep,
+            _subSync.Running
+                ? new MenuEntry("取消自动同步", Hp("sub-sync"))
+                : new MenuEntry("自动同步字幕（ffsubsync）…", Hp("sub-sync"), Enabled: path != null && File.Exists(path)),
         }));
         items.Add(Sep);
 
         items.Add(new MenuEntry("HDR 输出", Hp("hdr"), "H", Checked: _hdrOn));
-        items.Add(new MenuEntry("解码方式", Sub: SettingsWindow.HwdecChoices
-            .Select(c => new MenuEntry(c.Name, Hp("hwdec", c.Value), Checked: S.Hwdec == c.Value)).ToList()));
+        // 解码方式：只对当前这个视频生效并按文件记住，优先于全局设置
+        string? fileHwdec = FileHwdec();
+        var hwdec = new List<MenuEntry>
+        {
+            new($"跟随全局设置（{HwdecName(S.Hwdec)}）", Hp("hwdec", "global"), Checked: playing && fileHwdec == null),
+            Sep,
+        };
+        hwdec.AddRange(SettingsWindow.HwdecChoices.Select(c => new MenuEntry(c.Name, Hp("hwdec", c.Value), Checked: fileHwdec == c.Value)));
+        items.Add(new MenuEntry("解码方式（本视频）", Sub: hwdec, Enabled: playing));
         items.Add(Sep);
         items.Add(new MenuEntry("播放列表", Hp("playlist"), "P", Checked: PlaylistPanel.Visibility == Visibility.Visible, Enabled: !_fullscreen));
         items.Add(new MenuEntry("全屏", Hp("fullscreen"), "F / 双击", Checked: _fullscreen));
-        items.Add(new MenuEntry("设置…", Hp("settings")));
+        items.Add(new MenuEntry("全局设置…", Hp("settings")));
         items.Add(Sep);
         items.Add(new MenuEntry("退出", Hp("quit")));
         return items;
@@ -1292,8 +1347,23 @@ public partial class MainWindow : FluentWindow
         // MenuItem 会把 “_” 当作访问键，转义一下
         var mi = new MenuItem
         {
-            Header = e.Title.Replace("_", "__"), InputGestureText = e.Shortcut ?? "", IsChecked = e.Checked, IsEnabled = e.Enabled,
+            Header = e.Title.Replace("_", "__"), InputGestureText = e.Shortcut ?? "", IsEnabled = e.Enabled,
         };
+        // WPF-UI 的菜单只有 IsCheckable 时才画勾选框（而且每项都是一个框），这里自己在图标位置画对勾：
+        // 选中的显示对勾，同组没选中的留出同样宽度，文字对齐
+        if (e.Checked is bool isChecked)
+        {
+            if (isChecked)
+            {
+                var tick = new SymbolIcon { Symbol = SymbolRegular.Checkmark24, FontSize = 16, Width = 16 };
+                tick.SetResourceReference(Control.ForegroundProperty, "AccentTextFillColorPrimaryBrush");
+                mi.Icon = tick;
+            }
+            else
+            {
+                mi.Icon = new Border { Width = 16 };
+            }
+        }
         if (e.Sub != null) foreach (var sub in ToWpfMenu(e.Sub)) mi.Items.Add(sub);
         if (e.Cmd != null) { string cmd = e.Cmd; mi.Click += (_, _) => _mpv?.CommandString(cmd); }
         return mi;
@@ -1307,7 +1377,6 @@ public partial class MainWindow : FluentWindow
         if (t.GetValueOrDefault("title") is string title) parts.Add(title);
         if (t.GetValueOrDefault("codec") is string codec) parts.Add(codec);
         if (t.GetValueOrDefault("demux-channel-count") is long ch) parts.Add(ch + "ch");
-        if (t.GetValueOrDefault("default") is true) parts.Add("(默认)");
         if (t.GetValueOrDefault("external") is true) parts.Add("(外部)");
         return string.Join(" ", parts);
     }
