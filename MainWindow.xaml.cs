@@ -181,7 +181,7 @@ public partial class MainWindow : FluentWindow
         LocationChanged += (_, _) => PositionBar();
         SizeChanged += (_, _) => PositionBar();
         VideoFrame.SizeChanged += (_, _) => PositionBar();
-        DpiChanged += (_, _) => PositionBar();
+        DpiChanged += (_, _) => { PositionBar(); if (_fullscreen) Dispatcher.InvokeAsync(ApplyFullscreenBounds, DispatcherPriority.Loaded); };
         StateChanged += (_, _) =>
         {
             UpdateFrameMargins();
@@ -1407,6 +1407,24 @@ public partial class MainWindow : FluentWindow
         catch { }
     }
 
+    /// <summary>全屏时把窗口精确地放到所在显示器的整块屏幕上（物理像素）。</summary>
+    private void ApplyFullscreenBounds()
+    {
+        if (!_fullscreen || _hwnd == IntPtr.Zero) return;
+        var (_, mon) = Native.MonitorOf(_hwnd);
+        if (mon.Width <= 0 || mon.Height <= 0) return;
+        Native.SetWindowPos(_hwnd, IntPtr.Zero, mon.Left, mon.Top, mon.Width, mon.Height,
+            Native.SWP_NOZORDER | Native.SWP_NOOWNERZORDER | Native.SWP_NOACTIVATE | Native.SWP_FRAMECHANGED);
+    }
+
+    /// <summary>Windows 11 在窗口外圈画的 1 像素边框：全屏时去掉（旧系统不支持，忽略）。</summary>
+    private void SetDwmBorder(bool on)
+    {
+        if (_hwnd == IntPtr.Zero) return;
+        uint color = on ? Native.DWMWA_COLOR_DEFAULT : Native.DWMWA_COLOR_NONE;
+        try { Native.DwmSetWindowAttribute(_hwnd, Native.DWMWA_BORDER_COLOR, ref color, sizeof(uint)); } catch { }
+    }
+
     private Matrix FromDevice() =>
         PresentationSource.FromVisual(this)?.CompositionTarget?.TransformFromDevice ?? Matrix.Identity;
 
@@ -1433,6 +1451,11 @@ public partial class MainWindow : FluentWindow
             var tl = m.Transform(new Point(mon.Left, mon.Top));
             var br = m.Transform(new Point(mon.Right, mon.Bottom));
             (Left, Top, Width, Height) = (tl.X, tl.Y, br.X - tl.X, br.Y - tl.Y);
+            // 上面按 DIP 设置，非整数缩放时换算回像素会舍入，右 / 下边可能差 1 像素露出桌面：再按物理像素精确设一次。
+            // 布局完成后再设一次，防止 WPF 处理窗口状态切换时又用自己舍入后的尺寸覆盖
+            ApplyFullscreenBounds();
+            Dispatcher.InvokeAsync(ApplyFullscreenBounds, DispatcherPriority.Loaded);
+            SetDwmBorder(false);
         }
         else
         {
@@ -1440,6 +1463,7 @@ public partial class MainWindow : FluentWindow
             AppTitleBar.Visibility = Visibility.Visible;
             PlaylistPanel.Visibility = _playlistWasVisible ? Visibility.Visible : Visibility.Collapsed;
             SetResizeBorder(true);
+            SetDwmBorder(true);
             WindowCornerPreference = WindowCornerPreference.Round;
             (Left, Top, Width, Height) = (_prevBounds.X, _prevBounds.Y, _prevBounds.Width, _prevBounds.Height);
             WindowState = _prevState;
