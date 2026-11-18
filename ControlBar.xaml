@@ -41,10 +41,14 @@
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="RepeatButton">
-                        <!-- 透明的外框保证整个高度都能点；里面 4 像素高的条和灰色轨道对齐 -->
+                        <!--
+                            透明的外框保证整个高度都能点；里面 4 像素高的条和灰色轨道对齐。
+                            右边多画半个圆点的宽度（负边距，伸到圆点下面），蓝条一直接到圆点中心，中间不露灰色轨道
+                        -->
                         <Border Background="Transparent">
                             <Border
                                 Height="4"
+                                Margin="0,0,-9,0"
                                 VerticalAlignment="Center"
                                 Background="{DynamicResource SliderThumbBackground}"
                                 CornerRadius="2" />
@@ -65,6 +69,41 @@
                 </Setter.Value>
             </Setter>
         </Style>
+        <!--
+            圆点：WPF-UI 原来的圆点外面有一圈灰色的外环（SliderOuterThumbBackground），夹在蓝条和蓝点之间像一截灰色。
+            这里只保留强调色的圆点，悬停 / 拖动时稍微放大（和 Windows 11 的滑块一样）
+        -->
+        <Style x:Key="FilledSliderThumb" TargetType="Thumb">
+            <Setter Property="Width" Value="18" />
+            <Setter Property="Height" Value="18" />
+            <Setter Property="OverridesDefaultStyle" Value="True" />
+            <Setter Property="Foreground" Value="{DynamicResource SliderThumbBackground}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Thumb">
+                        <Grid Background="Transparent">
+                            <Ellipse
+                                x:Name="Dot"
+                                Width="12"
+                                Height="12"
+                                HorizontalAlignment="Center"
+                                VerticalAlignment="Center"
+                                Fill="{TemplateBinding Foreground}" />
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Dot" Property="Width" Value="16" />
+                                <Setter TargetName="Dot" Property="Height" Value="16" />
+                            </Trigger>
+                            <Trigger Property="IsDragging" Value="True">
+                                <Setter TargetName="Dot" Property="Width" Value="16" />
+                                <Setter TargetName="Dot" Property="Height" Value="16" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
         <ControlTemplate x:Key="FilledSlider" TargetType="Slider">
             <Grid>
                 <Border
@@ -78,7 +117,7 @@
                         <RepeatButton Command="Slider.DecreaseLarge" Style="{StaticResource SliderFilledPart}" />
                     </Track.DecreaseRepeatButton>
                     <Track.Thumb>
-                        <Thumb x:Name="Thumb" Style="{DynamicResource UiSliderThumbStyle}" />
+                        <Thumb x:Name="Thumb" Style="{StaticResource FilledSliderThumb}" />
                     </Track.Thumb>
                     <Track.IncreaseRepeatButton>
                         <RepeatButton Command="Slider.IncreaseLarge" Style="{StaticResource SliderEmptyPart}" />
