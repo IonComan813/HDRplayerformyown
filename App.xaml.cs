@@ -6,6 +6,14 @@ namespace HdrPlayer;
 
 public partial class App : Application
 {
+    private SingleInstance? _single;
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        _single?.Dispose();
+        base.OnExit(e);
+    }
+
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
@@ -15,6 +23,20 @@ public partial class App : Application
         {
             Shutdown(DefaultApps.HandleCommandLine(e.Args));
             return;
+        }
+
+        // 只开一个窗口：已经有 HdrPlayer 在运行时，把要打开的文件交给它，自己退出
+        string[] files = HdrPlayer.MainWindow.ExistingPaths(e.Args);
+        _single = new SingleInstance();
+        if (!_single.IsPrimary)
+        {
+            if (_single.Forward(files))
+            {
+                Shutdown();
+                return;
+            }
+            // 没连上：之前的实例可能正在退出，等它放开后由这里接手（等不到也照常启动）
+            _single.WaitForPrimary(5000);
         }
 
         string dll = Path.Combine(AppContext.BaseDirectory, "libmpv-2.dll");
@@ -29,9 +51,10 @@ public partial class App : Application
             return;
         }
 
-        var main = new MainWindow(e.Args);
+        var main = new MainWindow(files);
         MainWindow = main;
         main.Show();
+        _single.StartServer(paths => Dispatcher.BeginInvoke(() => main.OpenFromOtherInstance(paths)));
     }
 }
 

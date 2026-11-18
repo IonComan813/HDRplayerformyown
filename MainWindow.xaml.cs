@@ -60,6 +60,9 @@ public partial class MainWindow : FluentWindow
     private readonly AppSettings S;
     private Mpv? _mpv;
     private readonly string[] _startupFiles;
+    /// <summary>mpv 初始化完成；之前从其它实例转来的文件先排队。</summary>
+    private bool _ready;
+    private readonly List<string[]> _pendingOpen = new();
     private readonly ControlBar _bar;
     private readonly Thumbnailer _thumbs = new();
     private readonly SubSync _subSync = new();
@@ -79,6 +82,8 @@ public partial class MainWindow : FluentWindow
     // 悬浮控制栏
     private Native.POINT _lastCursor;
     private DateTime _lastActivity = DateTime.UtcNow;
+    /// <summary>最近一次键盘跳转：只让控制栏出现，不显示鼠标指针。</summary>
+    private DateTime _lastKeyActivity = DateTime.MinValue;
     private bool _menuOpen;
 
     // 全屏
@@ -86,6 +91,8 @@ public partial class MainWindow : FluentWindow
     private WindowState _prevState;
     private Rect _prevBounds;
     private bool _playlistWasVisible;
+    /// <summary>最小化之前的窗口状态：被另一个实例唤起时还原成这个。</summary>
+    private WindowState _prevStateBeforeMinimize = WindowState.Normal;
 
     // HDR：_hdrOn 是本次运行的输出状态。启动时跟随 Windows 当前的 HDR 开关（空着启动不改系统设置），
     // 打开 HDR 片源时自动开启；_originalWindowsHdr 记录第一次切换前的系统状态，退出时还原。
@@ -113,7 +120,7 @@ public partial class MainWindow : FluentWindow
     public MainWindow(string[] args)
     {
         S = AppSettings.Load();
-        _startupFiles = args.Where(a => File.Exists(a) || Directory.Exists(a)).ToArray();
+        _startupFiles = ExistingPaths(args);
 
         InitializeComponent();
         RestorePlacement();
@@ -186,7 +193,7 @@ public partial class MainWindow : FluentWindow
         {
             UpdateFrameMargins();
             if (WindowState == WindowState.Minimized) _bar.HideNow();
-            else PositionBar();
+            else { _prevStateBeforeMinimize = WindowState; PositionBar(); }
         };
         UpdateFrameMargins();
 
@@ -227,8 +234,12 @@ public partial class MainWindow : FluentWindow
             return;
         }
         _uiTimer.Start();
-        if (_startupFiles.Length > 0) AddFiles(_startupFiles, replace: true);
-        else if (S.RestorePlaylist) RestorePlaylist();
+        // 先恢复上次的播放列表，再把这次要打开的文件加到后面并播放（而不是用这个文件替换整个列表）
+        if (S.RestorePlaylist) RestorePlaylist(announce: _startupFiles.Length == 0);
+        if (_startupFiles.Length > 0) OpenFromShell(_startupFiles);
+        _ready = true;
+        foreach (var pending in _pendingOpen) OpenFromShell(pending);
+        _pendingOpen.Clear();
         PositionBar();
         _bar.Reveal();
     }
@@ -730,21 +741,94 @@ public partial class MainWindow : FluentWindow
         m.ShowText("重新载入…");
     }
 
-    /// <summary>空着启动时恢复上次的播放列表：只加入列表、不开始播放（免得一启动就切 HDR、出声音）。</summary>
-    private void RestorePlaylist()
+    /// <summary>
+    /// 恢复上次的播放列表：只加入列表、不开始播放（免得一启动就切 HDR、出声音）。
+    /// 双击视频文件启动时也恢复，那个文件随后加到列表里播放；announce 为 false 时不显示提示。
+    /// </summary>
+    private void RestorePlaylist(bool announce)
     {
         var m = _mpv;
         var saved = SavedPlaylist.Load();
         if (m == null || saved == null || saved.Files.Count == 0) return;
         int restored = 0;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (string f in saved.Files)
         {
-            if (!File.Exists(f)) continue; // 文件已删除 / 移动 / 所在的盘没接上
+            if (!File.Exists(f) || !seen.Add(FullPath(f))) continue; // 文件已删除 / 移动 / 所在的盘没接上；重复的只留一个
             m.Command("loadfile", f, "append"); // append：空闲时只加入列表，不会开始播放
             restored++;
         }
-        if (restored > 0)
+        if (restored > 0 && announce)
             m.ShowText($"已恢复上次的播放列表（{restored} 个文件），在播放列表（P）里双击要看的文件", 4000);
+    }
+
+    /// <summary>命令行参数里存在的文件 / 文件夹，转成完整路径（转给另一个实例时工作目录不同）。</summary>
+    public static string[] ExistingPaths(IEnumerable<string> args) =>
+        args.Where(a => File.Exists(a) || Directory.Exists(a)).Select(FullPath).ToArray();
+
+    private static string FullPath(string p)
+    {
+        try { return Path.GetFullPath(p); } catch { return p; }
+    }
+
+    private static bool SamePath(string? a, string? b) =>
+        a != null && b != null && string.Equals(FullPath(a), FullPath(b), StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>播放列表里这个文件的位置，没有返回 -1。</summary>
+    private int PlaylistIndexOf(string path)
+    {
+        if (_mpv?.GetNode("playlist") is not List<object?> list) return -1;
+        for (int i = 0; i < list.Count; i++)
+            if (list[i] is Dictionary<string, object?> e && SamePath(e.GetValueOrDefault("filename") as string, path))
+                return i;
+        return -1;
+    }
+
+    /// <summary>
+    /// 从资源管理器打开（启动参数，或另一个实例转来的）：视频加到播放列表末尾（已经在列表里的不重复加），
+    /// 然后播放第一个；它正是当前在播放的文件时，重新载入一次（回到原位置）。字幕 / 外挂音轨照常加载到当前视频。
+    /// </summary>
+    private void OpenFromShell(string[] paths)
+    {
+        var m = _mpv;
+        if (m == null || paths.Length == 0) return;
+        var media = new List<string>();
+        foreach (var p in paths)
+        {
+            string ext = Path.GetExtension(p);
+            if (SubExts.Contains(ext) || (AudioExts.Contains(ext) && !_idle)) AddFiles(new[] { p });
+            else media.Add(p);
+        }
+        if (media.Count == 0) return;
+
+        string? current = _idle ? null : m.GetString("path");
+        if (SamePath(current, media[0]) && media.Count == 1)
+        {
+            ReloadCurrent();
+            return;
+        }
+        int target = -1;
+        foreach (var f in media)
+        {
+            int idx = PlaylistIndexOf(f);
+            if (idx < 0)
+            {
+                m.Command("loadfile", f, "append");
+                idx = PlaylistIndexOf(f);
+            }
+            if (target < 0) target = idx;
+        }
+        if (target >= 0) m.Command("playlist-play-index", target.ToString(Inv));
+    }
+
+    /// <summary>另一个 HdrPlayer 实例转来的文件（例如在资源管理器里又双击了一个视频）：切到前台并打开。</summary>
+    public void OpenFromOtherInstance(string[] paths)
+    {
+        if (_shuttingDown) return;
+        if (WindowState == WindowState.Minimized) WindowState = _fullscreen ? WindowState.Normal : _prevStateBeforeMinimize;
+        Activate();
+        if (!_ready) { _pendingOpen.Add(paths); return; }
+        OpenFromShell(ExistingPaths(paths));
     }
 
     /// <summary>退出时保存播放列表（只保存文件列表；每个文件的进度单独记在 file-states.json 里）。</summary>
@@ -795,10 +879,11 @@ public partial class MainWindow : FluentWindow
                 else if (_idle) OpenFiles();
                 else m.CommandString("cycle pause");
                 break;
-            case "seek-back": m.CommandString($"osd-msg-bar seek {(-S.SeekStep).ToString(Inv)} {seekMode}"); break;
-            case "seek-fwd": m.CommandString($"osd-msg-bar seek {S.SeekStep.ToString(Inv)} {seekMode}"); break;
-            case "seek-back-big": m.CommandString($"osd-msg-bar seek {(-S.SeekStepLarge).ToString(Inv)} {seekMode}"); break;
-            case "seek-fwd-big": m.CommandString($"osd-msg-bar seek {S.SeekStepLarge.ToString(Inv)} {seekMode}"); break;
+            // 跳转时不用 mpv 自己的 OSD 进度条（osd-msg-bar，上面的分格是片子的章节标记），改为显示本程序的控制栏
+            case "seek-back": Seek(-S.SeekStep, seekMode); break;
+            case "seek-fwd": Seek(S.SeekStep, seekMode); break;
+            case "seek-back-big": Seek(-S.SeekStepLarge, seekMode); break;
+            case "seek-fwd-big": Seek(S.SeekStepLarge, seekMode); break;
             case "vol-up": m.CommandString($"no-osd add volume {S.VolumeStep.ToString(Inv)}"); m.ShowText("音量 ${volume}"); break;
             case "vol-down": m.CommandString($"no-osd add volume {(-S.VolumeStep).ToString(Inv)}"); m.ShowText("音量 ${volume}"); break;
             case "mute": m.CommandString("no-osd cycle mute"); m.ShowText("静音：${mute}"); break;
@@ -810,7 +895,9 @@ public partial class MainWindow : FluentWindow
                 ToggleFullscreen();
                 break;
             case "reload": ReloadCurrent(); break;
-            case "restart": if (!_idle) m.CommandString("osd-msg-bar seek 0 absolute+exact"); break;
+            case "restart":
+                if (!_idle) { m.CommandString("no-osd seek 0 absolute+exact"); RevealBarForKeyboard(); }
+                break;
             case "exit-fullscreen": if (_fullscreen) ToggleFullscreen(); break;
             case "menu": ShowContextMenu(); break;
             case "aid":
@@ -847,8 +934,8 @@ public partial class MainWindow : FluentWindow
             case "prev": m.Command("playlist-prev"); break;
             case "next": m.Command("playlist-next"); break;
             case "open": OpenFiles(); break;
-            case "frame-step": m.CommandString("frame-step"); break;
-            case "frame-back": m.CommandString("frame-back-step"); break;
+            case "frame-step": m.CommandString("frame-step"); RevealBarForKeyboard(); break;
+            case "frame-back": m.CommandString("frame-back-step"); RevealBarForKeyboard(); break;
         }
     }
 
@@ -927,11 +1014,10 @@ public partial class MainWindow : FluentWindow
     //  文件 / 播放列表
     // =====================================================================
 
-    private void AddFiles(IEnumerable<string> paths, bool replace = false)
+    private void AddFiles(IEnumerable<string> paths)
     {
         var m = _mpv;
         if (m == null) return;
-        bool first = true;
         foreach (var p in paths)
         {
             string ext = Path.GetExtension(p);
@@ -947,8 +1033,7 @@ public partial class MainWindow : FluentWindow
             }
             else
             {
-                m.Command("loadfile", p, first && replace ? "replace" : "append-play");
-                first = false;
+                m.Command("loadfile", p, "append-play");
             }
         }
     }
@@ -1502,6 +1587,20 @@ public partial class MainWindow : FluentWindow
     /// 鼠标在画面或控制栏上移动时显示控制栏，静止 2 秒后淡出。
     /// mpv 的画面是别的线程的原生窗口，收不到 WPF 的鼠标事件，所以用轮询光标位置的方式判断。
     /// </summary>
+    /// <summary>键盘跳转：用本程序的控制栏显示进度，静止 2 秒后照常淡出。</summary>
+    private void Seek(double seconds, string mode)
+    {
+        _mpv?.CommandString($"no-osd seek {seconds.ToString(Inv)} {mode}");
+        RevealBarForKeyboard();
+    }
+
+    private void RevealBarForKeyboard()
+    {
+        if (_idle || _shuttingDown) return;
+        _lastKeyActivity = DateTime.UtcNow;
+        UpdateBarVisibility();
+    }
+
     private void UpdateBarVisibility()
     {
         if (_shuttingDown || _mpv == null || !IsVisible || WindowState == WindowState.Minimized) return;
@@ -1515,8 +1614,9 @@ public partial class MainWindow : FluentWindow
         bool overVideo = root == _hwnd && Native.GetWindowRect(Video.Hwnd, out var vr) && vr.Contains(p);
         if (moved && (overVideo || overBar)) _lastActivity = DateTime.UtcNow;
 
-        bool keep = _idle || overBar || _bar.IsSeekDragging || _menuOpen ||
-                    (DateTime.UtcNow - _lastActivity).TotalMilliseconds < BarHideMs;
+        bool mouseKeep = _idle || overBar || _bar.IsSeekDragging || _menuOpen ||
+                         (DateTime.UtcNow - _lastActivity).TotalMilliseconds < BarHideMs;
+        bool keep = mouseKeep || (DateTime.UtcNow - _lastKeyActivity).TotalMilliseconds < BarHideMs;
         if (keep)
         {
             if (!_bar.IsRevealed) PositionBar();
@@ -1526,8 +1626,8 @@ public partial class MainWindow : FluentWindow
         {
             _bar.Conceal();
         }
-        // 控制栏淡出时画面上的鼠标指针也隐藏
-        Video.HideCursor = !keep;
+        // 控制栏淡出时画面上的鼠标指针也隐藏（键盘跳转让控制栏出现时，指针仍然保持隐藏）
+        Video.HideCursor = !mouseKeep;
     }
 
     private static string FormatTime(double sec)
