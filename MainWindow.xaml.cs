@@ -424,6 +424,22 @@ public partial class MainWindow : FluentWindow
         bool switched = false;
         string gdi = CurrentGdiName();
         var info = DisplayHelper.Query(gdi);
+
+        // 开 HDR 前先看能不能开：显示器不支持 / 系统策略（例如笔记本用电池）不允许时，不去切 Windows 设置，
+        // 也不输出 PQ，保持 SDR 输出，HDR 片源由 mpv 色调映射到 SDR。手动按 H 也一样，否则 PQ 信号会被当成 SDR 显示，发灰。
+        // 读不到显示器信息（ColorInfoKnown = false）时不下结论，按原来的流程走。
+        if (on && info is { ColorInfoKnown: true } && !(info.HasDxgi && info.DxgiIsHdr))
+        {
+            string? why = !info.HdrSupported ? "显示器不支持HDR，将映射到SDR输出"
+                        : info.LimitedByPolicy ? "系统策略禁止启用HDR，将映射到SDR输出"
+                        : null;
+            if (why != null)
+            {
+                m.ShowText(why, 3000);
+                return;
+            }
+        }
+
         if (info is { HdrSupported: true } && info.HdrEnabled != on)
         {
             bool before = info.HdrEnabled;
@@ -438,13 +454,8 @@ public partial class MainWindow : FluentWindow
                 if (!manual) return;
             }
         }
-        // 自动开启时，如果系统 HDR 既没开、也没能切换（显示器不支持 / 设置里不允许切换），就什么都不做
-        if (!manual && on && !switched && !WindowsHdrIsOn())
-        {
-            if (info is { HdrEnabled: true, LimitedByPolicy: true })
-                m.ShowText("Windows 当前不允许 HDR（例如笔记本正在用电池），保持 SDR 输出", 3000);
-            return;
-        }
+        // 自动开启时，如果系统 HDR 既没开、也没能切换（例如读不到显示器信息），就什么都不做
+        if (!manual && on && !switched && !WindowsHdrIsOn()) return;
 
         _hdrOn = on;
         ApplyMpvHdrProps();

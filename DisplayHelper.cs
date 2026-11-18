@@ -16,13 +16,15 @@ internal sealed class MonitorHdrInfo
 
     /// <summary>是否用的是 24H2 起的新接口（GET_ADVANCED_COLOR_INFO_2）；旧系统为 false，用旧接口推断。</summary>
     public bool HasColorInfo2;
+    /// <summary>新旧接口有一个读成功了：下面的 HdrSupported / LimitedByPolicy 是可信的（false 才真的表示“不支持”）。</summary>
+    public bool ColorInfoKnown;
     /// <summary>显示器支持 HDR（不包括只支持 WCG / ACM 的 SDR 显示器）。</summary>
     public bool HdrSupported;
     /// <summary>Windows 设置里的“使用 HDR”开关是开的。</summary>
     public bool HdrEnabled;
     /// <summary>当前实际处于 HDR 模式（开关开着但被策略限制，例如笔记本用电池时，可能不是 HDR）。</summary>
     public bool HdrActive;
-    /// <summary>被系统策略限制（例如电池模式下不允许 HDR），只有新接口能读到。</summary>
+    /// <summary>被系统策略限制（例如笔记本用电池时不允许 HDR）。新接口：advancedColorLimitedByPolicy；旧接口：advancedColorForceDisabled。</summary>
     public bool LimitedByPolicy;
     public bool WideColorEnforced;
     /// <summary>新接口的当前颜色模式：0 = SDR，1 = WCG，2 = HDR；-1 = 不知道（旧系统）。</summary>
@@ -221,6 +223,7 @@ internal static unsafe class DisplayHelper
         if (DisplayConfigGetDeviceInfo(ref ac) != 0) return false;
         uint v = ac.value;
         info.HasColorInfo2 = true;
+        info.ColorInfoKnown = true;
         info.AdvancedColorSupported = (v & 0x01) != 0;
         info.AdvancedColorEnabled = (v & 0x02) != 0;
         info.LimitedByPolicy = (v & 0x08) != 0;
@@ -247,6 +250,7 @@ internal static unsafe class DisplayHelper
             },
         };
         if (DisplayConfigGetDeviceInfo(ref ac) != 0) return;
+        info.ColorInfoKnown = true;
         info.AdvancedColorSupported = (ac.value & 0x1) != 0;
         info.AdvancedColorEnabled = (ac.value & 0x2) != 0;
         info.WideColorEnforced = (ac.value & 0x4) != 0;
@@ -254,6 +258,7 @@ internal static unsafe class DisplayHelper
         info.BitsPerColorChannel = ac.bitsPerColorChannel;
         info.HdrSupported = info.AdvancedColorSupported && !info.WideColorEnforced;
         info.HdrEnabled = info.AdvancedColorEnabled && !info.WideColorEnforced;
+        info.LimitedByPolicy = info.AdvancedColorForceDisabled;
         info.HdrActive = info.HdrEnabled && !info.AdvancedColorForceDisabled;
     }
 
