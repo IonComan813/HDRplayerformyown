@@ -23,6 +23,12 @@ jobs:
       DOTNET_CLI_TELEMETRY_OPTOUT: "1"
       DOTNET_NOLOGO: "1"
       GH_TOKEN: ${{ github.token }}
+      # Cloudflare R2（S3 兼容）：每次构建后把安装程序传到 hdrplayer-release/releasefile/，固定文件名、覆盖旧的。
+      # 密钥放在仓库的 Actions secrets 里（R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY）；没配置时跳过上传。
+      R2_ENDPOINT: https://fe03e958078a8537f7ef143d89668385.r2.cloudflarestorage.com
+      R2_BUCKET: hdrplayer-release
+      R2_KEY: releasefile/HdrPlayer-setup.exe
+      R2_CONFIGURED: ${{ secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_SECRET_ACCESS_KEY != '' }}
 
     steps:
       - uses: actions/checkout@v7
@@ -136,6 +142,34 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "ISCC 失败" }
           $exe = Get-ChildItem dist -Filter *-setup.exe | Select-Object -First 1
           "exe=dist/$($exe.Name)" >> $env:GITHUB_OUTPUT
+
+      - name: 上传到 Cloudflare R2
+        if: env.R2_CONFIGURED == 'true'
+        shell: pwsh
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          # 新版 AWS CLI 默认附加的 CRC 校验和 R2 不一定兼容，只在必要时计算
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          if (-not (Get-Command aws -ErrorAction SilentlyContinue)) {
+            python -m pip install --disable-pip-version-check awscli
+            if ($LASTEXITCODE -ne 0) { throw "安装 AWS CLI 失败" }
+          }
+          $exe = "${{ steps.setup.outputs.exe }}"
+          aws s3 cp $exe "s3://$env:R2_BUCKET/$env:R2_KEY" --endpoint-url $env:R2_ENDPOINT --no-progress `
+            --content-type application/octet-stream `
+            --metadata "version=${{ steps.ver.outputs.version }},commit=${{ github.sha }}"
+          if ($LASTEXITCODE -ne 0) { throw "上传到 R2 失败" }
+          aws s3api head-object --bucket $env:R2_BUCKET --key $env:R2_KEY --endpoint-url $env:R2_ENDPOINT --query "{Size:ContentLength,Modified:LastModified,Meta:Metadata}"
+          if ($LASTEXITCODE -ne 0) { throw "上传后读取 R2 对象失败" }
+
+      - name: R2 未配置
+        if: env.R2_CONFIGURED != 'true'
+        shell: pwsh
+        run: Write-Host "::notice::没有配置 R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY，跳过上传到 Cloudflare R2"
 
       - name: 上传 artifact
         uses: actions/upload-artifact@v7
