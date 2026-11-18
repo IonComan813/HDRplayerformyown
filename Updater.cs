@@ -41,8 +41,15 @@ internal sealed class UpdateInfo
     [JsonPropertyName("commit")] public string? Commit { get; set; }
 }
 
+/// <summary>下载进度：已下载 / 总字节数（不知道总大小时为 0），以及最近约 1 秒的平均速度（字节 / 秒）。</summary>
+internal readonly record struct DownloadProgress(long Done, long Total, double BytesPerSecond)
+{
+    public double Fraction => Total > 0 ? Math.Min(1, (double)Done / Total) : 0;
+}
+
 /// <summary>
 /// 检查更新、下载安装程序、退出后静默安装并重启。
+/// 联网用 .NET 的 HttpClient，默认跟随 Windows 的系统代理（设置 → 网络 → 代理，包括自动配置脚本）。
 /// 只在用户点“检查更新”时才联网；下载到临时目录 %TEMP%\HdrPlayer-update，校验 SHA-256 后再用，
 /// 装完重新启动的 HdrPlayer 会把它删掉（只留一个很小的安装日志，下次更新时覆盖）。
 /// </summary>
@@ -98,8 +105,11 @@ internal static class Updater
 
     public static bool IsNewer(UpdateInfo info) => info.Build > AppInfo.Build;
 
-    /// <summary>下载安装程序并校验大小和 SHA-256，返回本地路径。progress 报告 0~1。</summary>
-    public static async Task<string> DownloadAsync(UpdateInfo info, IProgress<double> progress, CancellationToken ct)
+    /// <summary>
+    /// 下载安装程序并校验大小和 SHA-256，返回本地路径。大约每 0.25 秒报告一次进度。
+    /// 取消（或出错）时删掉没下完的文件。
+    /// </summary>
+    public static async Task<string> DownloadAsync(UpdateInfo info, IProgress<DownloadProgress> progress, CancellationToken ct)
     {
         Directory.CreateDirectory(UpdatesDir);
         // 旧的下载一律清掉
@@ -108,25 +118,59 @@ internal static class Updater
 
         string target = Path.Combine(UpdatesDir, $"HdrPlayer-setup-b{info.Build}.exe");
         string part = target + ".part";
+        try
+        {
+            await DownloadToAsync(info, part, progress, ct);
+            return await VerifyAsync(info, part, target, ct);
+        }
+        catch
+        {
+            try { File.Delete(part); } catch { }
+            throw;
+        }
+    }
+
+    private static async Task DownloadToAsync(UpdateInfo info, string part, IProgress<DownloadProgress> progress, CancellationToken ct)
+    {
         // 构建号做查询参数，避免拿到 CDN 缓存的旧文件
         string url = $"{AppInfo.UpdateBaseUrl}/releasefile/{Uri.EscapeDataString(info.File)}?b={info.Build}";
-        using (var resp = await Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct))
+        using var resp = await Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
+        resp.EnsureSuccessStatusCode();
+        long total = resp.Content.Headers.ContentLength ?? info.Size;
+        await using var src = await resp.Content.ReadAsStreamAsync(ct);
+        await using var dst = new FileStream(part, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16, useAsync: true);
+        var buf = new byte[1 << 16];
+        long done = 0;
+        int n;
+
+        // 速度：最近约 1 秒内的字节数 / 时间（滑动窗口，数字不会乱跳）
+        var clock = Stopwatch.StartNew();
+        var samples = new Queue<(double T, long Done)>();
+        samples.Enqueue((0, 0));
+        double lastReport = -1;
+        void Report(bool force)
         {
-            resp.EnsureSuccessStatusCode();
-            long total = resp.Content.Headers.ContentLength ?? info.Size;
-            await using var src = await resp.Content.ReadAsStreamAsync(ct);
-            await using var dst = new FileStream(part, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16, useAsync: true);
-            var buf = new byte[1 << 16];
-            long done = 0;
-            int n;
-            while ((n = await src.ReadAsync(buf, ct)) > 0)
-            {
-                await dst.WriteAsync(buf.AsMemory(0, n), ct);
-                done += n;
-                if (total > 0) progress.Report(Math.Min(1, (double)done / total));
-            }
+            double now = clock.Elapsed.TotalSeconds;
+            if (!force && now - lastReport < 0.25) return;
+            lastReport = now;
+            samples.Enqueue((now, done));
+            while (samples.Count > 2 && now - samples.Peek().T > 1.0) samples.Dequeue();
+            var (t0, d0) = samples.Peek();
+            double speed = now - t0 > 0.05 ? (done - d0) / (now - t0) : 0;
+            progress.Report(new DownloadProgress(done, total, speed));
         }
 
+        while ((n = await src.ReadAsync(buf, ct)) > 0)
+        {
+            await dst.WriteAsync(buf.AsMemory(0, n), ct);
+            done += n;
+            Report(false);
+        }
+        Report(true);
+    }
+
+    private static async Task<string> VerifyAsync(UpdateInfo info, string part, string target, CancellationToken ct)
+    {
         var fi = new FileInfo(part);
         if (info.Size > 0 && fi.Length != info.Size)
             throw new InvalidDataException($"下载的文件大小不对（{fi.Length} / {info.Size} 字节），可能还没上传完，稍后再试");
@@ -134,10 +178,7 @@ internal static class Updater
         await using (var fs = File.OpenRead(part))
             hash = Convert.ToHexString(await SHA256.HashDataAsync(fs, ct));
         if (!string.Equals(hash, info.Sha256, StringComparison.OrdinalIgnoreCase))
-        {
-            try { File.Delete(part); } catch { }
             throw new InvalidDataException("下载的文件校验失败（SHA-256 不一致），可能刚好在更新，稍后再试");
-        }
         File.Move(part, target, overwrite: true);
         return target;
     }

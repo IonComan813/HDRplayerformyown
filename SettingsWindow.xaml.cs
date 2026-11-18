@@ -393,6 +393,11 @@ public partial class SettingsWindow : FluentWindow
     // ------------------------------------------------------------------ 关于 / 检查更新
 
     private CancellationTokenSource? _updateCts;
+    private bool _closed;
+
+    /// <summary>字节数显示成 KB / MB。</summary>
+    private static string FormatBytes(long bytes) =>
+        bytes >= 1024 * 1024 ? $"{bytes / 1024.0 / 1024.0:0.0} MB" : $"{bytes / 1024.0:0} KB";
 
     private StackPanel BuildAboutPage()
     {
@@ -425,11 +430,26 @@ public partial class SettingsWindow : FluentWindow
         // ---- 检查更新 ----
         var status = new TextBlock { FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(4, 4, 4, 0) };
         status.SetResourceReference(TextBlock.ForegroundProperty, "TextFillColorSecondaryBrush");
-        var bar = new System.Windows.Controls.ProgressBar { Height = 4, Margin = new Thickness(4, 8, 4, 0), Maximum = 1, Visibility = Visibility.Collapsed };
         var btn = new Wpf.Ui.Controls.Button { Content = "检查更新", Icon = new SymbolIcon { Symbol = SymbolRegular.ArrowSync24 } };
-        AddCard(p, "检查更新", "从发布服务器检查新版本；有新版本时自动下载到临时目录，下载完成后静默安装并重启 HdrPlayer，安装程序随后自动删除。只有点这个按钮时才联网", btn);
+        AddCard(p, "检查更新", "从发布服务器检查新版本；有新版本时自动下载到临时目录，下载完成后静默安装并重启 HdrPlayer，安装程序随后自动删除。只有点这个按钮时才联网（跟随 Windows 的系统代理）", btn);
         p.Children.Add(status);
-        p.Children.Add(bar);
+
+        // 下载进度条，右边是取消下载的 ×（关闭设置窗口 / 点“取消”同样会中断下载）
+        var bar = new System.Windows.Controls.ProgressBar { Height = 4, Maximum = 1, VerticalAlignment = VerticalAlignment.Center };
+        var cancelDl = new Wpf.Ui.Controls.Button
+        {
+            Appearance = ControlAppearance.Transparent, BorderThickness = new Thickness(0),
+            Padding = new Thickness(6), Margin = new Thickness(8, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center,
+            Icon = new SymbolIcon { Symbol = SymbolRegular.Dismiss16, FontSize = 14 }, ToolTip = "取消下载",
+        };
+        var barRow = new System.Windows.Controls.Grid { Margin = new Thickness(4, 4, 0, 0), Visibility = Visibility.Collapsed };
+        barRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        barRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        System.Windows.Controls.Grid.SetColumn(cancelDl, 1);
+        barRow.Children.Add(bar);
+        barRow.Children.Add(cancelDl);
+        p.Children.Add(barRow);
+        cancelDl.Click += (_, _) => _updateCts?.Cancel();
 
         if (AppInfo.UpdateBaseUrl == null)
         {
@@ -445,6 +465,7 @@ public partial class SettingsWindow : FluentWindow
         btn.Click += async (_, _) =>
         {
             btn.IsEnabled = false;
+            _updateCts?.Dispose();
             _updateCts = new CancellationTokenSource();
             var ct = _updateCts.Token;
             try
@@ -457,32 +478,45 @@ public partial class SettingsWindow : FluentWindow
                     btn.IsEnabled = true;
                     return;
                 }
-                status.Text = $"发现新版本 {latest.Version}（构建 {latest.Build}），正在下载…";
+                string head = $"正在下载新版本 {latest.Version}（构建 {latest.Build}）…";
+                status.Text = head;
                 bar.Value = 0;
-                bar.Visibility = Visibility.Visible;
-                var progress = new Progress<double>(v =>
+                cancelDl.IsEnabled = true;
+                barRow.Visibility = Visibility.Visible;
+                var progress = new Progress<DownloadProgress>(d =>
                 {
-                    bar.Value = v;
-                    status.Text = $"发现新版本 {latest.Version}（构建 {latest.Build}），正在下载… {v * 100:0}%";
+                    bar.Value = d.Fraction;
+                    string size = d.Total > 0 ? $"{d.Fraction * 100:0}%　{FormatBytes(d.Done)} / {FormatBytes(d.Total)}" : FormatBytes(d.Done);
+                    status.Text = $"{head}　{size}　{FormatBytes((long)d.BytesPerSecond)}/s";
                 });
                 string exe = await Updater.DownloadAsync(latest, progress, ct);
+                // 下载和校验都完成了：从这里开始不能再取消（马上就关闭播放器去安装）
+                cancelDl.IsEnabled = false;
                 status.Text = "下载完成，正在关闭 HdrPlayer 并安装更新，完成后会自动重新打开…";
                 Updater.PendingInstaller = exe;
-                await Task.Delay(800, ct);
+                await Task.Delay(800);
                 // 关掉设置窗口，主窗口看到 PendingInstaller 后正常退出（保存进度 / 播放列表），退出时启动安装程序
-                DialogResult = false;
+                if (!_closed) DialogResult = false;
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
+                barRow.Visibility = Visibility.Collapsed;
+                status.Text = "已取消下载。";
+                btn.IsEnabled = true;
             }
             catch (Exception ex)
             {
-                bar.Visibility = Visibility.Collapsed;
-                status.Text = "检查更新失败：" + (ex is System.Net.Http.HttpRequestException h && h.StatusCode != null ? $"服务器返回 {(int)h.StatusCode}" : ex.Message);
+                barRow.Visibility = Visibility.Collapsed;
+                status.Text = "检查更新失败：" + ex switch
+                {
+                    System.Net.Http.HttpRequestException { StatusCode: { } code } => $"服务器返回 {(int)code}",
+                    TaskCanceledException => "连接超时，请检查网络或系统代理",
+                    _ => ex.Message,
+                };
                 btn.IsEnabled = true;
             }
         };
-        Closed += (_, _) => _updateCts?.Cancel();
+        Closed += (_, _) => { _closed = true; _updateCts?.Cancel(); };
         return p;
     }
 
