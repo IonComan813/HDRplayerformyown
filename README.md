@@ -1,7 +1,7 @@
 # HdrPlayer
 
-基于 libmpv 的本地视频播放器，界面用 WPF + [WPF-UI](https://github.com/lepoco/wpfui)（Fluent 风格，深色 + Mica），只针对一台显示器调校：ViewSonic VX2781-4K-PRO（Mini LED，约 1000 nit 峰值）。
-运行环境：Windows 11，RTX 3080 Ti。
+基于 libmpv 的本地视频播放器，界面用 WPF + [WPF-UI](https://github.com/lepoco/wpfui)（Fluent 风格，深色 + Mica）。
+HDR 输出按显示器自己上报的参数（峰值亮度等）做色调映射，显示器不支持 HDR 时自动映射到 SDR。
 
 ## 运行
 

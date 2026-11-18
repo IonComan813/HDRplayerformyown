@@ -188,8 +188,8 @@ public partial class SettingsWindow : FluentWindow
         AddCombo(p, "视频同步", null, SyncChoices, _s.VideoSync, v => _s.VideoSync = v);
         AddToggle(p, "帧插值", "平滑 24p 抖动，会自动改为按显示器重采样", _s.Interpolation, v => _s.Interpolation = v);
         AddToggle(p, "写 mpv 日志", @"%APPDATA%\HdrPlayer\mpv.log，重启后生效", _s.DebugLog, v => _s.DebugLog = v);
-        AddNote(p, "RTX 3080 Ti 可硬解 H.264 和 HEVC 8/10-bit；HDR10+ 动态元数据在硬解下同样可用。\n" +
-                   "Hi10P（10-bit H.264）显卡不支持硬解，会自动回落到软解。");
+        AddNote(p, "能否硬解取决于显卡支持的格式；HDR10+ 动态元数据在硬解下同样可用。\n" +
+                   "显卡不支持的格式（如 Hi10P，即 10-bit H.264）会自动回落到软解。");
         return p;
     }
 
