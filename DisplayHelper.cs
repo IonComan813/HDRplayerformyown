@@ -7,10 +7,28 @@ internal sealed class MonitorHdrInfo
 {
     public string GdiName = "";
     public string FriendlyName = "";
+    // “高级颜色”在 Windows 11 24H2 起包括 HDR 和 WCG（SDR 显示器上的自动颜色管理 ACM），不再等于 HDR，
+    // 判断 HDR 要看下面的 Hdr* 字段。
     public bool AdvancedColorSupported;
     public bool AdvancedColorEnabled;
     public bool AdvancedColorForceDisabled;
     public uint BitsPerColorChannel;
+
+    /// <summary>是否用的是 24H2 起的新接口（GET_ADVANCED_COLOR_INFO_2）；旧系统为 false，用旧接口推断。</summary>
+    public bool HasColorInfo2;
+    /// <summary>显示器支持 HDR（不包括只支持 WCG / ACM 的 SDR 显示器）。</summary>
+    public bool HdrSupported;
+    /// <summary>Windows 设置里的“使用 HDR”开关是开的。</summary>
+    public bool HdrEnabled;
+    /// <summary>当前实际处于 HDR 模式（开关开着但被策略限制，例如笔记本用电池时，可能不是 HDR）。</summary>
+    public bool HdrActive;
+    /// <summary>被系统策略限制（例如电池模式下不允许 HDR），只有新接口能读到。</summary>
+    public bool LimitedByPolicy;
+    public bool WideColorEnforced;
+    /// <summary>新接口的当前颜色模式：0 = SDR，1 = WCG，2 = HDR；-1 = 不知道（旧系统）。</summary>
+    public int ActiveColorMode = -1;
+
+    public string ActiveColorModeName => ActiveColorMode switch { 0 => "SDR", 1 => "WCG（自动颜色管理）", 2 => "HDR", _ => "" };
 
     public bool HasDxgi;
     public uint DxgiBitsPerColor;
@@ -33,6 +51,9 @@ internal static unsafe class DisplayHelper
     private const uint TYPE_GET_TARGET_NAME = 2;
     private const uint TYPE_GET_ADVANCED_COLOR_INFO = 9;
     private const uint TYPE_SET_ADVANCED_COLOR_STATE = 10;
+    // Windows 11 24H2（26100）起：HDR 和 WCG（自动颜色管理）分开查询 / 设置
+    private const uint TYPE_GET_ADVANCED_COLOR_INFO_2 = 15;
+    private const uint TYPE_SET_HDR_STATE = 16;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct LUID { public uint LowPart; public int HighPart; }
@@ -89,8 +110,24 @@ internal static unsafe class DisplayHelper
         public uint bitsPerColorChannel;
     }
 
+    /// <summary>
+    /// 24H2 起的新结构。value 的位：0 advancedColorSupported，1 advancedColorActive，2 保留，
+    /// 3 advancedColorLimitedByPolicy，4 highDynamicRangeSupported，5 highDynamicRangeUserEnabled，
+    /// 6 wideColorSupported，7 wideColorUserEnabled。activeColorMode：0 SDR，1 WCG，2 HDR。
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
-    private struct SET_ADVANCED_COLOR_STATE
+    private struct GET_ADVANCED_COLOR_INFO_2
+    {
+        public DEVICE_INFO_HEADER header;
+        public uint value;
+        public uint colorEncoding;
+        public uint bitsPerColorChannel;
+        public uint activeColorMode;
+    }
+
+    /// <summary>旧的 SET_ADVANCED_COLOR_STATE 和新的 SET_HDR_STATE 布局相同：value 第 0 位是开 / 关。</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SET_COLOR_STATE
     {
         public DEVICE_INFO_HEADER header;
         public uint value;
@@ -106,7 +143,11 @@ internal static unsafe class DisplayHelper
     [DllImport("user32.dll")] private static extern int DisplayConfigGetDeviceInfo(ref SOURCE_DEVICE_NAME r);
     [DllImport("user32.dll")] private static extern int DisplayConfigGetDeviceInfo(ref TARGET_DEVICE_NAME r);
     [DllImport("user32.dll")] private static extern int DisplayConfigGetDeviceInfo(ref GET_ADVANCED_COLOR_INFO r);
-    [DllImport("user32.dll")] private static extern int DisplayConfigSetDeviceInfo(ref SET_ADVANCED_COLOR_STATE r);
+    [DllImport("user32.dll")] private static extern int DisplayConfigGetDeviceInfo(ref GET_ADVANCED_COLOR_INFO_2 r);
+    [DllImport("user32.dll")] private static extern int DisplayConfigSetDeviceInfo(ref SET_COLOR_STATE r);
+
+    private const int ERROR_NOT_SUPPORTED = 50;
+    private const int ERROR_INVALID_PARAMETER = 87;
 
     private record struct PathMatch(LUID TargetAdapter, uint TargetId);
 
@@ -157,21 +198,7 @@ internal static unsafe class DisplayHelper
                 };
                 if (DisplayConfigGetDeviceInfo(ref name) == 0) info.FriendlyName = name.monitorFriendlyDeviceName;
 
-                var ac = new GET_ADVANCED_COLOR_INFO
-                {
-                    header = new DEVICE_INFO_HEADER
-                    {
-                        type = TYPE_GET_ADVANCED_COLOR_INFO, size = (uint)Marshal.SizeOf<GET_ADVANCED_COLOR_INFO>(),
-                        adapterId = p.TargetAdapter, id = p.TargetId,
-                    },
-                };
-                if (DisplayConfigGetDeviceInfo(ref ac) == 0)
-                {
-                    info.AdvancedColorSupported = (ac.value & 0x1) != 0;
-                    info.AdvancedColorEnabled = (ac.value & 0x2) != 0;
-                    info.AdvancedColorForceDisabled = (ac.value & 0x8) != 0;
-                    info.BitsPerColorChannel = ac.bitsPerColorChannel;
-                }
+                if (!ReadColorInfo2(p, info)) ReadColorInfoLegacy(p, info);
             }
         }
         catch { /* 旧系统或驱动不支持时忽略 */ }
@@ -180,24 +207,94 @@ internal static unsafe class DisplayHelper
         return info;
     }
 
-    /// <summary>开关 Windows 的 HDR（“使用 HDR”开关）。</summary>
+    /// <summary>新接口（Windows 11 24H2 起）。旧系统上返回 false（ERROR_INVALID_PARAMETER / NOT_SUPPORTED）。</summary>
+    private static bool ReadColorInfo2(PathMatch p, MonitorHdrInfo info)
+    {
+        var ac = new GET_ADVANCED_COLOR_INFO_2
+        {
+            header = new DEVICE_INFO_HEADER
+            {
+                type = TYPE_GET_ADVANCED_COLOR_INFO_2, size = (uint)Marshal.SizeOf<GET_ADVANCED_COLOR_INFO_2>(),
+                adapterId = p.TargetAdapter, id = p.TargetId,
+            },
+        };
+        if (DisplayConfigGetDeviceInfo(ref ac) != 0) return false;
+        uint v = ac.value;
+        info.HasColorInfo2 = true;
+        info.AdvancedColorSupported = (v & 0x01) != 0;
+        info.AdvancedColorEnabled = (v & 0x02) != 0;
+        info.LimitedByPolicy = (v & 0x08) != 0;
+        info.HdrSupported = (v & 0x10) != 0;
+        info.HdrEnabled = (v & 0x20) != 0;
+        info.BitsPerColorChannel = ac.bitsPerColorChannel;
+        info.ActiveColorMode = (int)ac.activeColorMode;
+        info.HdrActive = ac.activeColorMode == 2;
+        return true;
+    }
+
+    /// <summary>
+    /// 旧接口（24H2 之前）。advancedColorEnabled 在 SDR 显示器开着自动颜色管理（ACM）时也是 1，
+    /// 这时 wideColorEnforced 为 1：所以 HDR = 高级颜色 且 不是强制 WCG。
+    /// </summary>
+    private static void ReadColorInfoLegacy(PathMatch p, MonitorHdrInfo info)
+    {
+        var ac = new GET_ADVANCED_COLOR_INFO
+        {
+            header = new DEVICE_INFO_HEADER
+            {
+                type = TYPE_GET_ADVANCED_COLOR_INFO, size = (uint)Marshal.SizeOf<GET_ADVANCED_COLOR_INFO>(),
+                adapterId = p.TargetAdapter, id = p.TargetId,
+            },
+        };
+        if (DisplayConfigGetDeviceInfo(ref ac) != 0) return;
+        info.AdvancedColorSupported = (ac.value & 0x1) != 0;
+        info.AdvancedColorEnabled = (ac.value & 0x2) != 0;
+        info.WideColorEnforced = (ac.value & 0x4) != 0;
+        info.AdvancedColorForceDisabled = (ac.value & 0x8) != 0;
+        info.BitsPerColorChannel = ac.bitsPerColorChannel;
+        info.HdrSupported = info.AdvancedColorSupported && !info.WideColorEnforced;
+        info.HdrEnabled = info.AdvancedColorEnabled && !info.WideColorEnforced;
+        info.HdrActive = info.HdrEnabled && !info.AdvancedColorForceDisabled;
+    }
+
+    /// <summary>
+    /// 开关 Windows 的 HDR（“使用 HDR”开关）。24H2 起用 SET_HDR_STATE（只动 HDR，不碰自动颜色管理）；
+    /// 旧系统用 SET_ADVANCED_COLOR_STATE（旧系统上高级颜色就是 HDR）。
+    /// </summary>
     public static bool SetWindowsHdr(string gdiName, bool enable, out string error)
     {
         error = "";
         var path = FindPath(gdiName);
         if (path is not { } p) { error = "找不到对应的显示路径"; return false; }
-        var st = new SET_ADVANCED_COLOR_STATE
+
+        var probe = new MonitorHdrInfo();
+        int r;
+        if (ReadColorInfo2(p, probe))
+        {
+            r = SetState(p, TYPE_SET_HDR_STATE, enable);
+            // 万一新查询接口能用、新设置接口却不认（预览版系统等），退回旧接口
+            if (r is ERROR_INVALID_PARAMETER or ERROR_NOT_SUPPORTED) r = SetState(p, TYPE_SET_ADVANCED_COLOR_STATE, enable);
+        }
+        else
+        {
+            r = SetState(p, TYPE_SET_ADVANCED_COLOR_STATE, enable);
+        }
+        if (r != 0) { error = "DisplayConfigSetDeviceInfo 错误码 " + r; return false; }
+        return true;
+    }
+
+    private static int SetState(PathMatch p, uint type, bool enable)
+    {
+        var st = new SET_COLOR_STATE
         {
             header = new DEVICE_INFO_HEADER
             {
-                type = TYPE_SET_ADVANCED_COLOR_STATE, size = (uint)Marshal.SizeOf<SET_ADVANCED_COLOR_STATE>(),
+                type = type, size = (uint)Marshal.SizeOf<SET_COLOR_STATE>(),
                 adapterId = p.TargetAdapter, id = p.TargetId,
             },
             value = enable ? 1u : 0u,
         };
-        int r = DisplayConfigSetDeviceInfo(ref st);
-        if (r != 0) { error = "DisplayConfigSetDeviceInfo 错误码 " + r; return false; }
-        return true;
+        return DisplayConfigSetDeviceInfo(ref st);
     }
 
     // ---------------- DXGI ----------------

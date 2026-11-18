@@ -207,15 +207,37 @@ public partial class MainWindow : FluentWindow
         UpdateHdrButton();
     }
 
+    /// <summary>第一次启动时窗口占主屏工作区的比例（宽和高都不超过）。</summary>
+    private const double FirstRunScreenFraction = 0.75;
+    /// <summary>窗口里视频区域以外的高度（标题栏 + 下边框），按它算出 16:9 的视频区域。</summary>
+    private const double ChromeHeight = 36;
+
     private void RestorePlacement()
     {
         var work = SystemParameters.WorkArea;
-        double w = Math.Clamp(S.WinW, MinWidth, Math.Max(MinWidth, work.Width));
-        double h = Math.Clamp(S.WinH, MinHeight, Math.Max(MinHeight, work.Height));
+        bool unset = S.WinX == -1 && S.WinY == -1;
+        double w, h;
+        if (unset)
+        {
+            // 第一次启动：按当前屏幕的大小（DIP，已含缩放比例）取 3/4，视频区域保持 16:9；以后用户改的大小会被记住
+            w = work.Width * FirstRunScreenFraction;
+            h = (w - 8) * 9 / 16 + ChromeHeight;
+            if (h > work.Height * FirstRunScreenFraction)
+            {
+                h = work.Height * FirstRunScreenFraction;
+                w = (h - ChromeHeight) * 16 / 9 + 8;
+            }
+            w = Math.Round(Math.Max(w, MinWidth));
+            h = Math.Round(Math.Max(h, MinHeight));
+        }
+        else
+        {
+            w = Math.Clamp(S.WinW, MinWidth, Math.Max(MinWidth, work.Width));
+            h = Math.Clamp(S.WinH, MinHeight, Math.Max(MinHeight, work.Height));
+        }
         var saved = new Rect(S.WinX, S.WinY, w, h);
         var virt = new Rect(SystemParameters.VirtualScreenLeft, SystemParameters.VirtualScreenTop,
             SystemParameters.VirtualScreenWidth, SystemParameters.VirtualScreenHeight);
-        bool unset = S.WinX == -1 && S.WinY == -1;
         if (unset || !virt.IntersectsWith(saved))
             saved = new Rect(work.X + (work.Width - w) / 2, work.Y + (work.Height - h) / 2, w, h);
         (Left, Top, Width, Height) = (saved.X, saved.Y, saved.Width, saved.Height);
@@ -386,7 +408,8 @@ public partial class MainWindow : FluentWindow
     private bool WindowsHdrIsOn()
     {
         var info = DisplayHelper.Query(CurrentGdiName());
-        return info is { AdvancedColorSupported: true, AdvancedColorEnabled: true } || info is { HasDxgi: true, DxgiIsHdr: true };
+        // 用 HdrActive 而不是“高级颜色已启用”：24H2 起 SDR 显示器开着自动颜色管理（WCG）时高级颜色也是开的
+        return info is { HdrActive: true } || info is { HasDxgi: true, DxgiIsHdr: true };
     }
 
     /// <summary>
@@ -401,9 +424,9 @@ public partial class MainWindow : FluentWindow
         bool switched = false;
         string gdi = CurrentGdiName();
         var info = DisplayHelper.Query(gdi);
-        if (info is { AdvancedColorSupported: true } && info.AdvancedColorEnabled != on)
+        if (info is { HdrSupported: true } && info.HdrEnabled != on)
         {
-            bool before = info.AdvancedColorEnabled;
+            bool before = info.HdrEnabled;
             if (DisplayHelper.SetWindowsHdr(gdi, on, out string err))
             {
                 _originalWindowsHdr ??= before;
@@ -416,7 +439,12 @@ public partial class MainWindow : FluentWindow
             }
         }
         // 自动开启时，如果系统 HDR 既没开、也没能切换（显示器不支持 / 设置里不允许切换），就什么都不做
-        if (!manual && on && !switched && !WindowsHdrIsOn()) return;
+        if (!manual && on && !switched && !WindowsHdrIsOn())
+        {
+            if (info is { HdrEnabled: true, LimitedByPolicy: true })
+                m.ShowText("Windows 当前不允许 HDR（例如笔记本正在用电池），保持 SDR 输出", 3000);
+            return;
+        }
 
         _hdrOn = on;
         ApplyMpvHdrProps();
@@ -427,17 +455,20 @@ public partial class MainWindow : FluentWindow
         if (switched)
         {
             // 显示器切换模式（黑屏一下）需要一点时间：自动切换时先暂停，免得错过开头；
-            // 稍后重新读取 EDID 峰值、重新应用 HDR 参数，再继续播放
+            // 稍后重新读取 EDID 峰值、重新应用 HDR 参数，再继续播放。
+            // 有的显示器切换得慢，1.5 秒后还没进入 HDR 模式（读到的峰值不可信）：之后再读两次
             bool resume = !manual && !_idle && m.GetFlag("pause") == false;
             if (resume) m.SetProperty("pause", true);
+            _displayPeak = 0;
+            int tries = 0;
             var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1500) };
             t.Tick += (_, _) =>
             {
-                t.Stop();
-                _displayPeak = 0;
+                tries++;
                 ApplyMpvHdrProps();
                 UpdateFormatLabel();
-                if (resume) _mpv?.SetProperty("pause", false);
+                if (tries == 1 && resume) _mpv?.SetProperty("pause", false);
+                if (!_hdrOn || _displayPeak > 0 || S.TargetPeakNits > 0 || tries >= 3) t.Stop();
             };
             t.Start();
         }
@@ -460,16 +491,31 @@ public partial class MainWindow : FluentWindow
         if (hdrSource != _hdrOn) SetHdr(hdrSource, manual: false);
     }
 
-    private float DisplayPeak()
+    /// <summary>读不到可信峰值时用的值（HDR10 片源最常见的母版峰值）。只在 Windows 还没进入 HDR 模式时会用到。</summary>
+    private const float FallbackPeakNits = 1000f;
+    /// <summary>低于这个值肯定不是真实的 HDR 峰值（读取失败或 EDID 没写）。</summary>
+    private const float MinPlausiblePeakNits = 100f;
+
+    /// <summary>
+    /// 色调映射的目标峰值（mpv target-peak）：高于它的高光会被压缩进显示器能显示的范围，而不是让显示器自己裁切。
+    /// Windows 处于 HDR 模式时，DXGI 报的峰值就是显示器 EDID 里的值（跑过“Windows HDR 校准”的话是校准后的值），
+    /// 直接用，哪怕只有 300–400 nit 的屏也照实用。Windows 还没切到 HDR 时，部分驱动报的是 SDR 亮度，
+    /// 这时的值不缓存，先用兜底值，切换完成后再读。
+    /// </summary>
+    private float DisplayPeak() => DisplayPeakWithSource().Nits;
+
+    private (float Nits, string Source) DisplayPeakWithSource()
     {
-        if (S.TargetPeakNits > 0) return S.TargetPeakNits;
-        if (_displayPeak <= 0)
+        if (S.TargetPeakNits > 0) return (S.TargetPeakNits, "手动设置");
+        if (_displayPeak > 0) return (_displayPeak, "显示器上报");
+        var info = DisplayHelper.Query(CurrentGdiName());
+        // 以 DXGI 自己报的色彩空间为准：系统的 HDR 标志可能先变，同一份 DXGI 数据里的亮度却还是切换前的
+        if (info is { HasDxgi: true, DxgiIsHdr: true } && info.MaxLuminance >= MinPlausiblePeakNits)
         {
-            var info = DisplayHelper.Query(CurrentGdiName());
-            // HDR 关闭时部分驱动上报的是 SDR 亮度，低于 400 视为不可信，回落到该显示器标称的 1000 nit
-            _displayPeak = info is { HasDxgi: true, MaxLuminance: >= 400 } ? info.MaxLuminance : 1000f;
+            _displayPeak = info.MaxLuminance;
+            return (_displayPeak, "显示器上报");
         }
-        return _displayPeak;
+        return (FallbackPeakNits, "读不到，暂用默认值");
     }
 
     private void ApplyMpvHdrProps()
@@ -1960,11 +2006,19 @@ public partial class MainWindow : FluentWindow
             if (d != null)
             {
                 Line("名称", $"{(d.FriendlyName.Length > 0 ? d.FriendlyName : "?")}  ({d.GdiName})");
-                Line("Windows HDR", d.AdvancedColorSupported ? (d.AdvancedColorEnabled ? "开" : "关") : "不支持");
+                string hdr = !d.HdrSupported ? "不支持" : d.HdrEnabled ? "开" : "关";
+                if (d.HdrEnabled && !d.HdrActive) hdr += d.LimitedByPolicy ? "（被系统策略限制，未生效）" : "（未生效）";
+                if (d.ActiveColorMode >= 0) hdr += $"  当前模式 {d.ActiveColorModeName}";
+                Line("Windows HDR", hdr);
                 if (d.HasDxgi)
                 {
                     Line("位深", $"{d.DxgiBitsPerColor} bit  色彩空间 {(d.DxgiIsHdr ? "HDR10 (PQ/BT.2020)" : "sRGB")}");
                     Line("EDID 亮度", $"峰值 {d.MaxLuminance:0} nit  全屏 {d.MaxFullFrameLuminance:0} nit  最低 {d.MinLuminance:0.####} nit");
+                    if (_hdrOn)
+                    {
+                        var (nits, src) = DisplayPeakWithSource();
+                        Line("色调映射目标", $"{nits:0} nit（{src}）");
+                    }
                     Line("EDID 原色", $"R({d.Red[0]:0.000},{d.Red[1]:0.000}) G({d.Green[0]:0.000},{d.Green[1]:0.000}) " +
                                      $"B({d.Blue[0]:0.000},{d.Blue[1]:0.000}) W({d.White[0]:0.0000},{d.White[1]:0.0000})");
                 }
