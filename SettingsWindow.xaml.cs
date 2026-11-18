@@ -122,6 +122,7 @@ public partial class SettingsWindow : FluentWindow
             new("音频", SymbolRegular.Speaker224, BuildAudioPage()),
             new("字幕", SymbolRegular.ClosedCaption24, BuildSubPage()),
             new("操作", SymbolRegular.Keyboard24, BuildControlPage()),
+            new("关于", SymbolRegular.Info24, BuildAboutPage()),
         };
         Nav.ItemsSource = pages;
         Nav.SelectionChanged += (_, _) =>
@@ -246,6 +247,8 @@ public partial class SettingsWindow : FluentWindow
             _s.RememberPosition, v => _s.RememberPosition = v);
         AddToggle(p, "记住每个文件的音频 / 字幕延迟", "关闭则延迟在切换文件时保持不变，退出后归零",
             _s.RememberDelays, v => _s.RememberDelays = v);
+        AddToggle(p, "记住每个文件的音轨和字幕", "包括关闭字幕和外挂的字幕 / 音轨文件；下次打开时记住的轨已经没了（例如外挂文件被删），就按首选语言规则选",
+            _s.RememberTracks, v => _s.RememberTracks = v);
         AddToggle(p, "进度条悬停预览缩略图", "后台另开一个不出画面的 mpv 实例截图；仅本地文件。HDR 片源的缩略图高光会被裁切",
             _s.SeekThumbnails, v => _s.SeekThumbnails = v);
         AddNumber(p, "音量步进", null, _s.VolumeStep, 1, 50, 1, v => _s.VolumeStep = v);
@@ -385,6 +388,102 @@ public partial class SettingsWindow : FluentWindow
         var lbl = new TextBlock { Text = text, FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(4, 8, 4, 12) };
         lbl.SetResourceReference(TextBlock.ForegroundProperty, "TextFillColorSecondaryBrush");
         page.Children.Add(lbl);
+    }
+
+    // ------------------------------------------------------------------ 关于 / 检查更新
+
+    private CancellationTokenSource? _updateCts;
+
+    private StackPanel BuildAboutPage()
+    {
+        var p = NewPage("关于");
+
+        string build = AppInfo.Build > 0 ? $"（构建 {AppInfo.Build}）" : "（自行编译）";
+        string mpvVer = _mpv.GetString("mpv-version") ?? "";
+        var info = new TextBlock { FontSize = 13, TextWrapping = TextWrapping.Wrap, LineHeight = 22 };
+        info.Inlines.Add(new System.Windows.Documents.Run("HdrPlayer " + AppInfo.Version + build) { FontWeight = FontWeights.SemiBold, FontSize = 16 });
+        info.Inlines.Add(new System.Windows.Documents.LineBreak());
+        if (mpvVer.Length > 0)
+        {
+            info.Inlines.Add(new System.Windows.Documents.Run("播放内核：" + mpvVer));
+            info.Inlines.Add(new System.Windows.Documents.LineBreak());
+        }
+        var link = new System.Windows.Documents.Hyperlink(new System.Windows.Documents.Run(AppInfo.RepoUrl))
+        {
+            NavigateUri = new Uri(AppInfo.RepoUrl),
+        };
+        link.RequestNavigate += (_, e) =>
+        {
+            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(e.Uri.AbsoluteUri) { UseShellExecute = true }); }
+            catch { }
+            e.Handled = true;
+        };
+        info.Inlines.Add(new System.Windows.Documents.Run("GitHub："));
+        info.Inlines.Add(link);
+        p.Children.Add(new CardControl { Margin = new Thickness(0, 0, 0, 4), Padding = new Thickness(16, 12, 16, 12), Header = info });
+
+        // ---- 检查更新 ----
+        var status = new TextBlock { FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(4, 4, 4, 0) };
+        status.SetResourceReference(TextBlock.ForegroundProperty, "TextFillColorSecondaryBrush");
+        var bar = new System.Windows.Controls.ProgressBar { Height = 4, Margin = new Thickness(4, 8, 4, 0), Maximum = 1, Visibility = Visibility.Collapsed };
+        var btn = new Wpf.Ui.Controls.Button { Content = "检查更新", Icon = new SymbolIcon { Symbol = SymbolRegular.ArrowSync24 } };
+        AddCard(p, "检查更新", "从发布服务器检查新版本；有新版本时自动下载到临时目录，下载完成后静默安装并重启 HdrPlayer，安装程序随后自动删除。只有点这个按钮时才联网", btn);
+        p.Children.Add(status);
+        p.Children.Add(bar);
+
+        if (AppInfo.UpdateBaseUrl == null)
+        {
+            btn.IsEnabled = false;
+            status.Text = "这个版本没有配置更新地址（自行编译的版本，或构建时没有设置 R2_PUBLIC_URL）。";
+        }
+        else if (!Updater.IsInstalledCopy())
+        {
+            btn.IsEnabled = false;
+            status.Text = "便携版不能自动更新（安装程序会装到另一个目录）。请用安装版，或到 GitHub 下载新的便携包。";
+        }
+
+        btn.Click += async (_, _) =>
+        {
+            btn.IsEnabled = false;
+            _updateCts = new CancellationTokenSource();
+            var ct = _updateCts.Token;
+            try
+            {
+                status.Text = "正在检查更新…";
+                var latest = await Updater.FetchLatestAsync(ct);
+                if (!Updater.IsNewer(latest))
+                {
+                    status.Text = $"已是最新版本（服务器上是 {latest.Version}，构建 {latest.Build}）。";
+                    btn.IsEnabled = true;
+                    return;
+                }
+                status.Text = $"发现新版本 {latest.Version}（构建 {latest.Build}），正在下载…";
+                bar.Value = 0;
+                bar.Visibility = Visibility.Visible;
+                var progress = new Progress<double>(v =>
+                {
+                    bar.Value = v;
+                    status.Text = $"发现新版本 {latest.Version}（构建 {latest.Build}），正在下载… {v * 100:0}%";
+                });
+                string exe = await Updater.DownloadAsync(latest, progress, ct);
+                status.Text = "下载完成，正在关闭 HdrPlayer 并安装更新，完成后会自动重新打开…";
+                Updater.PendingInstaller = exe;
+                await Task.Delay(800, ct);
+                // 关掉设置窗口，主窗口看到 PendingInstaller 后正常退出（保存进度 / 播放列表），退出时启动安装程序
+                DialogResult = false;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                bar.Visibility = Visibility.Collapsed;
+                status.Text = "检查更新失败：" + (ex is System.Net.Http.HttpRequestException h && h.StatusCode != null ? $"服务器返回 {(int)h.StatusCode}" : ex.Message);
+                btn.IsEnabled = true;
+            }
+        };
+        Closed += (_, _) => _updateCts?.Cancel();
+        return p;
     }
 
     // ------------------------------------------------------------------ 默认播放器

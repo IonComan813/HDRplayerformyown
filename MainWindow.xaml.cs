@@ -112,7 +112,11 @@ public partial class MainWindow : FluentWindow
     private readonly FileStateStore _fileStates = FileStateStore.Load();
     private string? _currentPath;      // 当前已载入的文件（file-loaded 时设置，记录状态后清空）
     private double _currentDuration;
-    private double _lastPos;           // 只在 mpv 事件线程上读写：最后一个有效的 time-pos（文件卸载时 time-pos 会变成空）
+    private double _lastPos;
+    // 当前文件选中的音轨 / 字幕（文件卸载时轨道列表已经清空，所以在播放中随时记下来，结束时写进 file-states.json）
+    private TrackRef? _audioSel, _subSel;
+    // 这个文件打开后用户亲手换过音轨 / 字幕：只有换过的才记，没动过的继续按首选语言规则（或之前记住的）来
+    private bool _audioTouched, _subTouched;           // 只在 mpv 事件线程上读写：最后一个有效的 time-pos（文件卸载时 time-pos 会变成空）
 
     // 关闭流程
     private bool _shuttingDown, _closeReady;
@@ -321,6 +325,8 @@ public partial class MainWindow : FluentWindow
         m.Observe("duration", MpvFormat.Double);
         m.Observe("volume", MpvFormat.Double);
         m.Observe("mute", MpvFormat.Flag);
+        m.Observe("aid", MpvFormat.String);
+        m.Observe("sid", MpvFormat.String);
         m.Observe("media-title", MpvFormat.String);
         m.Observe("playlist-count", MpvFormat.Int64);
         m.Observe("playlist-pos", MpvFormat.Int64);
@@ -543,6 +549,10 @@ public partial class MainWindow : FluentWindow
     {
         switch (name)
         {
+            case "aid":
+            case "sid":
+                SnapshotTracks();
+                break;
             case "pause":
                 _paused = value is true;
                 _bar.PlayIcon.Symbol = _paused ? SymbolRegular.Play24 : SymbolRegular.Pause24;
@@ -613,6 +623,8 @@ public partial class MainWindow : FluentWindow
 
     private void OnStartFile()
     {
+        _audioSel = _subSel = null;
+        _audioTouched = _subTouched = false;
         _hdr10Plus = false;
         _dvProfile = null;
         _autoHdrChecked = false;
@@ -674,8 +686,87 @@ public partial class MainWindow : FluentWindow
             m.Command("seek", pos.ToString("0.###", Inv), "absolute+exact");
             notes.Insert(0, $"从上次的位置 {FormatTime(pos)} 继续（Home 键从头开始）");
         }
+        if (S.RememberTracks) RestoreTracks(m, st);
+        SnapshotTracks();
         if (notes.Count > 0) m.ShowText(string.Join("\n", notes), 3000);
     }
+
+    // ---- 每个文件记住的音轨 / 字幕 ----
+
+    private static string TrackStr(Dictionary<string, object?> t, string k) => t.GetValueOrDefault(k) as string ?? "";
+    private static bool TrackFlag(Dictionary<string, object?> t, string k) => t.GetValueOrDefault(k) is true;
+    private static long TrackId(Dictionary<string, object?> t) => t.GetValueOrDefault("id") is long l ? l : 0;
+    private static long? TrackFfIndex(Dictionary<string, object?> t) => t.GetValueOrDefault("ff-index") is long l ? l : null;
+
+    private List<Dictionary<string, object?>> Tracks() =>
+        (_mpv?.GetNode("track-list") as List<object?>)?.OfType<Dictionary<string, object?>>().ToList() ?? new();
+
+    /// <summary>
+    /// 打开文件时选回记住的音轨 / 字幕。记住的轨找不到（外挂文件被删、文件被替换）时什么都不做，
+    /// 保留 mpv 按首选语言规则选好的。外挂文件还在、只是这次没自动加载时，重新加载它。
+    /// </summary>
+    private void RestoreTracks(Mpv m, FileState? st)
+    {
+        if (st == null || (st.Audio == null && st.Sub == null)) return;
+        var tracks = Tracks();
+        if (tracks.Count == 0) return;
+        RestoreTrack(m, tracks, "audio", "aid", "audio-add", st.Audio);
+        RestoreTrack(m, tracks, "sub", "sid", "sub-add", st.Sub);
+    }
+
+    private static void RestoreTrack(Mpv m, List<Dictionary<string, object?>> tracks, string type, string prop, string addCmd, TrackRef? r)
+    {
+        if (r == null) return;
+        if (r.Off) { m.SetProperty(prop, "no"); return; }
+        var same = tracks.Where(t => TrackStr(t, "type") == type).ToList();
+        Dictionary<string, object?>? hit;
+        if (r.External != null)
+        {
+            hit = same.FirstOrDefault(t => TrackFlag(t, "external") && SamePath(TrackStr(t, "external-filename"), r.External));
+            if (hit == null)
+            {
+                if (File.Exists(r.External)) m.Command(addCmd, r.External, "select");
+                return;
+            }
+        }
+        else
+        {
+            // 同一个流序号，并且编码、语言都没变（文件被替换成别的版本时不乱选）；
+            // 退一步按编码 + 语言 + 标题找（例如重新封装后流的顺序变了）
+            hit = same.FirstOrDefault(t => !TrackFlag(t, "external") && TrackFfIndex(t) == r.FfIndex &&
+                                           TrackStr(t, "codec") == (r.Codec ?? "") && TrackStr(t, "lang") == (r.Lang ?? ""))
+               ?? same.FirstOrDefault(t => !TrackFlag(t, "external") && TrackStr(t, "codec") == (r.Codec ?? "") &&
+                                           TrackStr(t, "lang") == (r.Lang ?? "") && TrackStr(t, "title") == (r.Title ?? ""));
+        }
+        if (hit != null) m.SetProperty(prop, TrackId(hit).ToString(Inv));
+    }
+
+    /// <summary>记下当前选中的音轨 / 字幕（aid / sid 变化时调用）。文件卸载中轨道列表为空，这时不更新。</summary>
+    private void SnapshotTracks()
+    {
+        if (_mpv == null || _currentPath == null || _idle) return;
+        var tracks = Tracks();
+        if (tracks.Count == 0) return;
+        TrackRef? Snap(string type)
+        {
+            var t = tracks.FirstOrDefault(o => TrackStr(o, "type") == type && TrackFlag(o, "selected"));
+            if (t == null) return null;
+            if (TrackFlag(t, "external"))
+                return new TrackRef { External = TrackStr(t, "external-filename") is { Length: > 0 } f ? FullPath(f) : null };
+            return new TrackRef
+            {
+                FfIndex = TrackFfIndex(t),
+                Codec = NullIfEmpty(TrackStr(t, "codec")),
+                Lang = NullIfEmpty(TrackStr(t, "lang")),
+                Title = NullIfEmpty(TrackStr(t, "title")),
+            };
+        }
+        _audioSel = Snap("audio") ?? _audioSel;
+        // 有字幕轨但一条都没选 = 字幕关掉了
+        _subSel = Snap("sub") ?? (tracks.Any(t => TrackStr(t, "type") == "sub") ? new TrackRef { Off = true } : _subSel);
+    }
+
+    private static string? NullIfEmpty(string s) => s.Length == 0 ? null : s;
 
     /// <summary>文件结束 / 切换 / 退出时，记下这个文件的进度和延迟。</summary>
     private void CommitFileState(double position, bool finished)
@@ -693,6 +784,8 @@ public partial class MainWindow : FluentWindow
             AudioDelay = S.RememberDelays ? m.GetDouble("audio-delay") ?? 0 : old?.AudioDelay ?? 0,
             SubDelay = S.RememberDelays ? m.GetDouble("sub-delay") ?? 0 : old?.SubDelay ?? 0,
             Hwdec = old?.Hwdec,
+            Audio = S.RememberTracks && _audioTouched && _audioSel != null ? _audioSel : old?.Audio,
+            Sub = S.RememberTracks && _subTouched && _subSel != null ? _subSel : old?.Sub,
             LastPlayed = DateTime.UtcNow,
         };
         _fileStates.Set(path, st);
@@ -903,11 +996,13 @@ public partial class MainWindow : FluentWindow
             case "aid":
                 if (arg == null) break;
                 m.SetProperty("aid", arg);
+                _audioTouched = true;
                 m.ShowText("音轨：${aid} ${current-tracks/audio/lang:} ${current-tracks/audio/title:}");
                 break;
             case "sid":
                 if (arg == null) break;
                 m.SetProperty("sid", arg);
+                _subTouched = true;
                 m.ShowText(arg == "no" ? "字幕：关" : "字幕：${sid} ${current-tracks/sub/lang:} ${current-tracks/sub/title:}");
                 break;
             case "hwdec":
@@ -927,8 +1022,8 @@ public partial class MainWindow : FluentWindow
             case "sub-delay-dec": AdjustSubDelay(-S.SubDelayStepMs); break;
             case "sub-delay-inc": AdjustSubDelay(S.SubDelayStepMs); break;
             case "sub-toggle": m.CommandString("no-osd cycle sub-visibility"); m.ShowText("字幕显示：${sub-visibility}"); break;
-            case "sub-cycle": m.CommandString("no-osd cycle sub"); m.ShowText("字幕：${sid} ${current-tracks/sub/title:}"); break;
-            case "audio-cycle": m.CommandString("no-osd cycle audio"); m.ShowText("音轨：${aid} ${current-tracks/audio/title:}"); break;
+            case "sub-cycle": _subTouched = true; m.CommandString("no-osd cycle sub"); m.ShowText("字幕：${sid} ${current-tracks/sub/title:}"); break;
+            case "audio-cycle": _audioTouched = true; m.CommandString("no-osd cycle audio"); m.ShowText("音轨：${aid} ${current-tracks/audio/title:}"); break;
             case "info": ShowInfo(); break;
             case "playlist": TogglePlaylist(); break;
             case "prev": m.Command("playlist-prev"); break;
@@ -1024,11 +1119,13 @@ public partial class MainWindow : FluentWindow
             if (SubExts.Contains(ext))
             {
                 m.Command("sub-add", p, "select");
+                _subTouched = true;
                 m.ShowText("已加载字幕：" + Path.GetFileName(p));
             }
             else if (AudioExts.Contains(ext) && !_idle)
             {
                 m.Command("audio-add", p, "select");
+                _audioTouched = true;
                 m.ShowText("已加载音轨：" + Path.GetFileName(p));
             }
             else
@@ -1060,12 +1157,12 @@ public partial class MainWindow : FluentWindow
 
     private void LoadSubtitle()
     {
-        foreach (var f in PickFiles(SubFilter, "加载字幕", true)) _mpv?.Command("sub-add", f, "select");
+        foreach (var f in PickFiles(SubFilter, "加载字幕", true)) { _mpv?.Command("sub-add", f, "select"); _subTouched = true; }
     }
 
     private void LoadAudioTrack()
     {
-        foreach (var f in PickFiles(AudioFilter, "加载外部音轨", false)) _mpv?.Command("audio-add", f, "select");
+        foreach (var f in PickFiles(AudioFilter, "加载外部音轨", false)) { _mpv?.Command("audio-add", f, "select"); _audioTouched = true; }
     }
 
     private void RefreshPlaylist()
@@ -1275,6 +1372,7 @@ public partial class MainWindow : FluentWindow
                     string.Equals(Str(t, "external-filename"), output, StringComparison.OrdinalIgnoreCase))
                     m.Command("sub-remove", Id(t).ToString(Inv));
         m.Command("sub-add", output, "select", "自动同步", lang ?? "");
+        _subTouched = true;
         // 偏移已经写进字幕文件，之前手动调的字幕延迟要清零，否则会叠加
         m.SetProperty("sub-delay", 0.0);
         string scale = Math.Abs(res.Scale - 1) > 0.0005 ? $"，帧率校正 ×{res.Scale.ToString("0.0000", Inv)}" : "";
@@ -1697,7 +1795,14 @@ public partial class MainWindow : FluentWindow
         if (_fullscreen) ToggleFullscreen();
         var copy = S.Clone();
         var dlg = new SettingsWindow(copy, m, CurrentGdiName(), _hdrOn) { Owner = this };
-        if (dlg.ShowDialog() != true) return;
+        bool ok = dlg.ShowDialog() == true;
+        // 设置里的“检查更新”下载好了新版本：正常退出（保存进度、播放列表），退出时由 App 启动安装程序
+        if (Updater.PendingInstaller != null)
+        {
+            Close();
+            return;
+        }
+        if (!ok) return;
 
         bool gpuApiChanged = copy.GpuApi != S.GpuApi;
         // 这几项只在打开文件时读取，正在播放的文件要重新载入才生效

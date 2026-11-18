@@ -3,7 +3,21 @@ using System.Text.Json;
 
 namespace HdrPlayer;
 
-/// <summary>每个文件记住的状态：上次的播放进度、音频延迟、字幕延迟、解码方式。</summary>
+/// <summary>
+/// 记住的一条音轨 / 字幕轨。内嵌轨按流序号（ff-index）认，同时核对编码和语言，防止文件被替换后选错；
+/// 外挂文件按路径认。Off = 字幕被关掉了。
+/// </summary>
+internal sealed class TrackRef
+{
+    public bool Off { get; set; }
+    public string? External { get; set; }
+    public long? FfIndex { get; set; }
+    public string? Codec { get; set; }
+    public string? Lang { get; set; }
+    public string? Title { get; set; }
+}
+
+/// <summary>每个文件记住的状态：上次的播放进度、音频延迟、字幕延迟、解码方式、选中的音轨和字幕。</summary>
 internal sealed class FileState
 {
     /// <summary>上次的播放位置（秒），0 = 从头开始。</summary>
@@ -14,10 +28,14 @@ internal sealed class FileState
     public double SubDelay { get; set; }
     /// <summary>只对这个文件生效的解码方式（mpv 的 hwdec 值），null = 跟随全局设置。</summary>
     public string? Hwdec { get; set; }
+    /// <summary>选中的音轨，null = 没记录（按首选语言规则选）。</summary>
+    public TrackRef? Audio { get; set; }
+    /// <summary>选中的字幕（或关闭字幕），null = 没记录。</summary>
+    public TrackRef? Sub { get; set; }
     /// <summary>最后一次播放的时间，记录太多时先淘汰最久没播的。</summary>
     public DateTime LastPlayed { get; set; }
 
-    public bool IsEmpty => Position <= 0 && AudioDelay == 0 && SubDelay == 0 && Hwdec == null;
+    public bool IsEmpty => Position <= 0 && AudioDelay == 0 && SubDelay == 0 && Hwdec == null && Audio == null && Sub == null;
 }
 
 /// <summary>

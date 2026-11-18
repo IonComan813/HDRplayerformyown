@@ -32,7 +32,14 @@
 
         <!--
             进度条 / 音量条：WPF-UI 的 Slider 只画灰色轨道和圆点，已播放的部分是透明的。
-            这里沿用它的横向模板，只把圆点左边（Track 的 DecreaseRepeatButton）画成和圆点同色的强调色。
+            这里沿用它的横向模板，把圆点左边（Track 的 DecreaseRepeatButton）画成和圆点同色的强调色。
+
+            圆点（20 像素）外圈 1 像素的描边几乎是透明的（ControlElevationBorderBrush，约 7% 不透明），
+            压在它下面的东西会透出来。所以：
+            - 灰色轨道和蓝条都只画在“圆点中心能到的范围”里，即左右各缩进半个圆点（10 像素），
+              拖到最左 / 最右时圆点外侧下面什么都没有，不会透出一截白色；
+            - 蓝条一直画到圆点中心（向右多画 10 像素，伸到圆点下面），圆点左侧描边下面是蓝色，
+              而不是灰色轨道。这也是 Windows 11 滑块的画法。
         -->
         <Style x:Key="SliderFilledPart" TargetType="RepeatButton">
             <Setter Property="IsTabStop" Value="False" />
@@ -41,10 +48,15 @@
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="RepeatButton">
-                        <!-- 透明的外框保证整个高度都能点；里面 4 像素高的条和灰色轨道对齐 -->
+                        <!--
+                            透明的外框保证整个高度都能点；里面 4 像素高的蓝条：
+                            左边从“圆点在最左时的中心”开始（缩进 10），右边伸到当前圆点的中心（-10）。
+                            值为 0 时宽度正好是 0
+                        -->
                         <Border Background="Transparent">
                             <Border
                                 Height="4"
+                                Margin="10,0,-10,0"
                                 VerticalAlignment="Center"
                                 Background="{DynamicResource SliderThumbBackground}"
                                 CornerRadius="2" />
@@ -70,6 +82,7 @@
                 <Border
                     x:Name="TrackBackground"
                     Height="4"
+                    Margin="10,0"
                     VerticalAlignment="Center"
                     Background="{DynamicResource SliderTrackFill}"
                     CornerRadius="2" />

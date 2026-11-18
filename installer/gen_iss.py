@@ -56,6 +56,8 @@ Root: HKCU; Subkey: "Software\\Classes\\.{e}"; ValueType: string; ValueName: "";
 s=s[:i]+reg+'\n'+s[j:]
 
 run='''[Run]
+; 程序内“检查更新”静默安装（/UPDATE=1）：装完自动重新启动 HdrPlayer。非 postinstall 的条目在静默安装时也会运行
+Filename: "{app}\\{#AppExe}"; Flags: nowait; Check: IsUpdate
 Filename: "{app}\\{#AppExe}"; Description: "启动 HdrPlayer"; Flags: nowait postinstall skipifsilent
 ; 一键设为默认：以管理员身份运行 HdrPlayer 写 Windows 的“默认关联配置文件”策略（微软给企业管理员的正规机制，
 ; 由 Windows 在每次登录时应用；注销重新登录后生效）。详见 DefaultApps.cs
@@ -97,6 +99,31 @@ begin
     if (Ext <> '') and WizardIsTaskSelected('assoc\\x' + Ext) then
       Result := True;
   end;
+end;
+
+// 由 HdrPlayer 的“检查更新”启动：/VERYSILENT /UPDATE=1
+function IsUpdate: Boolean;
+begin
+  Result := ExpandConstant('{param:UPDATE|0}') = '1';
+end;
+
+// 自动更新时 HdrPlayer 刚开始退出（保存进度、关闭 mpv），等它放开单实例互斥体再装，最多等 30 秒
+function InitializeSetup: Boolean;
+var
+  I: Integer;
+begin
+  if IsUpdate then
+  begin
+    I := 0;
+    while CheckForMutexes('Local\\HdrPlayer.SingleInstance') and (I < 120) do
+    begin
+      Sleep(250);
+      I := I + 1;
+    end;
+    // 互斥体放开后进程还要一点时间才完全结束、释放 exe / dll 文件
+    Sleep(1500);
+  end;
+  Result := True;
 end;
 
 // 勾选的后缀，逗号分隔（给 --apply-default-assoc）

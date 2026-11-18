@@ -60,6 +60,8 @@ jobs:
           dotnet publish HdrPlayer.csproj -c Release -r win-x64 --self-contained false
           -p:Version=${{ steps.ver.outputs.number }}
           -p:InformationalVersion=${{ steps.ver.outputs.version }}
+          -p:BuildNumber=${{ github.run_number }}
+          "-p:UpdateBaseUrl=${{ vars.R2_PUBLIC_URL }}"
           -o publish
 
       - name: 下载 libmpv（shinchiro/mpv-winbuild-cmake 最新版）
@@ -159,10 +161,26 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "安装 AWS CLI 失败" }
           }
           $exe = "${{ steps.setup.outputs.exe }}"
+          # 先传安装程序，再传 latest.json（程序检查更新时读它），这样 latest.json 永远不会指向还没传完的文件
           aws s3 cp $exe "s3://$env:R2_BUCKET/$env:R2_KEY" --endpoint-url $env:R2_ENDPOINT --no-progress `
-            --content-type application/octet-stream `
-            --metadata "version=${{ steps.ver.outputs.version }},commit=${{ github.sha }}"
+            --content-type application/octet-stream --cache-control no-cache `
+            --metadata "version=${{ steps.ver.outputs.version }},build=${{ github.run_number }},commit=${{ github.sha }}"
           if ($LASTEXITCODE -ne 0) { throw "上传到 R2 失败" }
+          $fileName = ($env:R2_KEY -split '/')[-1]
+          $jsonKey = $env:R2_KEY -replace '[^/]+$', 'latest.json'
+          $latest = [ordered]@{
+            version = "${{ steps.ver.outputs.version }}"
+            build   = ${{ github.run_number }}
+            file    = $fileName
+            sha256  = (Get-FileHash $exe -Algorithm SHA256).Hash
+            size    = (Get-Item $exe).Length
+            commit  = "${{ github.sha }}"
+          }
+          $latest | ConvertTo-Json | Set-Content -Encoding utf8NoBOM latest.json
+          Get-Content latest.json
+          aws s3 cp latest.json "s3://$env:R2_BUCKET/$jsonKey" `
+            --endpoint-url $env:R2_ENDPOINT --no-progress --content-type application/json --cache-control no-cache
+          if ($LASTEXITCODE -ne 0) { throw "上传 latest.json 到 R2 失败" }
           aws s3api head-object --bucket $env:R2_BUCKET --key $env:R2_KEY --endpoint-url $env:R2_ENDPOINT --query "{Size:ContentLength,Modified:LastModified,Meta:Metadata}"
           if ($LASTEXITCODE -ne 0) { throw "上传后读取 R2 对象失败" }
 
@@ -193,6 +211,6 @@ jobs:
           } else {
             $ghArgs = @($tag, $zip, $exe, "--title", "HdrPlayer $tag", "--generate-notes")
             if ($tag -match "-") { $ghArgs += "--prerelease" }   # v1.0-beta 这类标签发成预发布
-            gh release create @args
+            gh release create @ghArgs
           }
           if ($LASTEXITCODE -ne 0) { throw "发布失败" }
