@@ -1795,7 +1795,14 @@ public partial class MainWindow : FluentWindow
         if (_fullscreen) ToggleFullscreen();
         var copy = S.Clone();
         var dlg = new SettingsWindow(copy, m, CurrentGdiName(), _hdrOn) { Owner = this };
-        if (dlg.ShowDialog() != true) return;
+        bool ok = dlg.ShowDialog() == true;
+        // 设置里的“检查更新”下载好了新版本：正常退出（保存进度、播放列表），退出时由 App 启动安装程序
+        if (Updater.PendingInstaller != null)
+        {
+            Close();
+            return;
+        }
+        if (!ok) return;
 
         bool gpuApiChanged = copy.GpuApi != S.GpuApi;
         // 这几项只在打开文件时读取，正在播放的文件要重新载入才生效

@@ -10,7 +10,9 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        // 先放开单实例互斥体：更新安装程序靠它判断 HdrPlayer 已经退出
         _single?.Dispose();
+        Updater.LaunchPendingInstaller();
         base.OnExit(e);
     }
 

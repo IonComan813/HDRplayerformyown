@@ -16,7 +16,16 @@
     <RootNamespace>HdrPlayer</RootNamespace>
     <Version>0.2.0</Version>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- 版本号后面不要自动加 +commit，“关于”页和更新比较用的是干净的版本号 -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <!-- 构建号（GitHub Actions 的 run_number，检查更新时比大小）和更新地址（R2 公开地址），由 CI 用 -p: 传入 -->
+    <BuildNumber Condition="'$(BuildNumber)' == ''">0</BuildNumber>
   </PropertyGroup>
+
+  <ItemGroup>
+    <AssemblyMetadata Include="BuildNumber" Value="$(BuildNumber)" />
+    <AssemblyMetadata Include="UpdateBaseUrl" Value="$(UpdateBaseUrl)" />
+  </ItemGroup>
 
   <ItemGroup>
     <!-- Fluent 风格控件库：https://github.com/lepoco/wpfui -->
