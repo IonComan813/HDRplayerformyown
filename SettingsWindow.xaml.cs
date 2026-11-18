@@ -246,6 +246,8 @@ public partial class SettingsWindow : FluentWindow
             _s.RememberPosition, v => _s.RememberPosition = v);
         AddToggle(p, "记住每个文件的音频 / 字幕延迟", "关闭则延迟在切换文件时保持不变，退出后归零",
             _s.RememberDelays, v => _s.RememberDelays = v);
+        AddToggle(p, "记住每个文件的音轨和字幕", "包括关闭字幕和外挂的字幕 / 音轨文件；下次打开时记住的轨已经没了（例如外挂文件被删），就按首选语言规则选",
+            _s.RememberTracks, v => _s.RememberTracks = v);
         AddToggle(p, "进度条悬停预览缩略图", "后台另开一个不出画面的 mpv 实例截图；仅本地文件。HDR 片源的缩略图高光会被裁切",
             _s.SeekThumbnails, v => _s.SeekThumbnails = v);
         AddNumber(p, "音量步进", null, _s.VolumeStep, 1, 50, 1, v => _s.VolumeStep = v);

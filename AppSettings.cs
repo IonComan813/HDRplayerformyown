@@ -60,6 +60,8 @@ internal sealed class AppSettings
     public bool RememberPosition { get; set; } = true;
     /// <summary>记住每个文件的音频延迟和字幕延迟。</summary>
     public bool RememberDelays { get; set; } = true;
+    /// <summary>记住每个文件选的音轨和字幕；记住的轨没了（例如外挂文件被删）就按首选语言规则选。</summary>
+    public bool RememberTracks { get; set; } = true;
     public bool DebugLog { get; set; } = false;
 
     // ---- 窗口 ----
