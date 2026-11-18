@@ -53,6 +53,9 @@ public partial class App : Application
             return;
         }
 
+        // 上次“检查更新”下载的安装程序（装完以后就没用了）
+        Updater.CleanupDownloadsInBackground();
+
         var main = new MainWindow(files);
         MainWindow = main;
         main.Show();

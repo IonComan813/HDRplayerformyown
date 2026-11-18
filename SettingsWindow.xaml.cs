@@ -427,7 +427,7 @@ public partial class SettingsWindow : FluentWindow
         status.SetResourceReference(TextBlock.ForegroundProperty, "TextFillColorSecondaryBrush");
         var bar = new System.Windows.Controls.ProgressBar { Height = 4, Margin = new Thickness(4, 8, 4, 0), Maximum = 1, Visibility = Visibility.Collapsed };
         var btn = new Wpf.Ui.Controls.Button { Content = "检查更新", Icon = new SymbolIcon { Symbol = SymbolRegular.ArrowSync24 } };
-        AddCard(p, "检查更新", "从发布服务器检查新版本；有新版本时自动下载，下载完成后静默安装并重启 HdrPlayer。只有点这个按钮时才联网", btn);
+        AddCard(p, "检查更新", "从发布服务器检查新版本；有新版本时自动下载到临时目录，下载完成后静默安装并重启 HdrPlayer，安装程序随后自动删除。只有点这个按钮时才联网", btn);
         p.Children.Add(status);
         p.Children.Add(bar);
 

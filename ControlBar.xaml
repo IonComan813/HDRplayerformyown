@@ -32,7 +32,14 @@
 
         <!--
             进度条 / 音量条：WPF-UI 的 Slider 只画灰色轨道和圆点，已播放的部分是透明的。
-            这里沿用它的横向模板，只把圆点左边（Track 的 DecreaseRepeatButton）画成和圆点同色的强调色。
+            这里沿用它的横向模板，把圆点左边（Track 的 DecreaseRepeatButton）画成和圆点同色的强调色。
+
+            圆点（20 像素）外圈 1 像素的描边几乎是透明的（ControlElevationBorderBrush，约 7% 不透明），
+            压在它下面的东西会透出来。所以：
+            - 灰色轨道和蓝条都只画在“圆点中心能到的范围”里，即左右各缩进半个圆点（10 像素），
+              拖到最左 / 最右时圆点外侧下面什么都没有，不会透出一截白色；
+            - 蓝条一直画到圆点中心（向右多画 10 像素，伸到圆点下面），圆点左侧描边下面是蓝色，
+              而不是灰色轨道。这也是 Windows 11 滑块的画法。
         -->
         <Style x:Key="SliderFilledPart" TargetType="RepeatButton">
             <Setter Property="IsTabStop" Value="False" />
@@ -42,13 +49,14 @@
                 <Setter.Value>
                     <ControlTemplate TargetType="RepeatButton">
                         <!--
-                            透明的外框保证整个高度都能点；里面 4 像素高的条和灰色轨道对齐。
-                            右边多画半个圆点的宽度（负边距，伸到圆点下面），蓝条一直接到圆点中心，中间不露灰色轨道
+                            透明的外框保证整个高度都能点；里面 4 像素高的蓝条：
+                            左边从“圆点在最左时的中心”开始（缩进 10），右边伸到当前圆点的中心（-10）。
+                            值为 0 时宽度正好是 0
                         -->
                         <Border Background="Transparent">
                             <Border
                                 Height="4"
-                                Margin="0,0,-9,0"
+                                Margin="10,0,-10,0"
                                 VerticalAlignment="Center"
                                 Background="{DynamicResource SliderThumbBackground}"
                                 CornerRadius="2" />
@@ -69,46 +77,12 @@
                 </Setter.Value>
             </Setter>
         </Style>
-        <!--
-            圆点：WPF-UI 原来的圆点外面有一圈灰色的外环（SliderOuterThumbBackground），夹在蓝条和蓝点之间像一截灰色。
-            这里只保留强调色的圆点，悬停 / 拖动时稍微放大（和 Windows 11 的滑块一样）
-        -->
-        <Style x:Key="FilledSliderThumb" TargetType="Thumb">
-            <Setter Property="Width" Value="18" />
-            <Setter Property="Height" Value="18" />
-            <Setter Property="OverridesDefaultStyle" Value="True" />
-            <Setter Property="Foreground" Value="{DynamicResource SliderThumbBackground}" />
-            <Setter Property="Template">
-                <Setter.Value>
-                    <ControlTemplate TargetType="Thumb">
-                        <Grid Background="Transparent">
-                            <Ellipse
-                                x:Name="Dot"
-                                Width="12"
-                                Height="12"
-                                HorizontalAlignment="Center"
-                                VerticalAlignment="Center"
-                                Fill="{TemplateBinding Foreground}" />
-                        </Grid>
-                        <ControlTemplate.Triggers>
-                            <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="Dot" Property="Width" Value="16" />
-                                <Setter TargetName="Dot" Property="Height" Value="16" />
-                            </Trigger>
-                            <Trigger Property="IsDragging" Value="True">
-                                <Setter TargetName="Dot" Property="Width" Value="16" />
-                                <Setter TargetName="Dot" Property="Height" Value="16" />
-                            </Trigger>
-                        </ControlTemplate.Triggers>
-                    </ControlTemplate>
-                </Setter.Value>
-            </Setter>
-        </Style>
         <ControlTemplate x:Key="FilledSlider" TargetType="Slider">
             <Grid>
                 <Border
                     x:Name="TrackBackground"
                     Height="4"
+                    Margin="10,0"
                     VerticalAlignment="Center"
                     Background="{DynamicResource SliderTrackFill}"
                     CornerRadius="2" />
@@ -117,7 +91,7 @@
                         <RepeatButton Command="Slider.DecreaseLarge" Style="{StaticResource SliderFilledPart}" />
                     </Track.DecreaseRepeatButton>
                     <Track.Thumb>
-                        <Thumb x:Name="Thumb" Style="{StaticResource FilledSliderThumb}" />
+                        <Thumb x:Name="Thumb" Style="{DynamicResource UiSliderThumbStyle}" />
                     </Track.Thumb>
                     <Track.IncreaseRepeatButton>
                         <RepeatButton Command="Slider.IncreaseLarge" Style="{StaticResource SliderEmptyPart}" />

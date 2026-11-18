@@ -43,7 +43,8 @@ internal sealed class UpdateInfo
 
 /// <summary>
 /// 检查更新、下载安装程序、退出后静默安装并重启。
-/// 只在用户点“检查更新”时才联网；下载到 %LOCALAPPDATA%\HdrPlayer\updates，校验 SHA-256 后再用。
+/// 只在用户点“检查更新”时才联网；下载到临时目录 %TEMP%\HdrPlayer-update，校验 SHA-256 后再用，
+/// 装完重新启动的 HdrPlayer 会把它删掉（只留一个很小的安装日志，下次更新时覆盖）。
 /// </summary>
 internal static class Updater
 {
@@ -59,8 +60,7 @@ internal static class Updater
         return c;
     }
 
-    private static string UpdatesDir => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HdrPlayer", "updates");
+    private static string UpdatesDir => Path.Combine(Path.GetTempPath(), "HdrPlayer-update");
 
     /// <summary>下载好、等程序退出后安装的安装程序。</summary>
     public static string? PendingInstaller { get; set; }
@@ -140,6 +140,30 @@ internal static class Updater
         }
         File.Move(part, target, overwrite: true);
         return target;
+    }
+
+    /// <summary>
+    /// 启动时调用：删掉下载过的安装程序。刚更新完时安装程序还在收尾（它启动了新版 HdrPlayer 之后才退出），
+    /// 文件还被占用，所以在后台隔一会儿重试，最多两分钟左右。
+    /// </summary>
+    public static void CleanupDownloadsInBackground()
+    {
+        Task.Run(async () =>
+        {
+            int[] delays = { 0, 3, 10, 30, 60 };
+            foreach (int d in delays)
+            {
+                if (d > 0) await Task.Delay(TimeSpan.FromSeconds(d));
+                if (!Directory.Exists(UpdatesDir)) return;
+                bool remaining = false;
+                foreach (var f in Directory.EnumerateFiles(UpdatesDir, "HdrPlayer-setup-*"))
+                {
+                    try { File.Delete(f); }
+                    catch { remaining = true; }
+                }
+                if (!remaining) return;
+            }
+        });
     }
 
     /// <summary>
