@@ -150,7 +150,7 @@ public partial class SettingsWindow : FluentWindow
         var info = DisplayHelper.Query(_gdiName);
         string disp = info is { HasDxgi: true }
             ? $"当前显示器：{info.FriendlyName}　EDID 峰值 {info.MaxLuminance:0} nit / 全屏 {info.MaxFullFrameLuminance:0} nit　" +
-              $"Windows HDR {(info.AdvancedColorEnabled ? "开" : "关")}　播放器 HDR 输出 {(_hdrOn ? "开" : "关")}"
+              $"Windows HDR {(!info.HdrSupported ? "不支持" : info.HdrEnabled ? "开" : "关")}　播放器 HDR 输出 {(_hdrOn ? "开" : "关")}"
             : "无法读取显示器 HDR 信息";
         AddNote(p, disp);
 
@@ -162,7 +162,7 @@ public partial class SettingsWindow : FluentWindow
             _s.AutoManageHdr, v => _s.AutoManageHdr = v);
         AddCombo(p, "杜比视界", "应用 RPU 需要 vo=gpu-next（本播放器默认）；Profile 7 双层片源的增强层由新版 mpv 自动处理",
             DolbyVisionChoices, _s.DolbyVisionMode, v => _s.DolbyVisionMode = v);
-        AddNumber(p, "目标峰值亮度 (nit)", "0 = 读取显示器 EDID 上报的峰值", _s.TargetPeakNits, 0, 10000, 50,
+        AddNumber(p, "目标峰值亮度 (nit)", "0 = 自动：Windows 处于 HDR 模式时读取显示器上报的峰值（EDID，跑过 Windows HDR 校准则是校准值），高于它的高光会被压缩", _s.TargetPeakNits, 0, 10000, 50,
             v => _s.TargetPeakNits = (int)v);
         AddCombo(p, "色调映射算法", null, ToneMappingChoices, _s.ToneMapping, v => _s.ToneMapping = v);
         AddToggle(p, "HDR10+ 片源使用动态元数据", "使用 ST 2094-40 曲线，并关闭逐帧峰值检测",
