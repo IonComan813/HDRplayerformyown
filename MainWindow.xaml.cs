@@ -759,6 +759,7 @@ public partial class MainWindow : FluentWindow
         _hdr10Plus = false;
         _dvProfile = null;
         _autoHdrChecked = false;
+        _refreshChecked = false;
         ApplyToneMapping();
     }
 
@@ -946,6 +947,103 @@ public partial class MainWindow : FluentWindow
     {
         UpdateFormatLabel();
         MaybeAutoHdr();
+        MaybeMatchRefresh();
+    }
+
+    // =====================================================================
+    //  自动匹配刷新率
+    // =====================================================================
+
+    // 每个文件第一次 video-reconfig 时检查一次；_refreshGdi / _refreshOriginal：改过刷新率的显示器和它原来的刷新率（退出时还原）
+    private bool _refreshChecked;
+    private string? _refreshGdi;
+    private RefreshRate.Mode? _refreshOriginal;
+
+    /// <summary>
+    /// 开始播放时（不是打开播放器时）按视频帧率选刷新率，见 <see cref="RefreshRate"/>。切换到别的视频会再检查一次：
+    /// 新视频没有匹配的刷新率，就恢复成原来的。音乐文件（只有封面）不动。
+    /// </summary>
+    private void MaybeMatchRefresh()
+    {
+        var m = _mpv;
+        if (_refreshChecked || m == null || _idle || !S.MatchRefreshRate) return;
+        if (m.GetString("video-params/gamma") == null) return; // 还没解码出第一帧
+        _refreshChecked = true;
+        if (m.GetFlag("current-tracks/video/image") == true) return;
+
+        string gdi = CurrentGdiName();
+        // 播放器挪到了另一块屏幕上：先把之前改过的那块还原
+        if (_refreshGdi != null && !string.Equals(_refreshGdi, gdi, StringComparison.OrdinalIgnoreCase)) RestoreRefresh(announce: false);
+        var query = RefreshRate.Query(gdi);
+        if (query == null) return;
+        var (cur, all) = query.Value;
+        var original = _refreshGdi != null && _refreshOriginal is { } o ? all.FirstOrDefault(x => x.DevHz == o.DevHz, o) : cur;
+
+        double fps = m.GetDouble("container-fps") ?? 0;
+        if (fps <= 0) fps = m.GetDouble("estimated-vf-fps") ?? 0;
+        var pick = fps > 0 ? RefreshRate.Pick(fps, all, cur) : null;
+        var target = pick ?? original;
+        if (target.DevHz == cur.DevHz)
+        {
+            if (pick == null && _refreshGdi != null) { _refreshGdi = null; _refreshOriginal = null; }
+            return;
+        }
+
+        // 显示器切换模式时会黑一下：正在播放就先暂停，免得错过开头（自动切 HDR 时已经暂停的话不重复）
+        bool resume = m.GetFlag("pause") == false;
+        if (resume) m.SetProperty("pause", true);
+        if (!RefreshRate.Set(gdi, target.DevHz, out string err))
+        {
+            if (resume) m.SetProperty("pause", false);
+            m.ShowText($"切换刷新率失败（{target.Text} Hz）：{err}", 3000);
+            return;
+        }
+        if (target.DevHz == original.DevHz)
+        {
+            _refreshGdi = null;
+            _refreshOriginal = null;
+        }
+        else if (_refreshGdi == null)
+        {
+            _refreshGdi = gdi;
+            _refreshOriginal = cur;
+        }
+        SetDisplayFpsOverride(_refreshGdi != null ? target.Hz : 0);
+
+        string fpsText = fps.ToString("0.###", Inv);
+        m.ShowText(pick != null
+            ? $"刷新率 {cur.Text} → {target.Text} Hz（视频 {fpsText} 帧" +
+              (Math.Abs(target.Hz / Math.Round(target.Hz / fps) - fps) / fps < RefreshRate.ExactTolerance ? "）" : "，近似）")
+            : $"没有和 {fpsText} 帧匹配的刷新率，恢复为原来的 {target.Text} Hz", 3000);
+        if (resume)
+        {
+            var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1500) };
+            t.Tick += (_, _) => { t.Stop(); _mpv?.SetProperty("pause", false); };
+            t.Start();
+        }
+    }
+
+    /// <summary>
+    /// 刷新率改了以后直接告诉 mpv 新的精确值（0 = 让 mpv 自己检测）：嵌入的 mpv 窗口不一定收得到显示模式变化的通知，
+    /// 按显示器重采样要用准确的刷新率。旧版 mpv 的选项名是 display-fps。
+    /// </summary>
+    private void SetDisplayFpsOverride(double hz)
+    {
+        var m = _mpv;
+        if (m == null) return;
+        string v = hz > 0 ? hz.ToString("0.######", Inv) : "0";
+        if (m.SetProperty("display-fps-override", v) < 0) m.SetProperty("display-fps", v);
+    }
+
+    /// <summary>把改过的刷新率还原（退出、关掉设置时）。</summary>
+    private void RestoreRefresh(bool announce)
+    {
+        if (_refreshGdi == null || _refreshOriginal is not { } o) return;
+        RefreshRate.Restore(_refreshGdi, o.DevHz);
+        _refreshGdi = null;
+        _refreshOriginal = null;
+        SetDisplayFpsOverride(0);
+        if (announce) _mpv?.ShowText($"刷新率已还原为 {o.Text} Hz", 2500);
     }
 
     private void OnEndFile(MpvEndReason reason, int error, double position)
@@ -2277,11 +2375,18 @@ public partial class MainWindow : FluentWindow
         bool needsReload = copy.DecoderThreads != S.DecoderThreads || copy.AudioLanguages != S.AudioLanguages ||
                            copy.SubLanguages != S.SubLanguages || copy.SubAuto != S.SubAuto;
         bool dvChanged = copy.DolbyVisionMode != S.DolbyVisionMode;
+        bool refreshToggled = copy.MatchRefreshRate != S.MatchRefreshRate;
         if (copy.TargetPeakNits != S.TargetPeakNits) _displayPeak = 0;
         CopySettings(copy, S);
         S.Save();
         ApplyPlaybackOptions(m, initial: false);
         if (dvChanged) m.SetProperty("vf", DolbyVisionFilter());
+        if (refreshToggled)
+        {
+            // 关掉：马上还原；打开：当前视频马上匹配一次
+            if (!S.MatchRefreshRate) RestoreRefresh(announce: true);
+            else { _refreshChecked = false; MaybeMatchRefresh(); }
+        }
         UpdateThumbnailSource();
         // 改设置不会去切换 Windows HDR，只重新应用 mpv 的 HDR 参数
         ApplyMpvHdrProps();
@@ -2513,6 +2618,7 @@ public partial class MainWindow : FluentWindow
                     Dispatcher.InvokeAsync(() =>
                     {
                         RestoreWindowsHdr();
+                        try { RestoreRefresh(announce: false); } catch { }
                         _closeReady = true;
                         Close();
                     });

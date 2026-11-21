@@ -30,7 +30,11 @@ internal sealed class AppSettings
     public string Scale { get; set; } = "ewa_lanczossharp";
     public string Dscale { get; set; } = "mitchell";
     public bool Deband { get; set; } = false;
-    public string VideoSync { get; set; } = "audio";
+    /// <summary>默认按显示器刷新率重采样：配合自动匹配刷新率，刷新率和帧率的倍数稍有差别（如 72 对 71.928）时
+    /// mpv 微调播放速度（最多 1%）补上，不会隔一阵就重复 / 丢一帧。</summary>
+    public string VideoSync { get; set; } = "display-resample";
+    /// <summary>开始播放时按视频帧率把显示器切到整数倍（或近似）的刷新率，切换文件时重新匹配，退出时还原。</summary>
+    public bool MatchRefreshRate { get; set; } = true;
     public bool Interpolation { get; set; } = false;
     public bool ExactSeek { get; set; } = true;
 
@@ -89,7 +93,7 @@ internal sealed class AppSettings
 
     /// <summary>设置文件格式版本，用于升级时调整旧设置的默认值。</summary>
     public int SettingsVersion { get; set; }
-    private const int CurrentVersion = 3;
+    private const int CurrentVersion = 4;
 
     public static AppSettings Load()
     {
@@ -117,6 +121,11 @@ internal sealed class AppSettings
             // 语言预设加入了回退规则（简体 ↔ 繁体 → 英语、其它语言 → 英语），把旧预设换成新的；手动输入的不动
             if (LanguagePresets.Upgrades.TryGetValue(NormalizeLanguageList(SubLanguages), out var sub)) SubLanguages = sub;
             if (LanguagePresets.Upgrades.TryGetValue(NormalizeLanguageList(AudioLanguages), out var aud)) AudioLanguages = aud;
+        }
+        if (SettingsVersion < 4)
+        {
+            // 视频同步的默认值从“按音频同步”改成了“按显示器重采样”（和自动匹配刷新率配合）；旧设置里存的是旧默认值，一起换掉
+            if (VideoSync == "audio") VideoSync = "display-resample";
         }
         SettingsVersion = CurrentVersion;
     }
