@@ -15,8 +15,43 @@ using MenuItem = System.Windows.Controls.MenuItem;
 
 namespace HdrPlayer;
 
-/// <summary>播放列表里的一项（XAML 模板里绑定 Display / Path / Current）。</summary>
-public sealed record PlaylistEntry(int Index, string Display, string Path, bool Current);
+/// <summary>
+/// 播放列表里的一项（XAML 模板里绑定）。列表内容没变时（只是换了正在播放的项、缩略图生成好了）
+/// 原地改属性，不重建列表，滚动位置和选中项都不动。
+/// </summary>
+public sealed class PlaylistEntry : INotifyPropertyChanged
+{
+    public PlaylistEntry(int index, string display, string path)
+    {
+        Index = index;
+        Display = display;
+        Path = path;
+    }
+
+    public int Index { get; }
+    public string Display { get; }
+    public string Path { get; }
+
+    private bool _current, _failed, _isAudio;
+    private ImageSource? _thumbnail;
+
+    /// <summary>正在播放（mpv 播放列表的 current 项，同一时间只有一项）。</summary>
+    public bool Current { get => _current; set => Set(ref _current, value, nameof(Current)); }
+    /// <summary>打不开（格式无法识别等），提示可以修复。</summary>
+    public bool Failed { get => _failed; set => Set(ref _failed, value, nameof(Failed)); }
+    /// <summary>没有画面（纯音频），占位图换成音符。</summary>
+    public bool IsAudio { get => _isAudio; set => Set(ref _isAudio, value, nameof(IsAudio)); }
+    public ImageSource? Thumbnail { get => _thumbnail; set => Set(ref _thumbnail, value, nameof(Thumbnail)); }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    private void Set<T>(ref T field, T value, string name)
+    {
+        if (EqualityComparer<T>.Default.Equals(field, value)) return;
+        field = value;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+    }
+}
 
 public partial class MainWindow : FluentWindow
 {
@@ -67,6 +102,23 @@ public partial class MainWindow : FluentWindow
     private readonly Thumbnailer _thumbs = new();
     private readonly SubSync _subSync = new();
     private DispatcherTimer? _subSyncOsd;
+    private readonly VideoRepair _repair = new();
+    private DispatcherTimer? _repairOsd;
+    /// <summary>解除静音时恢复到的音量（静音 = 音量 0，不单独用 mpv 的 mute）。</summary>
+    private const double UnmuteVolume = 5;
+
+    // 播放列表缩略图：按完整路径缓存（Pos = 截图位置，0 = 没有记住的位置）
+    private readonly PlaylistThumbs _plThumbs = new();
+    private sealed class ThumbInfo
+    {
+        public double Pos;
+        public PlaylistThumbs.Kind Kind = PlaylistThumbs.Kind.None;
+        public ImageSource? Image;
+    }
+    private readonly Dictionary<string, ThumbInfo> _thumbInfo = new(StringComparer.OrdinalIgnoreCase);
+    // 打不开的文件（本次运行里 mpv 报错的）；_startingPath 是正在打开的文件，打开失败时没有 file-loaded，只能在 start-file 时记下
+    private readonly HashSet<string> _failedPaths = new(StringComparer.OrdinalIgnoreCase);
+    private string? _startingPath, _lastFailedPath;
     private readonly DispatcherTimer _uiTimer;
     private InfoWindow? _infoWindow;
     private IntPtr _hwnd;
@@ -152,6 +204,7 @@ public partial class MainWindow : FluentWindow
             if (!_shuttingDown) Dispatcher.InvokeAsync(() => _bar.ShowThumbnail(at, bmp));
         };
         _bar.SetVolume(S.Volume);
+        _bar.SetMuted(S.Volume <= 0);
         _bar.BtnPrev.IsEnabled = _bar.BtnNext.IsEnabled = false;
         _bar.DragOver += OnFileDragOver;
         _bar.Drop += OnFileDrop;
@@ -174,6 +227,16 @@ public partial class MainWindow : FluentWindow
         PlMenuRemove.Click += (_, _) => RemoveSelected();
         PlMenuReveal.Click += (_, _) => RevealSelected();
         PlMenuInfo.Click += (_, _) => { if (PlaylistBox.SelectedItem is PlaylistEntry e) ShowEntryInfo(e); };
+        PlMenuRepair.Click += (_, _) =>
+        {
+            if (_repair.Running) _repair.Cancel();
+            else if (PlaylistBox.SelectedItem is PlaylistEntry e) StartRepair(e.Path);
+        };
+        PlaylistBox.ContextMenuOpening += OnPlaylistMenuOpening;
+        _plThumbs.Ready += (path, pos, kind, bmp) =>
+        {
+            if (!_shuttingDown) Dispatcher.InvokeAsync(() => OnPlaylistThumb(path, pos, kind, bmp));
+        };
         PlaylistBox.MouseDoubleClick += (_, e) =>
         {
             if (ItemsControl.ContainerFromElement(PlaylistBox, e.OriginalSource as DependencyObject) is ListBoxItem)
@@ -324,12 +387,18 @@ public partial class MainWindow : FluentWindow
         m.SetOption("osd-margin-y", "28");
         m.SetOption("volume-max", "150");
         m.SetOption("volume", S.Volume.ToString(Inv));
+        m.SetOption("mute", "no");
         m.SetOption("screenshot-directory", Environment.GetFolderPath(Environment.SpecialFolder.MyPictures));
         if (S.DebugLog) m.SetOption("log-file", Path.Combine(AppSettings.Dir, "mpv.log"));
         ApplyPlaybackOptions(m, initial: true);
 
         m.PropertyChanged += OnMpvProperty;
-        m.StartFile += () => { _lastPos = 0; Ui(OnStartFile); };
+        m.StartFile += () =>
+        {
+            _lastPos = 0;
+            string? starting = m.GetString("path");
+            Ui(() => { _startingPath = starting; OnStartFile(); });
+        };
         m.FileLoaded += () => Ui(OnFileLoaded);
         // 在事件线程上先取下结束时的位置，再交给 UI 线程（那时新文件的 time-pos 可能已经开始刷新了）
         m.EndFile += (r, err) => { double pos = _lastPos; Ui(() => OnEndFile(r, err, pos)); };
@@ -346,7 +415,6 @@ public partial class MainWindow : FluentWindow
         m.Observe("time-pos", MpvFormat.Double);
         m.Observe("duration", MpvFormat.Double);
         m.Observe("volume", MpvFormat.Double);
-        m.Observe("mute", MpvFormat.Flag);
         m.Observe("aid", MpvFormat.String);
         m.Observe("sid", MpvFormat.String);
         m.Observe("media-title", MpvFormat.String);
@@ -632,11 +700,8 @@ public partial class MainWindow : FluentWindow
                 _timeDirty = true;
                 break;
             case "volume":
-                if (value is double v) { _bar.SetVolume(v); S.Volume = v; }
-                break;
-            case "mute":
-                _bar.MuteIcon.Symbol = value is true ? SymbolRegular.SpeakerMute24 : SymbolRegular.Speaker224;
-                _bar.SetMuted(value is true);
+                // 静音就是音量 0：拖到 0 / 按静音都显示静音图标，往右拖离开 0 就解除
+                if (value is double v) { _bar.SetVolume(v); _bar.SetMuted(v <= 0); S.Volume = v; }
                 break;
             case "media-title":
                 SetTitle(value is string t && t.Length > 0 ? $"{t} - HdrPlayer" : "HdrPlayer");
@@ -714,6 +779,8 @@ public partial class MainWindow : FluentWindow
         }
         _currentPath = m.GetString("path");
         _currentDuration = m.GetDouble("duration") ?? 0;
+        _lastFailedPath = null;
+        if (_currentPath != null && _failedPaths.Remove(FullPath(_currentPath))) UpdatePlaylistFlags();
         ApplyFileState(m, resumePosition: !reloaded);
         UpdateFormatLabel();
         UpdateThumbnailSource();
@@ -846,6 +913,8 @@ public partial class MainWindow : FluentWindow
             LastPlayed = DateTime.UtcNow,
         };
         _fileStates.Set(path, st);
+        // 播放列表的缩略图换成这次停下的位置（刚切走的文件优先生成）
+        RefreshEntryThumb(path, urgent: true);
     }
 
     /// <summary>当前文件是有画面的本地文件、且设置里开启时，让缩略图线程跟着打开它。</summary>
@@ -873,7 +942,17 @@ public partial class MainWindow : FluentWindow
         CommitFileState(position, finished: reason == MpvEndReason.Eof);
         if (reason != MpvEndReason.Error) return;
         if (_reloading) { _reloading = false; _mpv?.SetProperty("start", "none"); }
-        _mpv?.ShowText("播放失败：" + Mpv.ErrorString(error), 4000);
+        // 打开失败时没有 file-loaded：用 start-file 时记下的路径，播放列表里标出来，右键菜单里可以修复它
+        string? failed = _startingPath;
+        bool local = failed != null && File.Exists(failed);
+        if (local)
+        {
+            _lastFailedPath = FullPath(failed!);
+            _failedPaths.Add(_lastFailedPath);
+            UpdatePlaylistFlags();
+        }
+        _mpv?.ShowText("播放失败：" + Mpv.ErrorString(error) +
+            (local ? "\n可以右键 → 修复视频，试试重新封装" : ""), 5000);
     }
 
     /// <summary>
@@ -1036,7 +1115,7 @@ public partial class MainWindow : FluentWindow
             case "seek-fwd-big": Seek(S.SeekStepLarge, seekMode); break;
             case "vol-up": m.CommandString($"no-osd add volume {S.VolumeStep.ToString(Inv)}"); m.ShowText("音量 ${volume}"); break;
             case "vol-down": m.CommandString($"no-osd add volume {(-S.VolumeStep).ToString(Inv)}"); m.ShowText("音量 ${volume}"); break;
-            case "mute": m.CommandString("no-osd cycle mute"); m.ShowText("静音：${mute}"); break;
+            case "mute": ToggleMute(); break;
             case "fullscreen": ToggleFullscreen(); break;
             case "click": OnVideoClick(); break;
             case "dblclick":
@@ -1072,6 +1151,8 @@ public partial class MainWindow : FluentWindow
             case "reveal": RevealFile(m.GetString("path")); break;
             case "load-sub": LoadSubtitle(); break;
             case "sub-sync": StartSubSync(); break;
+            case "repair": StartRepair(RepairTarget()); break;
+            case "repair-cancel": _repair.Cancel(); break;
             case "load-audio": LoadAudioTrack(); break;
             case "settings": OpenSettings(); break;
             case "quit": Close(); break;
@@ -1088,6 +1169,27 @@ public partial class MainWindow : FluentWindow
             case "open": OpenFiles(); break;
             case "frame-step": m.CommandString("frame-step"); RevealBarForKeyboard(); break;
             case "frame-back": m.CommandString("frame-back-step"); RevealBarForKeyboard(); break;
+        }
+    }
+
+    /// <summary>
+    /// 静音 = 音量拉到 0（图标随之变成静音）；再点一次解除，音量一律回到 5%。
+    /// 拖音量条也一样：拖到 0 就是静音，往右拖离开 0 就解除。
+    /// </summary>
+    private void ToggleMute()
+    {
+        var m = _mpv;
+        if (m == null) return;
+        m.SetProperty("mute", false);
+        if ((m.GetDouble("volume") ?? 0) > 0)
+        {
+            m.SetProperty("volume", 0.0);
+            m.ShowText("静音");
+        }
+        else
+        {
+            m.SetProperty("volume", UnmuteVolume);
+            m.ShowText($"音量 {UnmuteVolume.ToString(Inv)}");
         }
     }
 
@@ -1224,23 +1326,120 @@ public partial class MainWindow : FluentWindow
 
     private void RefreshPlaylist()
     {
-        var list = new List<PlaylistEntry>();
-        if (_mpv?.GetNode("playlist") is List<object?> items)
+        var items = new List<(string Path, string Name, bool Current)>();
+        if (_mpv?.GetNode("playlist") is List<object?> nodes)
         {
-            for (int i = 0; i < items.Count; i++)
+            foreach (var n in nodes)
             {
-                if (items[i] is not Dictionary<string, object?> d) continue;
+                if (n is not Dictionary<string, object?> d) continue;
                 string path = d.GetValueOrDefault("filename") as string ?? "";
                 string name = d.GetValueOrDefault("title") as string ?? Path.GetFileName(path);
-                bool cur = d.GetValueOrDefault("current") is true || d.GetValueOrDefault("playing") is true;
-                list.Add(new PlaylistEntry(i, $"{i + 1}. {name}", path, cur));
+                // 只看 current：切换文件的过程中 mpv 会短暂地让旧文件还是 playing、新文件已经是 current，
+                // 以前两个都算，播放列表就会同时有两项显示为正在播放
+                items.Add((path, name, d.GetValueOrDefault("current") is true));
             }
         }
-        _playlist = list;
-        int sel = PlaylistBox.SelectedIndex;
-        PlaylistBox.ItemsSource = list;
-        if (sel >= 0 && sel < list.Count) PlaylistBox.SelectedIndex = sel;
-        _bar.BtnPrev.IsEnabled = _bar.BtnNext.IsEnabled = list.Count > 1;
+
+        // 文件没变（只是换了正在播放的项）：原地更新，不重建列表，滚动位置和多选都保留
+        if (items.Count == _playlist.Count && items.Select(i => i.Path).SequenceEqual(_playlist.Select(e => e.Path)))
+        {
+            for (int i = 0; i < items.Count; i++) _playlist[i].Current = items[i].Current;
+        }
+        else
+        {
+            var selected = PlaylistBox.SelectedItems.OfType<PlaylistEntry>().Select(e => e.Path)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            int firstSel = PlaylistBox.SelectedIndex;
+            var list = items.Select((it, i) => new PlaylistEntry(i, it.Name, it.Path) { Current = it.Current }).ToList();
+            _playlist = list;
+            PlaylistBox.ItemsSource = list;
+            var keep = list.Where(e => selected.Contains(e.Path)).ToList();
+            foreach (var e in keep) PlaylistBox.SelectedItems.Add(e);
+            // 删掉了选中的项：选中原来位置上的下一项，方便连续按 Delete
+            if (keep.Count == 0 && firstSel >= 0 && list.Count > 0) PlaylistBox.SelectedIndex = Math.Min(firstSel, list.Count - 1);
+            UpdatePlaylistFlags();
+            foreach (var e in list) ApplyThumb(e);
+        }
+        _bar.BtnPrev.IsEnabled = _bar.BtnNext.IsEnabled = items.Count > 1;
+    }
+
+    /// <summary>按 _failedPaths 和缩略图的结果更新“打不开”的标记。</summary>
+    private void UpdatePlaylistFlags()
+    {
+        foreach (var e in _playlist)
+        {
+            string key = FullPath(e.Path);
+            e.Failed = _failedPaths.Contains(key) ||
+                       (_thumbInfo.TryGetValue(key, out var info) && info.Kind == PlaylistThumbs.Kind.Failed);
+        }
+    }
+
+    // ---- 播放列表缩略图 ----
+
+    /// <summary>缩略图应该截哪个位置：记住的进度（0 = 没有，取片长 10% 处）。</summary>
+    private double ThumbPos(string path) => _fileStates.Get(path)?.Position ?? 0;
+
+    /// <summary>
+    /// 给列表项套上缓存的缩略图；没有或位置变了就请求生成（生成好之前先显示旧图）。
+    /// 播放列表没打开时不生成，打开时再补（免得一启动就在后台读一堆文件）。
+    /// </summary>
+    private void ApplyThumb(PlaylistEntry e, bool urgent = false)
+    {
+        if (e.Path.Length == 0 || e.Path.Contains("://")) return;
+        string key = FullPath(e.Path);
+        double pos = ThumbPos(key);
+        _thumbInfo.TryGetValue(key, out var info);
+        if (info != null)
+        {
+            e.Thumbnail = info.Image;
+            e.IsAudio = info.Kind == PlaylistThumbs.Kind.NoVideo;
+        }
+        if (info != null && info.Pos == pos) return;
+        if (PlaylistPanel.Visibility != Visibility.Visible) return;
+        _thumbInfo[key] = new ThumbInfo { Pos = pos, Image = info?.Image, Kind = info?.Kind ?? PlaylistThumbs.Kind.None };
+        _plThumbs.Request(key, pos, urgent);
+    }
+
+    /// <summary>这个文件的进度变了（切走 / 停止时）：更新列表里它的缩略图。</summary>
+    private void RefreshEntryThumb(string path, bool urgent)
+    {
+        foreach (var e in _playlist)
+            if (SamePath(e.Path, path)) ApplyThumb(e, urgent);
+    }
+
+    private void OnPlaylistThumb(string path, double pos, PlaylistThumbs.Kind kind, System.Windows.Media.Imaging.BitmapSource? bmp)
+    {
+        if (!_thumbInfo.TryGetValue(path, out var info) || info.Pos != pos) return; // 已经有更新的请求了
+        info.Kind = kind;
+        // 这次没截到（超时等）就先留着旧图
+        if (kind == PlaylistThumbs.Kind.Image) info.Image = bmp;
+        else if (kind != PlaylistThumbs.Kind.None) info.Image = null;
+        foreach (var e in _playlist)
+        {
+            if (!SamePath(e.Path, path)) continue;
+            e.Thumbnail = info.Image;
+            e.IsAudio = kind == PlaylistThumbs.Kind.NoVideo;
+        }
+        if (kind == PlaylistThumbs.Kind.Failed) UpdatePlaylistFlags();
+    }
+
+    // ---- 选中项的操作（Ctrl / Shift 可以多选）----
+
+    private List<PlaylistEntry> SelectedEntries() =>
+        PlaylistBox.SelectedItems.OfType<PlaylistEntry>().OrderBy(e => e.Index).ToList();
+
+    /// <summary>右键菜单：选中多项时只有“移除”；一项都没选（点在空白处）不弹。</summary>
+    private void OnPlaylistMenuOpening(object sender, ContextMenuEventArgs e)
+    {
+        int n = PlaylistBox.SelectedItems.Count;
+        if (n == 0) { e.Handled = true; return; }
+        bool multi = n > 1;
+        var single = multi ? Visibility.Collapsed : Visibility.Visible;
+        PlMenuPlay.Visibility = PlMenuReveal.Visibility = PlMenuSep.Visibility = PlMenuRepair.Visibility = PlMenuInfo.Visibility = single;
+        PlMenuRemove.Header = multi ? $"移除选中的 {n} 项" : "移除";
+        string? path = (PlaylistBox.SelectedItem as PlaylistEntry)?.Path;
+        PlMenuRepair.Header = _repair.Running ? "取消修复视频" : "修复视频（重新封装）…";
+        PlMenuRepair.IsEnabled = _repair.Running || (path != null && File.Exists(path));
     }
 
     private void PlaySelected()
@@ -1251,8 +1450,11 @@ public partial class MainWindow : FluentWindow
 
     private void RemoveSelected()
     {
-        if (PlaylistBox.SelectedItem is PlaylistEntry e)
-            _mpv?.Command("playlist-remove", e.Index.ToString(Inv));
+        var m = _mpv;
+        if (m == null) return;
+        // 从后往前删，前面的序号不会变
+        foreach (var e in SelectedEntries().OrderByDescending(e => e.Index))
+            m.Command("playlist-remove", e.Index.ToString(Inv));
     }
 
     private void RevealSelected()
@@ -1273,6 +1475,7 @@ public partial class MainWindow : FluentWindow
         bool show = PlaylistPanel.Visibility != Visibility.Visible;
         PlaylistPanel.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
         S.PlaylistVisible = show;
+        if (show) foreach (var e in _playlist) ApplyThumb(e);
     }
 
     // =====================================================================
@@ -1436,6 +1639,138 @@ public partial class MainWindow : FluentWindow
         m.ShowText($"字幕已同步：整体偏移 {res.Offset.ToString("+0.00;-0.00;0.00", Inv)} 秒{scale}\n已保存为 {Path.GetFileName(output)}", 5000);
     }
 
+    // =====================================================================
+    //  修复视频（ffmpeg 重新封装）
+    // =====================================================================
+
+    /// <summary>
+    /// 画面右键菜单里“修复视频”针对的文件：正在播放的本地文件；没在播放时是刚才打不开的那个文件
+    /// （格式无法识别时 mpv 不会载入它，画面上的菜单本来没有“本视频”）。
+    /// </summary>
+    private string? RepairTarget()
+    {
+        string? path = _idle ? null : _mpv?.GetString("path");
+        if (path != null && File.Exists(path)) return FullPath(path);
+        return _idle && _lastFailedPath != null && File.Exists(_lastFailedPath) ? _lastFailedPath : null;
+    }
+
+    /// <summary>
+    /// 不重新编码地重新封装成“原名.repaired.mkv”（原文件不动），完成后在播放列表里替换掉原文件；
+    /// 原文件正在播放（或刚才打不开）时直接播放修复好的，接着原来的进度、延迟和音轨 / 字幕。
+    /// </summary>
+    private async void StartRepair(string? source)
+    {
+        var m = _mpv;
+        if (m == null) return;
+        if (_repair.Running) { _repair.Cancel(); return; }
+        if (source == null || !File.Exists(source)) { m.ShowText("只能修复本地文件"); return; }
+        source = FullPath(source);
+        if (VideoRepair.FindFfmpeg() == null || VideoRepair.FindFfprobe() == null)
+        {
+            await Dialogs.ShowAsync(this, "修复视频",
+                "没有找到 ffmpeg / ffprobe。\n\n发布版（安装版 / 便携版）自带，在程序目录的 tools\\ffmpeg 里。" +
+                "自己编译的话可以把 ffmpeg.exe / ffprobe.exe 放进 PATH。");
+            return;
+        }
+
+        // 输出：原文件旁边的“原名.repaired.mkv”（已存在就加序号）；目录不可写时让用户选位置
+        string name = Path.GetFileNameWithoutExtension(source);
+        int cut = name.LastIndexOf(".repaired", StringComparison.OrdinalIgnoreCase);
+        if (cut > 0) name = name[..cut];
+        string dir = Path.GetDirectoryName(source) ?? "";
+        string output;
+        if (DirectoryWritable(dir))
+        {
+            output = Path.Combine(dir, name + ".repaired.mkv");
+            for (int i = 2; File.Exists(output) || File.Exists(output + ".part"); i++)
+                output = Path.Combine(dir, $"{name}.repaired-{i}.mkv");
+        }
+        else
+        {
+            var dlg = new Microsoft.Win32.SaveFileDialog
+            {
+                Title = "原文件所在的文件夹不能写入，选择修复后的文件保存到哪里",
+                FileName = name + ".repaired.mkv",
+                Filter = "MKV 视频|*.mkv",
+                DefaultExt = ".mkv",
+                InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos),
+            };
+            if (dlg.ShowDialog(this) != true) return;
+            output = dlg.FileName;
+            if (SamePath(output, source)) { m.ShowText("不能覆盖原文件", 3000); return; }
+            try { File.Delete(output); } catch { } // 用户在对话框里确认过覆盖
+        }
+
+        long size = 0;
+        try { size = new FileInfo(source).Length; } catch { }
+        bool go = await Dialogs.ConfirmAsync(this, "修复视频",
+            $"把 {Path.GetFileName(source)} 重新封装成 MKV（不重新编码，画质不变），另存为：\n{output}\n\n" +
+            $"原文件不会改动。需要大约 {VideoRepair.FormatSize(size)} 的空间，耗时主要取决于硬盘速度。\n\n" +
+            "能修好：拖不动进度条、时长显示不对、时间戳错乱导致的音画不同步或卡住、电视录像（TS）里的坏包、扩展名和实际格式不符。\n" +
+            "修不好：画面本身花屏 / 马赛克；录制中断、缺少索引（moov）的 MP4 / MOV。",
+            "开始修复");
+        if (!go || _shuttingDown || _mpv == null) return;
+
+        double fraction = 0;
+        var started = DateTime.UtcNow;
+        string shortName = Path.GetFileName(source);
+        void ShowProgress() =>
+            m.ShowText($"正在修复 {shortName}　{fraction * 100:0}%　{(DateTime.UtcNow - started).TotalSeconds:0} 秒\n（右键 → 取消修复视频）", 1500);
+        _repairOsd?.Stop();
+        _repairOsd = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        _repairOsd.Tick += (_, _) => ShowProgress();
+        _repairOsd.Start();
+        ShowProgress();
+
+        var res = await _repair.RunAsync(source, output, f => fraction = f);
+        _repairOsd.Stop();
+        if (_shuttingDown || _mpv == null) return;
+        if (!res.Ok)
+        {
+            m.ShowText("", 1);
+            if (res.Message == "已取消修复。") m.ShowText(res.Message, 3000);
+            else await Dialogs.ShowAsync(this, "修复视频", res.Message);
+            return;
+        }
+        ReplaceWithRepaired(source, output);
+        m.ShowText($"修复完成，已保存为 {Path.GetFileName(output)}（原文件没有改动）" +
+            (res.DroppedStreams ? "\n有些字幕 / 附件 / 数据流放不进 MKV，已省略" : ""), 5000);
+    }
+
+    /// <summary>修复完成：播放列表里用修复好的文件替换原文件，记住的进度等状态也带过去。</summary>
+    private void ReplaceWithRepaired(string source, string output)
+    {
+        var m = _mpv;
+        if (m == null) return;
+        bool isCurrent = !_idle && SamePath(m.GetString("path"), source);
+        bool wasFailed = _idle && SamePath(_lastFailedPath, source);
+        // 正在播放：先把当前的进度记下来（之后它结束时就不会再记一次）
+        if (isCurrent) CommitFileState(_timePos, finished: false);
+        if (_fileStates.Get(source) is { } st)
+        {
+            _fileStates.Set(output, new FileState
+            {
+                Position = st.Position, AudioDelay = st.AudioDelay, SubDelay = st.SubDelay, Hwdec = st.Hwdec,
+                Audio = st.Audio, Sub = st.Sub, LastPlayed = DateTime.UtcNow,
+            });
+        }
+        _failedPaths.Remove(source);
+        if (wasFailed) _lastFailedPath = null;
+
+        int idx = PlaylistIndexOf(source);
+        m.Command("loadfile", output, "append");
+        int last = (int)(m.GetInt("playlist-count") ?? 1) - 1;
+        int target = last;
+        if (idx >= 0 && idx < last)
+        {
+            // 挪到原文件的位置上（原文件往后挪一位），再删掉原文件
+            m.Command("playlist-move", last.ToString(Inv), idx.ToString(Inv));
+            target = idx;
+        }
+        if (isCurrent || wasFailed) m.Command("playlist-play-index", target.ToString(Inv));
+        if (idx >= 0) m.Command("playlist-remove", (target == idx ? idx + 1 : idx).ToString(Inv));
+    }
+
     private static bool DirectoryWritable(string dir)
     {
         try
@@ -1483,8 +1818,16 @@ public partial class MainWindow : FluentWindow
             new("加载字幕…", Hp("load-sub"), Enabled: playing),
             new("加载外部音轨…", Hp("load-audio"), Enabled: playing),
             new("重新载入当前文件", Hp("reload"), "F5", Enabled: playing),
-            Sep,
         };
+        // 修复视频：格式无法识别时文件根本没载入，这时针对刚才打不开的那个文件
+        string? repairTarget = RepairTarget();
+        if (_repair.Running)
+            items.Add(new MenuEntry("取消修复视频", Hp("repair-cancel")));
+        else if (repairTarget != null && !SamePath(repairTarget, path))
+            items.Add(new MenuEntry($"修复无法打开的文件：{Path.GetFileName(repairTarget)}…", Hp("repair")));
+        else
+            items.Add(new MenuEntry("修复视频（重新封装）…", Hp("repair"), Enabled: repairTarget != null));
+        items.Add(Sep);
 
         var audio = new List<MenuEntry>();
         var subs = new List<MenuEntry> { new("关闭字幕", Hp("sid", "no"), Checked: m?.GetString("sid") is "no" or null) };
@@ -2081,6 +2424,8 @@ public partial class MainWindow : FluentWindow
             _uiTimer.Stop();
             _subSyncOsd?.Stop();
             _subSync.KillNow();
+            _repairOsd?.Stop();
+            _repair.KillNow();
             _infoWindow?.Close();
             _bar.HideNow();
             Hide();
@@ -2091,6 +2436,7 @@ public partial class MainWindow : FluentWindow
             Task.Run(() =>
             {
                 try { _thumbs.Dispose(); } catch { }
+                try { _plThumbs.Dispose(); } catch { }
                 try { m.Dispose(); } catch { }
             }).ContinueWith(_ =>
             {

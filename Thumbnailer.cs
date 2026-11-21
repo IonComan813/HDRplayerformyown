@@ -133,6 +133,19 @@ internal sealed class Thumbnailer : IDisposable
     private Mpv EnsureMpv()
     {
         if (_mpv != null) return _mpv;
+        var m = CreateHeadless(MaxW, MaxH);
+        m.FileLoaded += () => _loaded.Set();
+        m.PlaybackRestart += () => _restart.Set();
+        m.Initialize();
+        return _mpv = m;
+    }
+
+    /// <summary>
+    /// 不出画面、不出声的截图用 mpv 实例（还没 Initialize，调用方挂好事件后再初始化）。
+    /// 画面先缩小到不超过 maxW × maxH（保持宽高比）再截图。播放列表的缩略图也用它。
+    /// </summary>
+    internal static Mpv CreateHeadless(int maxW, int maxH)
+    {
         var m = new Mpv();
         m.SetOption("vo", "null");
         m.SetOption("ao", "null");
@@ -156,15 +169,12 @@ internal sealed class Thumbnailer : IDisposable
         // 只对非参考帧跳过环路滤波：精确跳转要连续解码一串帧，参考帧质量不能降，否则误差会累积成马赛克
         m.SetOption("vd-lavc-skiploopfilter", "nonref");
         m.SetOption("vd-lavc-fast", "yes");
-        // 先缩小再截图：保持宽高比，最大 384×216
-        m.SetOption("vf", $"lavfi=[scale={MaxW}:{MaxH}:force_original_aspect_ratio=decrease:force_divisible_by=2]");
-        m.FileLoaded += () => _loaded.Set();
-        m.PlaybackRestart += () => _restart.Set();
-        m.Initialize();
-        return _mpv = m;
+        // 先缩小再截图：保持宽高比
+        m.SetOption("vf", $"lavfi=[scale={maxW}:{maxH}:force_original_aspect_ratio=decrease:force_divisible_by=2]");
+        return m;
     }
 
-    private static BitmapSource? Grab(Mpv m)
+    internal static BitmapSource? Grab(Mpv m)
     {
         // "video"：只要视频画面，不含字幕和 OSD；默认格式 bgr0 = WPF 的 Bgr32
         if (m.CommandWithResult("screenshot-raw", "video") is not Dictionary<string, object?> r) return null;

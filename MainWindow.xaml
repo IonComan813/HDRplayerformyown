@@ -69,50 +69,85 @@
                             <ui:Button x:Name="BtnPlClose" Appearance="Transparent" BorderThickness="0" Padding="8,6" ToolTip="关闭 (P)" Icon="{ui:SymbolIcon Dismiss24}" />
                         </StackPanel>
                     </Grid>
+                    <!-- Ctrl / Shift 多选；正在播放的那一项用强调色的文字和缩略图边框表示 -->
                     <ListBox
                         x:Name="PlaylistBox"
                         Margin="4,0,4,6"
                         AllowDrop="True"
                         Background="Transparent"
                         BorderThickness="0"
+                        SelectionMode="Extended"
                         ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                         <ListBox.ItemTemplate>
                             <DataTemplate DataType="{x:Type local:PlaylistEntry}">
-                                <Grid>
+                                <Grid Margin="0,2">
                                     <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="22" />
+                                        <ColumnDefinition Width="Auto" />
                                         <ColumnDefinition Width="*" />
                                     </Grid.ColumnDefinitions>
-                                    <ui:SymbolIcon
-                                        x:Name="Marker"
+                                    <!-- 缩略图：上次退出 / 切走时那个位置的画面 -->
+                                    <Border
+                                        x:Name="ThumbFrame"
                                         Grid.Column="0"
-                                        FontSize="14"
-                                        Filled="True"
-                                        Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}"
-                                        Symbol="Play24"
-                                        Visibility="Hidden" />
-                                    <TextBlock
-                                        x:Name="Label"
-                                        Grid.Column="1"
-                                        Text="{Binding Display}"
-                                        TextTrimming="CharacterEllipsis"
-                                        ToolTip="{Binding Path}" />
+                                        Width="116"
+                                        Height="67"
+                                        VerticalAlignment="Top"
+                                        Background="#FF161616"
+                                        BorderBrush="Transparent"
+                                        BorderThickness="2"
+                                        CornerRadius="5">
+                                        <Grid>
+                                            <ui:SymbolIcon
+                                                x:Name="Placeholder"
+                                                FontSize="22"
+                                                Foreground="#80FFFFFF"
+                                                Symbol="VideoClip24" />
+                                            <Image
+                                                RenderOptions.BitmapScalingMode="HighQuality"
+                                                Source="{Binding Thumbnail}"
+                                                Stretch="Uniform" />
+                                        </Grid>
+                                    </Border>
+                                    <StackPanel Grid.Column="1" Margin="10,0,2,0" VerticalAlignment="Center">
+                                        <TextBlock
+                                            x:Name="Label"
+                                            Text="{Binding Display}"
+                                            TextWrapping="Wrap"
+                                            ToolTip="{Binding Path}" />
+                                        <TextBlock
+                                            x:Name="FailedText"
+                                            Margin="0,3,0,0"
+                                            FontSize="11"
+                                            Foreground="{DynamicResource SystemFillColorCautionBrush}"
+                                            Text="无法打开，可右键 → 修复视频"
+                                            TextWrapping="Wrap"
+                                            Visibility="Collapsed" />
+                                    </StackPanel>
                                 </Grid>
                                 <DataTemplate.Triggers>
+                                    <DataTrigger Binding="{Binding IsAudio}" Value="True">
+                                        <Setter TargetName="Placeholder" Property="Symbol" Value="MusicNote224" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding Failed}" Value="True">
+                                        <Setter TargetName="Placeholder" Property="Symbol" Value="VideoClipOff24" />
+                                        <Setter TargetName="FailedText" Property="Visibility" Value="Visible" />
+                                    </DataTrigger>
                                     <DataTrigger Binding="{Binding Current}" Value="True">
-                                        <Setter TargetName="Marker" Property="Visibility" Value="Visible" />
                                         <Setter TargetName="Label" Property="Foreground" Value="{DynamicResource AccentTextFillColorPrimaryBrush}" />
                                         <Setter TargetName="Label" Property="FontWeight" Value="SemiBold" />
+                                        <Setter TargetName="ThumbFrame" Property="BorderBrush" Value="{DynamicResource AccentTextFillColorPrimaryBrush}" />
                                     </DataTrigger>
                                 </DataTemplate.Triggers>
                             </DataTemplate>
                         </ListBox.ItemTemplate>
                         <ListBox.ContextMenu>
+                            <!-- 选中多项时只留“移除”（见 OnPlaylistMenuOpening） -->
                             <ContextMenu>
                                 <MenuItem x:Name="PlMenuPlay" Header="播放" InputGestureText="Enter" />
                                 <MenuItem x:Name="PlMenuRemove" Header="移除" InputGestureText="Delete" />
                                 <MenuItem x:Name="PlMenuReveal" Header="在资源管理器中显示" />
-                                <Separator />
+                                <Separator x:Name="PlMenuSep" />
+                                <MenuItem x:Name="PlMenuRepair" Header="修复视频（重新封装）…" />
                                 <MenuItem x:Name="PlMenuInfo" Header="视频参数…" />
                             </ContextMenu>
                         </ListBox.ContextMenu>

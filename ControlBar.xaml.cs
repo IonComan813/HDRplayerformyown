@@ -129,9 +129,11 @@ public partial class ControlBar : Window
         _settingVolume = false;
     }
 
+    /// <summary>静音状态（音量为 0）：换图标，音量提示里显示“静音”。</summary>
     public void SetMuted(bool muted)
     {
         _muted = muted;
+        MuteIcon.Symbol = muted ? Wpf.Ui.Controls.SymbolRegular.SpeakerMute24 : Wpf.Ui.Controls.SymbolRegular.Speaker224;
         if (_tipOwner == TipOwner.Volume) ShowVolumeTip();
     }
 
@@ -152,7 +154,7 @@ public partial class ControlBar : Window
         const double thumb = 20;
         double x = thumb / 2 + Math.Max(0, VolumeSlider.ActualWidth - thumb) * VolumeSlider.Value / Math.Max(1, VolumeSlider.Maximum);
         _tipOwner = TipOwner.Volume;
-        tip.ShowAt(VolumeSlider, x, 6, _muted ? $"静音（{v}%）" : $"{v}%", null, false);
+        tip.ShowAt(VolumeSlider, x, 6, _muted || v <= 0 ? "静音" : $"{v}%", null, false);
     }
 
     private void UpdateSeekTip(MouseEventArgs e)
