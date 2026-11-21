@@ -89,9 +89,6 @@ public partial class SettingsWindow : FluentWindow
         ("lanczos", "lanczos"), ("bilinear", "bilinear"),
     };
 
-    private static readonly (string, string)[] SyncChoices =
-        { ("display-resample", "按显示器刷新率重采样（默认）"), ("audio", "按音频同步") };
-
     private static readonly (string, string)[] SubAutoChoices =
         { ("no", "不自动加载"), ("exact", "完全同名"), ("fuzzy", "包含文件名"), ("all", "目录下全部") };
 
@@ -187,11 +184,9 @@ public partial class SettingsWindow : FluentWindow
         AddToggle(p, "去色带 (deband)", null, _s.Deband, v => _s.Deband = v);
         AddToggle(p, "自动匹配刷新率",
             "开始播放时把显示器切到视频帧率的整数倍（不低于 48 Hz，没有恰好的就用最接近的，如 119.88 帧用 120 Hz），" +
-            "切换视频时重新匹配，退出时还原。只在系统列出的刷新率里选，不设置自定义刷新率",
+            "切换视频时重新匹配，退出时还原。只在系统列出的刷新率里选，不设置自定义刷新率。" +
+            "视频同步自动选：刷新率匹配时按显示器重采样，不匹配时按音频同步（关掉这项也一样，只是不切换刷新率）",
             _s.MatchRefreshRate, v => _s.MatchRefreshRate = v);
-        AddCombo(p, "视频同步", "按显示器重采样：刷新率和帧率的倍数稍有差别时微调播放速度补上，配合自动匹配刷新率使用",
-            SyncChoices, _s.VideoSync, v => _s.VideoSync = v);
-        AddToggle(p, "帧插值", "平滑 24p 抖动，会自动改为按显示器重采样", _s.Interpolation, v => _s.Interpolation = v);
         AddToggle(p, "写 mpv 日志", @"%APPDATA%\HdrPlayer\mpv.log，重启后生效", _s.DebugLog, v => _s.DebugLog = v);
         AddNote(p, "能否硬解取决于显卡支持的格式；HDR10+ 动态元数据在硬解下同样可用。\n" +
                    "显卡不支持的格式（如 Hi10P，即 10-bit H.264）会自动回落到软解。");
