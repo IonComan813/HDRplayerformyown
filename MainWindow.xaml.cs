@@ -761,7 +761,8 @@ public partial class MainWindow : FluentWindow
         _autoHdrChecked = false;
         _refreshChecked = false;
         // 先按音频同步，视频参数出来以后再按刷新率是否匹配决定（纯音频文件就一直是音频同步）
-        _mpv?.SetProperty("video-sync", "audio");
+        _refreshMatched = false;
+        SetSyncMode("audio");
         ApplyToneMapping();
     }
 
@@ -923,6 +924,7 @@ public partial class MainWindow : FluentWindow
             AudioDelay = S.RememberDelays ? m.GetDouble("audio-delay") ?? 0 : old?.AudioDelay ?? 0,
             SubDelay = S.RememberDelays ? m.GetDouble("sub-delay") ?? 0 : old?.SubDelay ?? 0,
             Hwdec = old?.Hwdec,
+            VideoSync = old?.VideoSync,
             Audio = S.RememberTracks && _audioTouched && _audioSel != null ? _audioSel : old?.Audio,
             Sub = S.RememberTracks && _subTouched && _subSel != null ? _subSel : old?.Sub,
             LastPlayed = DateTime.UtcNow,
@@ -958,6 +960,8 @@ public partial class MainWindow : FluentWindow
 
     // 每个文件第一次 video-reconfig 时检查一次；_refreshGdi / _refreshOriginal：改过刷新率的显示器和它原来的刷新率（退出时还原）
     private bool _refreshChecked;
+    /// <summary>当前文件的刷新率和帧率匹配（这时固定按显示器重采样，右键菜单里的视频同步变灰）。</summary>
+    private bool _refreshMatched;
     private string? _refreshGdi;
     private RefreshRate.Mode? _refreshOriginal;
 
@@ -965,7 +969,8 @@ public partial class MainWindow : FluentWindow
     /// 开始播放时（不是打开播放器时）按视频帧率选刷新率，见 <see cref="RefreshRate"/>。切换到别的视频会再检查一次：
     /// 新视频没有匹配的刷新率，就恢复成原来的。同时决定视频同步方式：
     /// 刷新率和帧率匹配（恰好或足够近似的整数倍）时按显示器重采样，mpv 微调播放速度把那点差别补上，不重复 / 丢帧；
-    /// 不匹配时按音频同步（重采样要改的速度太大，没意义）。关掉“自动匹配刷新率”时不切换，只看当前刷新率匹不匹配。
+    /// 不匹配时用这个视频单独选的方式，没选过就用全局设置（按音频同步，或帧插值 + 按显示器重采样）。
+    /// 关掉“自动匹配刷新率”时不切换，只看当前刷新率匹不匹配。
     /// 音乐文件（只有封面）不动。
     /// </summary>
     private void MaybeMatchRefresh()
@@ -974,7 +979,7 @@ public partial class MainWindow : FluentWindow
         if (_refreshChecked || m == null || _idle) return;
         if (m.GetString("video-params/gamma") == null) return; // 还没解码出第一帧
         _refreshChecked = true;
-        if (m.GetFlag("current-tracks/video/image") == true) { SetVideoSync(false); return; }
+        if (m.GetFlag("current-tracks/video/image") == true) { _refreshMatched = false; SetSyncMode("audio"); return; }
 
         string gdi = CurrentGdiName();
         // 播放器挪到了另一块屏幕上：先把之前改过的那块还原
@@ -982,10 +987,10 @@ public partial class MainWindow : FluentWindow
         double fps = m.GetDouble("container-fps") ?? 0;
         if (fps <= 0) fps = m.GetDouble("estimated-vf-fps") ?? 0;
         var query = RefreshRate.Query(gdi);
-        if (query == null || fps <= 0) { SetVideoSync(false); return; }
+        if (query == null || fps <= 0) { ApplyVideoSync(false); return; }
         var (cur, all) = query.Value;
         bool currentMatches = RefreshRate.Pick(fps, new[] { cur }, cur) != null;
-        if (!S.MatchRefreshRate) { SetVideoSync(currentMatches); return; }
+        if (!S.MatchRefreshRate) { ApplyVideoSync(currentMatches); return; }
 
         var original = _refreshGdi != null && _refreshOriginal is { } o ? all.FirstOrDefault(x => x.DevHz == o.DevHz, o) : cur;
         var pick = RefreshRate.Pick(fps, all, cur);
@@ -993,7 +998,7 @@ public partial class MainWindow : FluentWindow
         if (target.DevHz == cur.DevHz)
         {
             if (pick == null && _refreshGdi != null) { _refreshGdi = null; _refreshOriginal = null; }
-            SetVideoSync(pick != null);
+            ApplyVideoSync(pick != null);
             return;
         }
 
@@ -1003,7 +1008,7 @@ public partial class MainWindow : FluentWindow
         if (!RefreshRate.Set(gdi, target.DevHz, out string err))
         {
             if (resume) m.SetProperty("pause", false);
-            SetVideoSync(currentMatches);
+            ApplyVideoSync(currentMatches);
             m.ShowText($"切换刷新率失败（{target.Text} Hz）：{err}", 3000);
             return;
         }
@@ -1018,7 +1023,7 @@ public partial class MainWindow : FluentWindow
             _refreshOriginal = cur;
         }
         SetDisplayFpsOverride(_refreshGdi != null ? target.Hz : 0);
-        SetVideoSync(pick != null);
+        ApplyVideoSync(pick != null);
 
         string fpsText = fps.ToString("0.###", Inv);
         m.ShowText(pick != null
@@ -1033,9 +1038,48 @@ public partial class MainWindow : FluentWindow
         }
     }
 
-    /// <summary>true：按显示器刷新率重采样（刷新率和帧率匹配时）；false：按音频同步。</summary>
-    private void SetVideoSync(bool resample) =>
-        _mpv?.SetProperty("video-sync", resample ? "display-resample" : "audio");
+    /// <summary>
+    /// matched：刷新率和帧率匹配，按显示器重采样（不插值）。否则用这个视频单独选的方式，没选过用全局设置。
+    /// </summary>
+    private void ApplyVideoSync(bool matched)
+    {
+        _refreshMatched = matched;
+        SetSyncMode(matched ? "resample" : FileVideoSync() ?? S.NoMatchSync);
+    }
+
+    /// <summary>"resample" = 按显示器重采样；"interp" = 帧插值 + 按显示器重采样；其它 = 按音频同步。</summary>
+    private void SetSyncMode(string mode)
+    {
+        var m = _mpv;
+        if (m == null) return;
+        m.SetProperty("video-sync", mode is "resample" or "interp" ? "display-resample" : "audio");
+        m.SetProperty("interpolation", mode == "interp" ? "yes" : "no");
+    }
+
+    private static string SyncName(string value) =>
+        SettingsWindow.NoMatchSyncChoices.FirstOrDefault(c => c.Value == value).Name ?? value;
+
+    /// <summary>当前文件单独选的、刷新率匹配不上时的视频同步方式；null = 跟随全局设置。</summary>
+    private string? FileVideoSync()
+    {
+        string? path = _currentPath ?? (_idle ? null : _mpv?.GetString("path"));
+        return path == null ? null : _fileStates.Get(path)?.VideoSync;
+    }
+
+    /// <summary>右键菜单里给当前视频选同步方式（null = 跟随全局设置），记住；刷新率匹配不上时立即生效。</summary>
+    private void SetFileVideoSync(string? value)
+    {
+        var m = _mpv;
+        string? path = _currentPath ?? (_idle ? null : m?.GetString("path"));
+        if (m == null || path == null) return;
+        var st = _fileStates.Get(path) ?? new FileState { LastPlayed = DateTime.UtcNow };
+        st.VideoSync = value;
+        _fileStates.Set(path, st);
+        if (!_refreshMatched) ApplyVideoSync(false);
+        m.ShowText(value == null
+            ? $"本视频的视频同步：跟随全局设置（{SyncName(S.NoMatchSync)}）"
+            : $"本视频的视频同步：{SyncName(value)}");
+    }
 
     /// <summary>
     /// 刷新率改了以后直接告诉 mpv 新的精确值（0 = 让 mpv 自己检测）：嵌入的 mpv 窗口不一定收得到显示模式变化的通知，
@@ -1266,6 +1310,9 @@ public partial class MainWindow : FluentWindow
                 break;
             case "hwdec":
                 if (arg != null) SetFileHwdec(arg == "global" ? null : arg);
+                break;
+            case "vsync":
+                if (arg != null) SetFileVideoSync(arg == "global" ? null : arg);
                 break;
             case "audio-delay-dec": AdjustAudioDelay(-S.SubDelayStepMs); break;
             case "audio-delay-inc": AdjustAudioDelay(S.SubDelayStepMs); break;
@@ -1936,7 +1983,7 @@ public partial class MainWindow : FluentWindow
             _fileStates.Set(output, new FileState
             {
                 Position = st.Position, AudioDelay = st.AudioDelay, SubDelay = st.SubDelay, Hwdec = st.Hwdec,
-                Audio = st.Audio, Sub = st.Sub, LastPlayed = DateTime.UtcNow,
+                VideoSync = st.VideoSync, Audio = st.Audio, Sub = st.Sub, LastPlayed = DateTime.UtcNow,
             });
         }
         _failedPaths.Remove(source);
@@ -2059,6 +2106,22 @@ public partial class MainWindow : FluentWindow
         };
         hwdec.AddRange(SettingsWindow.HwdecChoices.Select(c => new MenuEntry(c.Name, Hp("hwdec", c.Value), Checked: fileHwdec == c.Value)));
         items.Add(new MenuEntry("解码方式（本视频）", Sub: hwdec, Enabled: playing));
+        // 视频同步：刷新率和帧率匹配时固定按显示器重采样，灰掉；匹配不上时可以给这个视频单独选，记住，优先于全局设置
+        if (_refreshMatched && playing)
+        {
+            items.Add(new MenuEntry("视频同步（刷新率已匹配，按显示器重采样）", Enabled: false));
+        }
+        else
+        {
+            string? fileSync = FileVideoSync();
+            var sync = new List<MenuEntry>
+            {
+                new($"跟随全局设置（{SyncName(S.NoMatchSync)}）", Hp("vsync", "global"), Checked: playing && fileSync == null),
+                Sep,
+            };
+            sync.AddRange(SettingsWindow.NoMatchSyncChoices.Select(c => new MenuEntry(c.Name, Hp("vsync", c.Value), Checked: fileSync == c.Value)));
+            items.Add(new MenuEntry("视频同步（本视频）", Sub: sync, Enabled: playing && _refreshChecked));
+        }
         items.Add(Sep);
         items.Add(new MenuEntry("播放列表", Hp("playlist"), "P", Checked: PlaylistPanel.Visibility == Visibility.Visible, Enabled: !_fullscreen));
         items.Add(new MenuEntry("全屏", Hp("fullscreen"), "F / 双击", Checked: _fullscreen));
@@ -2395,6 +2458,8 @@ public partial class MainWindow : FluentWindow
         S.Save();
         ApplyPlaybackOptions(m, initial: false);
         if (dvChanged) m.SetProperty("vf", DolbyVisionFilter());
+        // 全局的“无匹配时的视频同步”改了：当前视频匹配不上刷新率、又没单独选过的，马上用新的
+        if (!refreshToggled && !_idle && _refreshChecked && !_refreshMatched) ApplyVideoSync(false);
         if (refreshToggled)
         {
             // 关掉：马上还原；之后（或者打开时）对当前视频重新判断一次刷新率和同步方式
@@ -2495,12 +2560,10 @@ public partial class MainWindow : FluentWindow
             {
                 Head("渲染输出");
                 Line("VO", $"{P("current-vo")}  API {P("gpu-api")}");
-                Line("视频同步", P("video-sync") switch
-                {
-                    "display-resample" => "按显示器刷新率重采样（刷新率和帧率匹配）",
-                    "audio" => "按音频同步（刷新率和帧率不匹配）",
-                    var x => x,
-                });
+                Line("视频同步", _refreshMatched ? "按显示器刷新率重采样（刷新率和帧率匹配）"
+                    : P("video-sync") == "display-resample" && m.GetFlag("interpolation") == true ? "帧插值 + 按显示器刷新率重采样（刷新率和帧率不匹配）"
+                    : P("video-sync") == "audio" ? "按音频同步（刷新率和帧率不匹配）"
+                    : P("video-sync"));
                 Line("输出色彩", $"{P("video-target-params/primaries")} / {P("video-target-params/gamma")}  峰值 {P("video-target-params/max-luma")} nit");
                 Line("HDR 输出", _hdrOn ? $"开  目标峰值 {Math.Round(DisplayPeak())} nit" : "关（色调映射到 SDR）");
                 Line("色调映射", $"{P("tone-mapping")}  峰值检测 {P("hdr-compute-peak")}  色域映射 {P("gamut-mapping-mode")}");

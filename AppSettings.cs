@@ -32,9 +32,14 @@ internal sealed class AppSettings
     public bool Deband { get; set; } = false;
     /// <summary>
     /// 开始播放时按视频帧率把显示器切到整数倍（或近似）的刷新率，切换文件时重新匹配，退出时还原。
-    /// 视频同步不再单独设置：刷新率和帧率匹配时按显示器重采样，不匹配时按音频同步（见 MainWindow.MaybeMatchRefresh）。
+    /// 刷新率和帧率匹配时一律按显示器重采样；不匹配时用 <see cref="NoMatchSync"/>（见 MainWindow.MaybeMatchRefresh）。
     /// </summary>
     public bool MatchRefreshRate { get; set; } = true;
+    /// <summary>
+    /// 刷新率和帧率匹配不上时的视频同步方式："audio" = 按音频同步；"interp" = 帧插值 + 按显示器刷新率重采样。
+    /// 每个文件可以在右键菜单里单独选（记在 file-states.json），优先于这里。
+    /// </summary>
+    public string NoMatchSync { get; set; } = "audio";
     public bool ExactSeek { get; set; } = true;
 
     // ---- 音频 ----

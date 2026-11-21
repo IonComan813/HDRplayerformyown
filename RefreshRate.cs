@@ -9,9 +9,10 @@ namespace HdrPlayer;
 /// <item>支持哪些刷新率：EnumDisplaySettingsEx 列出当前分辨率下的模式（系统按 EDID + 显卡驱动给出，
 /// 包括在显卡控制面板里加的自定义分辨率），只有整数，59.94 写成 59；精确值用 DXGI 的模式列表补上，
 /// 拿不到时按惯例把 23 / 29 / 47 / 59 / 71 / 119 / 143 / 239 当成 ×1000/1001 的 NTSC 刷新率。</item>
-/// <item>选哪个：帧率的整数倍，刷新率不低于 48 Hz（24 / 25 / 30 帧至少 ×2）。恰好整数倍（误差 &lt; 0.05%）优先，
+/// <item>选哪个：帧率的整数倍，刷新率不低于 47.952 Hz（24 / 25 / 30 帧至少 ×2）。恰好整数倍（误差 &lt; 0.05%）优先，
 /// 其次是近似的（误差 &lt; 0.5%，例如 119.88 帧用 120 Hz；mpv 的“按显示器重采样”会把这点差别补上）；
-/// 同一档里优先保持当前刷新率，其次选最高的。都没有就用原来的刷新率。不设置自定义刷新率。</item>
+/// 同一档里优先保持当前刷新率（免得多黑屏一次），其次选最低的（刷新率越高越耗电，看视频用不上）。
+/// 都没有就用原来的刷新率。不设置自定义刷新率。</item>
 /// <item>怎么切：ChangeDisplaySettingsEx + CDS_FULLSCREEN，只是临时改，不写进系统设置；
 /// 退出时还原，万一程序崩溃，注销 / 重启后也会恢复成原来的。</item>
 /// </list>
@@ -26,8 +27,8 @@ internal static class RefreshRate
             : Hz.ToString("0.###", CultureInfo.InvariantCulture);
     }
 
-    /// <summary>刷新率不低于这个值（低帧率视频至少 ×2，免得切到 24 / 25 / 30 Hz 这种会闪、鼠标也卡的刷新率）。</summary>
-    public const double MinHz = 47.5;
+    /// <summary>刷新率不低于 47.952 Hz（= 48 × 1000/1001；低帧率视频至少 ×2，免得切到 24 / 25 / 30 Hz 这种会闪、鼠标也卡的刷新率）。</summary>
+    public const double MinHz = 47.9;
     /// <summary>误差小于它算“恰好整数倍”。23.976 × 3 = 71.928：恰好；24 × 3 = 72 对 71.928：差 0.1%，算近似。</summary>
     public const double ExactTolerance = 0.0005;
     /// <summary>误差小于它算“近似”：mpv 的 display-resample 默认最多改 1% 的速度，这里留一半余量。</summary>
@@ -35,7 +36,7 @@ internal static class RefreshRate
 
     /// <summary>
     /// 为 fps 帧的视频挑刷新率。返回 null = 没有合适的（调用方用原来的刷新率）。
-    /// current 是现在的刷新率：同一档里优先保持它，免得没必要地切一次（黑屏一下）。
+    /// current 是现在的刷新率：同一档里优先保持它，免得没必要地切一次（黑屏一下）；其次选最低的。
     /// </summary>
     public static Mode? Pick(double fps, IReadOnlyList<Mode> modes, Mode? current)
     {
@@ -52,7 +53,7 @@ internal static class RefreshRate
             if (tier < 0) continue;
             bool better = best == null || tier < bestTier ||
                           (tier == bestTier && !IsSame(best.Value, current) &&
-                           (IsSame(m, current) || m.Hz > best.Value.Hz));
+                           (IsSame(m, current) || m.Hz < best.Value.Hz));
             if (better) { best = m; bestTier = tier; }
         }
         return best;
