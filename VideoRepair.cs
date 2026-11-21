@@ -54,7 +54,11 @@ internal sealed class VideoRepair
         return null;
     }
 
-    public void Cancel() => _cts?.Cancel();
+    public void Cancel()
+    {
+        _cts?.Cancel();
+        _checkCts?.Cancel();
+    }
 
     /// <summary>退出程序时调用：结束 ffmpeg，删掉没写完的文件。</summary>
     public void KillNow()
@@ -70,6 +74,184 @@ internal sealed class VideoRepair
         }
         catch { }
         if (_partFile != null) try { File.Delete(_partFile); } catch { }
+    }
+
+    // ------------------------------------------------------------------ 修复前的快速检查
+
+    /// <summary>
+    /// 检查结果。Readable = false：ffprobe 打不开，重新封装也救不了（Error 是给用户看的说明）。
+    /// Issues 为空表示没发现问题（只查了文件头、开头 30 秒和结尾附近，不保证整个文件都没问题）。
+    /// </summary>
+    public sealed record Check(bool Readable, string Error, List<string> Issues, bool Cancelled = false);
+
+    /// <summary>扩展名 → ffprobe 的 format_name 里应该出现的名字（用来发现“扩展名和实际格式不符”）。</summary>
+    private static readonly Dictionary<string, string> ExtFormats = new(StringComparer.OrdinalIgnoreCase)
+    {
+        [".mkv"] = "matroska", [".webm"] = "matroska", [".mka"] = "matroska",
+        [".mp4"] = "mp4", [".m4v"] = "mp4", [".mov"] = "mov", [".3gp"] = "3gp",
+        [".ts"] = "mpegts", [".m2ts"] = "mpegts", [".mts"] = "mpegts", [".m2t"] = "mpegts",
+        [".avi"] = "avi", [".flv"] = "flv", [".wmv"] = "asf", [".asf"] = "asf",
+        [".mpg"] = "mpeg", [".mpeg"] = "mpeg", [".vob"] = "mpeg",
+    };
+
+    private CancellationTokenSource? _checkCts;
+
+    /// <summary>
+    /// 快速检查文件是不是真的需要修复（一般几秒）：能不能读、有没有时长、扩展名对不对、
+    /// 开头 30 秒的时间戳是否连续、有没有损坏的包，以及能不能跳到结尾附近（缺索引 / 被截断时跳不过去或很慢）。
+    /// </summary>
+    public async Task<Check> CheckAsync(string input)
+    {
+        string? ffprobe = FindFfprobe();
+        if (ffprobe == null) return new(false, "没有找到 ffprobe。", new());
+        _checkCts = new CancellationTokenSource();
+        var ct = _checkCts.Token;
+        var issues = new List<string>();
+        var inv = CultureInfo.InvariantCulture;
+        try
+        {
+            // ---- 文件头 ----
+            var (code, json, err) = await RunTimed(ffprobe, new[]
+            {
+                "-v", "error", "-hide_banner", "-show_entries",
+                "format=duration,start_time,format_name:stream=index,codec_type", "-of", "json", input,
+            }, 30, ct);
+            if (ct.IsCancellationRequested) return new(false, "", issues, Cancelled: true);
+            if (code == TimedOut) return new(true, "", new() { "读取文件头超过 30 秒还没完成，文件可能损坏" });
+
+            double duration = 0, start = 0;
+            string format = "";
+            var av = new HashSet<int>();
+            try
+            {
+                using var doc = JsonDocument.Parse(json);
+                var root = doc.RootElement;
+                if (root.TryGetProperty("streams", out var arr) && arr.ValueKind == JsonValueKind.Array)
+                    foreach (var s in arr.EnumerateArray())
+                        if (s.TryGetProperty("index", out var ix) && ix.TryGetInt32(out int n) &&
+                            s.TryGetProperty("codec_type", out var t) && t.GetString() is "video" or "audio")
+                            av.Add(n);
+                if (root.TryGetProperty("format", out var f))
+                {
+                    if (f.TryGetProperty("duration", out var d)) double.TryParse(d.GetString(), NumberStyles.Float, inv, out duration);
+                    if (f.TryGetProperty("start_time", out var st)) double.TryParse(st.GetString(), NumberStyles.Float, inv, out start);
+                    if (f.TryGetProperty("format_name", out var fn)) format = fn.GetString() ?? "";
+                }
+            }
+            catch { }
+            if (code != 0 || av.Count == 0) return new(false, code != 0 ? ProbeError(err) : "这个文件里没有找到可用的视频 / 音频流，无法修复。", issues);
+
+            if (FirstLine(err) is { } headErr) issues.Add("读取文件头时报错：" + headErr);
+            if (duration <= 0) issues.Add("文件里没有时长信息（进度条可能拖不动、总时长显示不对）");
+            if (ExtFormats.TryGetValue(Path.GetExtension(input), out var expect) &&
+                !format.Split(',').Any(x => x.Equals(expect, StringComparison.OrdinalIgnoreCase)))
+                issues.Add($"扩展名是 {Path.GetExtension(input).ToLowerInvariant()}，实际格式却是 {format.Split(',')[0]}");
+
+            // ---- 开头 30 秒的包：时间戳缺失 / 倒退 / 大跳变、损坏标记 ----
+            (code, string pk, err) = await RunTimed(ffprobe, new[]
+            {
+                "-v", "error", "-hide_banner", "-read_intervals", "%+30",
+                "-show_entries", "packet=stream_index,pts_time,dts_time,flags", "-of", "compact=p=0", input,
+            }, 30, ct);
+            if (ct.IsCancellationRequested) return new(false, "", issues, Cancelled: true);
+            if (code == TimedOut) issues.Add("读取开头 30 秒的数据超过 30 秒还没完成");
+            else
+            {
+                int missing = 0, backwards = 0, jumps = 0, corrupt = 0;
+                var lastDts = new Dictionary<int, double>();
+                foreach (var line in pk.Split('\n'))
+                {
+                    var kv = line.Trim().Split('|').Select(p => p.Split('=', 2)).Where(p => p.Length == 2)
+                        .ToDictionary(p => p[0], p => p[1]);
+                    if (!kv.TryGetValue("stream_index", out var si) || !int.TryParse(si, out int idx) || !av.Contains(idx)) continue;
+                    if (kv.GetValueOrDefault("flags", "").Contains('C')) corrupt++;
+                    string ts = kv.GetValueOrDefault("dts_time", "N/A");
+                    if (ts == "N/A") ts = kv.GetValueOrDefault("pts_time", "N/A");
+                    if (!double.TryParse(ts, NumberStyles.Float, inv, out double dts)) { missing++; continue; }
+                    if (lastDts.TryGetValue(idx, out double prev))
+                    {
+                        if (dts < prev - 0.001) backwards++;
+                        else if (dts - prev > 10) jumps++;
+                    }
+                    lastDts[idx] = dts;
+                }
+                if (corrupt > 0) issues.Add($"开头 30 秒里有 {corrupt} 个标记为损坏的数据包");
+                if (backwards > 0) issues.Add($"开头 30 秒里时间戳倒退了 {backwards} 次（可能导致音画不同步、卡住）");
+                if (jumps > 0) issues.Add($"开头 30 秒里时间戳跳变了 {jumps} 次（超过 10 秒）");
+                if (missing > 0) issues.Add($"开头 30 秒里有 {missing} 个数据包没有时间戳");
+                int errCount = err.Split('\n').Count(l => l.Trim().Length > 0);
+                if (errCount > 0) issues.Add($"读取开头 30 秒时报错 {errCount} 次，例如：{FirstLine(err)}");
+            }
+
+            // ---- 跳到结尾附近：缺索引时很慢或跳不过去，被截断时那里没有数据 ----
+            if (duration > 60)
+            {
+                double target = start + duration * 0.95;
+                (code, pk, err) = await RunTimed(ffprobe, new[]
+                {
+                    "-v", "error", "-hide_banner", "-read_intervals", target.ToString("0.###", inv) + "%+#30",
+                    "-show_entries", "packet=stream_index,pts_time,dts_time", "-of", "compact=p=0", input,
+                }, 15, ct);
+                if (ct.IsCancellationRequested) return new(false, "", issues, Cancelled: true);
+                if (code == TimedOut)
+                {
+                    issues.Add("跳到结尾附近超过 15 秒还没完成，文件可能缺少索引（拖动进度条会很慢）");
+                }
+                else
+                {
+                    double max = double.NegativeInfinity;
+                    foreach (var line in pk.Split('\n'))
+                        foreach (var part in line.Trim().Split('|'))
+                            if ((part.StartsWith("pts_time=") || part.StartsWith("dts_time=")) &&
+                                double.TryParse(part[9..], NumberStyles.Float, inv, out double v))
+                                max = Math.Max(max, v);
+                    if (double.IsNegativeInfinity(max))
+                        issues.Add("读不到结尾附近的数据：文件可能被截断，总时长显示不对");
+                    else if (max < start + duration * 0.5)
+                        issues.Add($"跳不到结尾附近（目标 {Hms(target - start)}，实际只到 {Hms(max - start)}）：文件可能被截断或缺少索引，总时长显示不对");
+                    else if (err.Contains("ended prematurely", StringComparison.OrdinalIgnoreCase) ||
+                             err.Contains("Could not seek", StringComparison.OrdinalIgnoreCase))
+                        issues.Add("读取结尾附近时报错：" + FirstLine(err));
+                }
+            }
+            return new(true, "", issues);
+        }
+        catch (Exception ex)
+        {
+            return new(true, "", new() { "检查时出错：" + ex.Message });
+        }
+        finally
+        {
+            _checkCts.Dispose();
+            _checkCts = null;
+        }
+    }
+
+    private const int TimedOut = int.MinValue;
+
+    /// <summary>带超时地运行；超时返回 TimedOut，用户取消返回 -1（调用方看 ct）。</summary>
+    private async Task<(int Code, string Out, string Err)> RunTimed(string exe, string[] args, int seconds, CancellationToken ct)
+    {
+        using var t = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        t.CancelAfter(TimeSpan.FromSeconds(seconds));
+        var r = await RunProcess(exe, args, null, t.Token);
+        return t.IsCancellationRequested && !ct.IsCancellationRequested ? (TimedOut, "", "") : r;
+    }
+
+    private static string? FirstLine(string log)
+    {
+        var line = log.Split('\n').Select(l => l.Trim()).FirstOrDefault(l => l.Length > 0);
+        if (line == null) return null;
+        // 去掉 “[h264 @ 0x55...] ” 这样的前缀
+        int b = line.StartsWith('[') ? line.IndexOf("] ", StringComparison.Ordinal) : -1;
+        if (b > 0) line = line[(b + 2)..];
+        return line.Length > 120 ? line[..120] + "…" : line;
+    }
+
+    private static string Hms(double seconds)
+    {
+        var t = TimeSpan.FromSeconds(Math.Max(0, Math.Floor(seconds)));
+        return $"{(int)t.TotalHours:00}:{t.Minutes:00}:{t.Seconds:00}";
     }
 
     /// <summary>

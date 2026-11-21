@@ -69,7 +69,7 @@
                             <ui:Button x:Name="BtnPlClose" Appearance="Transparent" BorderThickness="0" Padding="8,6" ToolTip="关闭 (P)" Icon="{ui:SymbolIcon Dismiss24}" />
                         </StackPanel>
                     </Grid>
-                    <!-- Ctrl / Shift 多选；正在播放的那一项用强调色的文字和缩略图边框表示 -->
+                    <!-- Ctrl / Shift 多选；正在播放的那一项用强调色的文字表示，进度处显示“播放中” -->
                     <ListBox
                         x:Name="PlaylistBox"
                         Margin="4,0,4,6"
@@ -93,8 +93,6 @@
                                         Height="67"
                                         VerticalAlignment="Top"
                                         Background="#FF161616"
-                                        BorderBrush="Transparent"
-                                        BorderThickness="2"
                                         CornerRadius="5">
                                         <Grid>
                                             <ui:SymbolIcon
@@ -109,7 +107,7 @@
                                         </Grid>
                                     </Border>
                                     <!-- 文件名在上（自动换行，最多 3 行，再长就在第 3 行末尾显示…，整行高度不超过缩略图），
-                                         进度在下、和缩略图底边对齐。3 × 16 + 2 + 进度一行 ≈ 缩略图高 67 -->
+                                         进度在下、和缩略图底边对齐，两者左对齐。3 × 16 + 2 + 进度一行 ≈ 缩略图高 67 -->
                                     <Grid Grid.Column="1" Margin="10,0,2,0">
                                         <Grid.RowDefinitions>
                                             <RowDefinition Height="Auto" />
@@ -132,7 +130,7 @@
                                             x:Name="ProgressText"
                                             Grid.Row="2"
                                             Margin="0,0,0,1"
-                                            HorizontalAlignment="Right"
+                                            HorizontalAlignment="Left"
                                             FontSize="11"
                                             FontFamily="Segoe UI"
                                             Foreground="{DynamicResource TextFillColorSecondaryBrush}"
@@ -141,11 +139,10 @@
                                             x:Name="FailedText"
                                             Grid.Row="2"
                                             Margin="0,0,0,1"
-                                            HorizontalAlignment="Right"
+                                            HorizontalAlignment="Left"
                                             FontSize="11"
                                             Foreground="{DynamicResource SystemFillColorCautionBrush}"
                                             Text="无法打开，可右键 → 修复视频"
-                                            TextAlignment="Right"
                                             TextWrapping="Wrap"
                                             Visibility="Collapsed" />
                                     </Grid>
@@ -162,7 +159,6 @@
                                     <DataTrigger Binding="{Binding Current}" Value="True">
                                         <Setter TargetName="Label" Property="Foreground" Value="{DynamicResource AccentTextFillColorPrimaryBrush}" />
                                         <Setter TargetName="Label" Property="FontWeight" Value="SemiBold" />
-                                        <Setter TargetName="ThumbFrame" Property="BorderBrush" Value="{DynamicResource AccentTextFillColorPrimaryBrush}" />
                                         <Setter TargetName="ProgressText" Property="Foreground" Value="{DynamicResource AccentTextFillColorPrimaryBrush}" />
                                     </DataTrigger>
                                 </DataTemplate.Triggers>
