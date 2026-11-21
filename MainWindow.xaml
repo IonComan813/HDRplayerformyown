@@ -108,17 +108,23 @@
                                                 Stretch="Uniform" />
                                         </Grid>
                                     </Border>
-                                    <!-- 文件名在上（自动换行），进度在下、和缩略图底边对齐 -->
+                                    <!-- 文件名在上（自动换行，最多 3 行，再长就在第 3 行末尾显示…，整行高度不超过缩略图），
+                                         进度在下、和缩略图底边对齐。3 × 16 + 2 + 进度一行 ≈ 缩略图高 67 -->
                                     <Grid Grid.Column="1" Margin="10,0,2,0">
                                         <Grid.RowDefinitions>
                                             <RowDefinition Height="Auto" />
-                                            <RowDefinition Height="*" MinHeight="4" />
+                                            <RowDefinition Height="*" MinHeight="2" />
                                             <RowDefinition Height="Auto" />
                                         </Grid.RowDefinitions>
                                         <TextBlock
                                             x:Name="Label"
                                             Grid.Row="0"
+                                            MaxHeight="48"
+                                            FontSize="13"
+                                            LineHeight="16"
+                                            LineStackingStrategy="BlockLineHeight"
                                             Text="{Binding Display}"
+                                            TextTrimming="CharacterEllipsis"
                                             TextWrapping="Wrap"
                                             ToolTip="{Binding Path}" />
                                         <!-- 上次的进度 / 片长，正在播放时显示“播放中” -->
