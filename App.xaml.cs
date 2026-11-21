@@ -81,4 +81,23 @@ internal static class Dialogs
         }
         try { await box.ShowDialogAsync(); } catch (TaskCanceledException) { }
     }
+
+    /// <summary>带“确定 / 取消”两个按钮的对话框，点了主按钮返回 true。</summary>
+    public static async Task<bool> ConfirmAsync(Window? owner, string title, string text, string okText)
+    {
+        var box = new Wpf.Ui.Controls.MessageBox
+        {
+            Title = title,
+            Content = new System.Windows.Controls.TextBlock { Text = text, TextWrapping = TextWrapping.Wrap, MaxWidth = 520 },
+            PrimaryButtonText = okText,
+            CloseButtonText = "取消",
+        };
+        if (owner is { IsVisible: true })
+        {
+            box.Owner = owner;
+            box.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+        }
+        try { return await box.ShowDialogAsync() == Wpf.Ui.Controls.MessageBoxResult.Primary; }
+        catch (TaskCanceledException) { return false; }
+    }
 }
