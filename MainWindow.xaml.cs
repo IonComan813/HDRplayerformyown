@@ -107,6 +107,8 @@ public partial class MainWindow : FluentWindow
     private DispatcherTimer? _subSyncOsd;
     private readonly VideoRepair _repair = new();
     private DispatcherTimer? _repairOsd;
+    /// <summary>修复前的快速检查进行中（这时还不算 _repair.Running）。</summary>
+    private bool _repairChecking;
     /// <summary>解除静音时恢复到的音量（静音 = 音量 0，不单独用 mpv 的 mute）。</summary>
     private const double UnmuteVolume = 5;
 
@@ -234,7 +236,7 @@ public partial class MainWindow : FluentWindow
         PlMenuInfo.Click += (_, _) => { if (PlaylistBox.SelectedItem is PlaylistEntry e) ShowEntryInfo(e); };
         PlMenuRepair.Click += (_, _) =>
         {
-            if (_repair.Running) _repair.Cancel();
+            if (_repair.Running || _repairChecking) _repair.Cancel();
             else if (PlaylistBox.SelectedItem is PlaylistEntry e) StartRepair(e.Path);
         };
         PlaylistBox.ContextMenuOpening += OnPlaylistMenuOpening;
@@ -1481,8 +1483,8 @@ public partial class MainWindow : FluentWindow
         PlMenuPlay.Visibility = PlMenuReveal.Visibility = PlMenuSep.Visibility = PlMenuRepair.Visibility = PlMenuInfo.Visibility = single;
         PlMenuRemove.Header = multi ? $"移除选中的 {n} 项" : "移除";
         string? path = (PlaylistBox.SelectedItem as PlaylistEntry)?.Path;
-        PlMenuRepair.Header = _repair.Running ? "取消修复视频" : "修复视频（重新封装）…";
-        PlMenuRepair.IsEnabled = _repair.Running || (path != null && File.Exists(path));
+        PlMenuRepair.Header = _repair.Running || _repairChecking ? "取消修复视频" : "修复视频（重新封装）…";
+        PlMenuRepair.IsEnabled = _repair.Running || _repairChecking || (path != null && File.Exists(path));
     }
 
     private void PlaySelected()
@@ -1714,6 +1716,34 @@ public partial class MainWindow : FluentWindow
                 "自己编译的话可以把 ffmpeg.exe / ffprobe.exe 放进 PATH。");
             return;
         }
+        if (_repairChecking) return;
+
+        // 先快速检查一下是不是真的需要修复：看起来正常就先提示一下，用户仍然要修再继续
+        _repairChecking = true;
+        VideoRepair.Check check;
+        m.ShowText($"正在检查 {Path.GetFileName(source)} 是否需要修复…\n（右键 → 取消修复视频）", 60000);
+        try { check = await _repair.CheckAsync(source); }
+        finally { _repairChecking = false; }
+        m.ShowText("", 1);
+        if (_shuttingDown || _mpv == null || check.Cancelled) return;
+        if (!check.Readable)
+        {
+            await Dialogs.ShowAsync(this, "修复视频", check.Error);
+            return;
+        }
+        var issues = check.Issues;
+        // 正在播放的文件：mpv 自己也说跳不了，那就是缺索引
+        if (!_idle && SamePath(m.GetString("path"), source) && m.GetFlag("seekable") == false)
+            issues.Insert(0, "播放器无法在这个文件里跳转（拖不动进度条）");
+        if (issues.Count == 0)
+        {
+            bool still = await Dialogs.ConfirmAsync(this, "这个文件看起来是正常的",
+                $"检查了 {Path.GetFileName(source)}：文件头、时长、格式、开头 30 秒的时间戳和数据包、跳到结尾附近，都没有发现问题。\n\n" +
+                "对正常的文件，修复不会带来任何改善，只会多出一份内容一样的 MKV。\n" +
+                "这个检查只看了文件头、开头和结尾附近；如果播放时确实有问题（比如中间某段卡住、音画不同步），仍然可以修复试试。",
+                "仍然修复");
+            if (!still || _shuttingDown || _mpv == null) return;
+        }
 
         // 输出：原文件旁边的“原名.repaired.mkv”（已存在就加序号）；目录不可写时让用户选位置
         string name = Path.GetFileNameWithoutExtension(source);
@@ -1745,8 +1775,9 @@ public partial class MainWindow : FluentWindow
 
         long size = 0;
         try { size = new FileInfo(source).Length; } catch { }
+        string found = issues.Count == 0 ? "" : "检查发现：\n" + string.Join("\n", issues.Select(i => "· " + i)) + "\n\n";
         bool go = await Dialogs.ConfirmAsync(this, "修复视频",
-            $"把 {Path.GetFileName(source)} 重新封装成 MKV（不重新编码，画质不变），另存为：\n{output}\n\n" +
+            found + $"把 {Path.GetFileName(source)} 重新封装成 MKV（不重新编码，画质不变），另存为：\n{output}\n\n" +
             $"原文件不会改动。需要大约 {VideoRepair.FormatSize(size)} 的空间，耗时主要取决于硬盘速度。\n\n" +
             "能修好：拖不动进度条、时长显示不对、时间戳错乱导致的音画不同步或卡住、电视录像（TS）里的坏包、扩展名和实际格式不符。\n" +
             "修不好：画面本身花屏 / 马赛克；录制中断、缺少索引（moov）的 MP4 / MOV。",
@@ -1861,7 +1892,7 @@ public partial class MainWindow : FluentWindow
             new("重新载入当前文件", Hp("reload"), "F5", Enabled: playing),
         };
         // 修复视频：只针对正在播放的文件；打不开的文件在播放列表里右键修复
-        items.Add(_repair.Running
+        items.Add(_repair.Running || _repairChecking
             ? new MenuEntry("取消修复视频", Hp("repair-cancel"))
             : new MenuEntry("修复视频（重新封装）…", Hp("repair"), Enabled: RepairTarget() != null));
         items.Add(Sep);
