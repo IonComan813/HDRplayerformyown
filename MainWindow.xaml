@@ -108,21 +108,41 @@
                                                 Stretch="Uniform" />
                                         </Grid>
                                     </Border>
-                                    <StackPanel Grid.Column="1" Margin="10,0,2,0" VerticalAlignment="Center">
+                                    <!-- 文件名在上（自动换行），进度在下、和缩略图底边对齐 -->
+                                    <Grid Grid.Column="1" Margin="10,0,2,0">
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="*" MinHeight="4" />
+                                            <RowDefinition Height="Auto" />
+                                        </Grid.RowDefinitions>
                                         <TextBlock
                                             x:Name="Label"
+                                            Grid.Row="0"
                                             Text="{Binding Display}"
                                             TextWrapping="Wrap"
                                             ToolTip="{Binding Path}" />
+                                        <!-- 上次的进度 / 片长，正在播放时显示“播放中” -->
+                                        <TextBlock
+                                            x:Name="ProgressText"
+                                            Grid.Row="2"
+                                            Margin="0,0,0,1"
+                                            HorizontalAlignment="Right"
+                                            FontSize="11"
+                                            FontFamily="Segoe UI"
+                                            Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                            Text="{Binding Progress}" />
                                         <TextBlock
                                             x:Name="FailedText"
-                                            Margin="0,3,0,0"
+                                            Grid.Row="2"
+                                            Margin="0,0,0,1"
+                                            HorizontalAlignment="Right"
                                             FontSize="11"
                                             Foreground="{DynamicResource SystemFillColorCautionBrush}"
                                             Text="无法打开，可右键 → 修复视频"
+                                            TextAlignment="Right"
                                             TextWrapping="Wrap"
                                             Visibility="Collapsed" />
-                                    </StackPanel>
+                                    </Grid>
                                 </Grid>
                                 <DataTemplate.Triggers>
                                     <DataTrigger Binding="{Binding IsAudio}" Value="True">
@@ -131,11 +151,13 @@
                                     <DataTrigger Binding="{Binding Failed}" Value="True">
                                         <Setter TargetName="Placeholder" Property="Symbol" Value="VideoClipOff24" />
                                         <Setter TargetName="FailedText" Property="Visibility" Value="Visible" />
+                                        <Setter TargetName="ProgressText" Property="Visibility" Value="Collapsed" />
                                     </DataTrigger>
                                     <DataTrigger Binding="{Binding Current}" Value="True">
                                         <Setter TargetName="Label" Property="Foreground" Value="{DynamicResource AccentTextFillColorPrimaryBrush}" />
                                         <Setter TargetName="Label" Property="FontWeight" Value="SemiBold" />
                                         <Setter TargetName="ThumbFrame" Property="BorderBrush" Value="{DynamicResource AccentTextFillColorPrimaryBrush}" />
+                                        <Setter TargetName="ProgressText" Property="Foreground" Value="{DynamicResource AccentTextFillColorPrimaryBrush}" />
                                     </DataTrigger>
                                 </DataTemplate.Triggers>
                             </DataTemplate>

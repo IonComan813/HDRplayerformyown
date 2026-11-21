@@ -25,8 +25,8 @@ internal sealed class PlaylistThumbs : IDisposable
         None,
     }
 
-    /// <summary>(路径, 请求的位置, 结果, 图像) —— 在后台线程触发，图像已 Freeze。</summary>
-    public event Action<string, double, Kind, BitmapSource?>? Ready;
+    /// <summary>(路径, 请求的位置, 结果, 图像, 片长秒数（不知道为 0）) —— 在后台线程触发，图像已 Freeze。</summary>
+    public event Action<string, double, Kind, BitmapSource?, double>? Ready;
 
     /// <summary>缩略图的最大像素尺寸：播放列表里显示成 112 × 63（DIP），高 DPI 屏上也够清晰。</summary>
     public const int MaxW = 256, MaxH = 144;
@@ -82,20 +82,21 @@ internal sealed class PlaylistThumbs : IDisposable
                 }
                 Kind kind = Kind.None;
                 BitmapSource? bmp = null;
-                try { (kind, bmp) = Make(job.Path, job.Pos); }
+                double duration = 0;
+                try { (kind, bmp, duration) = Make(job.Path, job.Pos); }
                 catch (OperationCanceledException) { return; }
                 catch (Exception ex) { System.Diagnostics.Debug.WriteLine("playlist-thumbs: " + ex); }
                 if (_stop) return;
-                Ready?.Invoke(job.Path, job.Pos, kind, bmp);
+                Ready?.Invoke(job.Path, job.Pos, kind, bmp, duration);
             }
             // 做完一批就关掉文件，免得占着文件句柄（资源管理器里删不掉 / 改不了名）
             try { _mpv?.Command("stop"); } catch { }
         }
     }
 
-    private (Kind, BitmapSource?) Make(string path, double pos)
+    private (Kind, BitmapSource?, double) Make(string path, double pos)
     {
-        if (!File.Exists(path)) return (Kind.None, null);
+        if (!File.Exists(path)) return (Kind.None, null, 0);
         Directory.CreateDirectory(Dir);
         if (!_cleaned) { _cleaned = true; Cleanup(); }
 
@@ -104,15 +105,18 @@ internal sealed class PlaylistThumbs : IDisposable
         string tag = pos > 0 ? Math.Round(pos * 1000).ToString(CultureInfo.InvariantCulture) : "d";
         string jpg = Path.Combine(Dir, $"{key}_{tag}.jpg");
         string noVideo = Path.Combine(Dir, $"{key}.novideo");
+        // 片长单独存一个小文件（播放列表里显示“进度/片长”），和截图位置无关
+        string durFile = Path.Combine(Dir, $"{key}.dur");
+        double knownDur = ReadDuration(durFile);
 
-        if (File.Exists(noVideo)) return (Kind.NoVideo, null);
-        if (File.Exists(jpg))
+        if (File.Exists(noVideo) && knownDur > 0) return (Kind.NoVideo, null, knownDur);
+        if (File.Exists(jpg) && knownDur > 0)
         {
             var cached = LoadJpeg(jpg);
             if (cached != null)
             {
-                try { File.SetLastWriteTimeUtc(jpg, DateTime.UtcNow); } catch { }
-                return (Kind.Image, cached);
+                try { File.SetLastWriteTimeUtc(jpg, DateTime.UtcNow); File.SetLastWriteTimeUtc(durFile, DateTime.UtcNow); } catch { }
+                return (Kind.Image, cached, knownDur);
             }
         }
         // 同一个文件之前别的位置的截图：作废
@@ -124,20 +128,23 @@ internal sealed class PlaylistThumbs : IDisposable
         _loaded.Reset();
         _restart.Reset();
         m.Command("loadfile", path, "replace");
-        if (!_loaded.Wait(10000, _cts.Token)) return (Kind.None, null);
-        if (_loadFailed) return (Kind.Failed, null);
+        if (!_loaded.Wait(10000, _cts.Token)) return (Kind.None, null, 0);
+        if (_loadFailed) return (Kind.Failed, null, 0);
         _restart.Wait(5000, _cts.Token);
+
+        double duration = m.GetDouble("duration") ?? 0;
+        if (duration > 0)
+            try { File.WriteAllText(durFile, duration.ToString("R", CultureInfo.InvariantCulture)); } catch { }
 
         bool hasVideo = !string.IsNullOrEmpty(m.GetString("video-codec")) && m.GetFlag("current-tracks/video/image") != true;
         if (!hasVideo)
         {
             try { File.WriteAllBytes(noVideo, Array.Empty<byte>()); } catch { }
-            return (Kind.NoVideo, null);
+            return (Kind.NoVideo, null, duration);
         }
         // 杜比视界 P5 的画面要靠 RPU 重塑才有正确颜色，软件截图不做这一步，会偏绿 / 偏紫
-        if (m.GetString("current-tracks/video/dolby-vision-profile") == "5") return (Kind.None, null);
+        if (m.GetString("current-tracks/video/dolby-vision-profile") == "5") return (Kind.None, null, duration);
 
-        double duration = m.GetDouble("duration") ?? 0;
         double at = pos > 0 ? pos : duration * 0.1;
         if (duration > 0) at = Math.Min(at, Math.Max(0, duration - 1));
         if (at > 0.5)
@@ -147,9 +154,21 @@ internal sealed class PlaylistThumbs : IDisposable
             _restart.Wait(5000, _cts.Token);
         }
         var bmp = Thumbnailer.Grab(m);
-        if (bmp == null) return (Kind.None, null);
+        if (bmp == null) return (Kind.None, null, duration);
         SaveJpeg(bmp, jpg);
-        return (Kind.Image, bmp);
+        return (Kind.Image, bmp, duration);
+    }
+
+    private static double ReadDuration(string file)
+    {
+        try
+        {
+            return File.Exists(file) && double.TryParse(File.ReadAllText(file), NumberStyles.Float, CultureInfo.InvariantCulture, out double d) ? d : 0;
+        }
+        catch
+        {
+            return 0;
+        }
     }
 
     private Mpv EnsureMpv()
