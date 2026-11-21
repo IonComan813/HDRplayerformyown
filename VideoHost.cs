@@ -169,7 +169,7 @@ internal static class Native
     [DllImport("user32.dll")] public static extern IntPtr SetCursor(IntPtr cursor);
     [DllImport("user32.dll")] public static extern uint GetDoubleClickTime();
 
-    public const uint SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010, SWP_FRAMECHANGED = 0x0020, SWP_NOOWNERZORDER = 0x0200;
+    public const uint SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010, SWP_FRAMECHANGED = 0x0020, SWP_NOOWNERZORDER = 0x0200;
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
 
@@ -249,6 +249,14 @@ internal static class Native
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFOEX info);
+
+    /// <summary>窗口所在显示器的工作区（去掉任务栏，物理像素）。</summary>
+    public static RECT WorkAreaOf(IntPtr hwnd)
+    {
+        var mi = new MONITORINFOEX { cbSize = (uint)Marshal.SizeOf<MONITORINFOEX>(), szDevice = "" };
+        IntPtr mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        return GetMonitorInfo(mon, ref mi) ? mi.rcWork : default;
+    }
 
     /// <summary>窗口所在显示器：GDI 设备名（如 \\.\DISPLAY1）和整块屏幕的物理像素矩形。</summary>
     public static (string Device, RECT Bounds) MonitorOf(IntPtr hwnd)

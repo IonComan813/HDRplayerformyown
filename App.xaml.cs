@@ -74,11 +74,7 @@ internal static class Dialogs
             Content = new System.Windows.Controls.TextBlock { Text = text, TextWrapping = TextWrapping.Wrap, MaxWidth = 520 },
             CloseButtonText = "确定",
         };
-        if (owner is { IsVisible: true })
-        {
-            box.Owner = owner;
-            box.WindowStartupLocation = WindowStartupLocation.CenterOwner;
-        }
+        Place(box, owner);
         try { await box.ShowDialogAsync(); } catch (TaskCanceledException) { }
     }
 
@@ -92,12 +88,47 @@ internal static class Dialogs
             PrimaryButtonText = okText,
             CloseButtonText = "取消",
         };
-        if (owner is { IsVisible: true })
-        {
-            box.Owner = owner;
-            box.WindowStartupLocation = WindowStartupLocation.CenterOwner;
-        }
+        Place(box, owner);
         try { return await box.ShowDialogAsync() == Wpf.Ui.Controls.MessageBoxResult.Primary; }
         catch (TaskCanceledException) { return false; }
+    }
+
+    /// <summary>
+    /// 居中到 owner 上。WPF-UI 的 MessageBox 在 Loaded 里按 Owner.Left / Top / Width / Height 自己居中，
+    /// 但主窗口最大化时这几个值是“还原”后的位置和大小，弹窗就偏到一边去了（owner 最小化时它干脆居中到主屏幕）。
+    /// 它的 Loaded 处理在构造时就挂上了，这里挂的排在它后面：等它按内容改好尺寸，再按 owner 实际的屏幕矩形
+    /// （物理像素，最大化、多显示器、不同缩放比例都准）重新放到正中，并保证不超出那块屏幕的工作区。
+    /// </summary>
+    private static void Place(Wpf.Ui.Controls.MessageBox box, Window? owner)
+    {
+        if (owner is not { IsVisible: true }) return;
+        box.Owner = owner;
+        box.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+        box.Loaded += (_, _) =>
+        {
+            try { CenterOn(box, owner); } catch { /* 定位失败就保持 WPF-UI 原来的位置 */ }
+        };
+    }
+
+    private static void CenterOn(Window box, Window owner)
+    {
+        IntPtr bh = new System.Windows.Interop.WindowInteropHelper(box).Handle;
+        IntPtr oh = new System.Windows.Interop.WindowInteropHelper(owner).Handle;
+        if (bh == IntPtr.Zero || oh == IntPtr.Zero) return;
+        var work = Native.WorkAreaOf(oh);
+        // 最小化的窗口没有可用的矩形，就放在它所在屏幕的正中
+        if (owner.WindowState == WindowState.Minimized || !Native.GetWindowRect(oh, out var area)) area = work;
+        // 弹窗尺寸：WPF-UI 刚按内容设好的 Width / Height（DIP）换算成这块屏幕上的物理像素
+        var dpi = System.Windows.Media.VisualTreeHelper.GetDpi(owner);
+        int w = (int)Math.Round((double.IsNaN(box.Width) ? box.ActualWidth : box.Width) * dpi.DpiScaleX);
+        int h = (int)Math.Round((double.IsNaN(box.Height) ? box.ActualHeight : box.Height) * dpi.DpiScaleY);
+        if (w <= 0 || h <= 0) return;
+        int x = area.Left + (area.Width - w) / 2, y = area.Top + (area.Height - h) / 2;
+        if (work.Width > 0 && work.Height > 0)
+        {
+            x = Math.Clamp(x, work.Left, Math.Max(work.Left, work.Right - w));
+            y = Math.Clamp(y, work.Top, Math.Max(work.Top, work.Bottom - h));
+        }
+        Native.SetWindowPos(bh, IntPtr.Zero, x, y, 0, 0, Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
     }
 }
