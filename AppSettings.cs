@@ -36,7 +36,7 @@ internal sealed class AppSettings
     /// </summary>
     public bool MatchRefreshRate { get; set; } = true;
     /// <summary>
-    /// 刷新率和帧率匹配不上时的视频同步方式："audio" = 按音频同步；"interp" = 帧插值 + 按显示器刷新率重采样。
+    /// 刷新率和帧率匹配不上时的视频同步方式："audio" = 按音频同步；"interp" = 帧插值（mpv 的插值要求按显示器同步，所以同时按显示器刷新率重采样）。
     /// 每个文件可以在右键菜单里单独选（记在 file-states.json），优先于这里。
     /// </summary>
     public string NoMatchSync { get; set; } = "audio";

@@ -89,9 +89,9 @@ public partial class SettingsWindow : FluentWindow
         ("lanczos", "lanczos"), ("bilinear", "bilinear"),
     };
 
-    /// <summary>刷新率匹配不上时的视频同步方式（画面右键菜单里也用）。</summary>
+    /// <summary>刷新率匹配不上时的视频同步方式（画面右键菜单里也用）。帧插值只在按显示器同步时才起作用，选它时一定是按显示器重采样。</summary>
     public static readonly (string Value, string Name)[] NoMatchSyncChoices =
-        { ("audio", "按音频同步"), ("interp", "帧插值 + 按显示器刷新率重采样") };
+        { ("audio", "按音频同步"), ("interp", "帧插值") };
 
     private static readonly (string, string)[] SubAutoChoices =
         { ("no", "不自动加载"), ("exact", "完全同名"), ("fuzzy", "包含文件名"), ("all", "目录下全部") };
@@ -187,8 +187,8 @@ public partial class SettingsWindow : FluentWindow
         AddCombo(p, "缩小算法", null, DscaleChoices, _s.Dscale, v => _s.Dscale = v);
         AddToggle(p, "去色带 (deband)", null, _s.Deband, v => _s.Deband = v);
         AddToggle(p, "自动匹配刷新率",
-            "开始播放时把显示器切到视频帧率的整数倍（不低于 48 Hz，没有恰好的就用最接近的，如 119.88 帧用 120 Hz），" +
-            "切换视频时重新匹配，退出时还原。只在系统列出的刷新率里选，不设置自定义刷新率",
+            "开始播放时把显示器切到视频帧率的整数倍（不低于 47.952 Hz，选符合条件的最低刷新率；没有恰好的就用最接近的，" +
+            "如 119.88 帧用 120 Hz），切换视频时重新匹配，退出时还原。只在系统列出的刷新率里选，不设置自定义刷新率",
             _s.MatchRefreshRate, v => _s.MatchRefreshRate = v);
         AddCombo(p, "视频同步",
             "如果有近似匹配的刷新率，则直接按显示器刷新率重采样；此处选择无匹配时的优先策略，" +

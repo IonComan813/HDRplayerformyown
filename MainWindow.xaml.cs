@@ -1066,8 +1066,8 @@ public partial class MainWindow : FluentWindow
         return path == null ? null : _fileStates.Get(path)?.VideoSync;
     }
 
-    /// <summary>右键菜单里给当前视频选同步方式（null = 跟随全局设置），记住；刷新率匹配不上时立即生效。</summary>
-    private void SetFileVideoSync(string? value)
+    /// <summary>右键菜单里给当前视频选同步方式，记住（优先于全局设置）；刷新率匹配不上时立即生效。</summary>
+    private void SetFileVideoSync(string value)
     {
         var m = _mpv;
         string? path = _currentPath ?? (_idle ? null : m?.GetString("path"));
@@ -1076,9 +1076,7 @@ public partial class MainWindow : FluentWindow
         st.VideoSync = value;
         _fileStates.Set(path, st);
         if (!_refreshMatched) ApplyVideoSync(false);
-        m.ShowText(value == null
-            ? $"本视频的视频同步：跟随全局设置（{SyncName(S.NoMatchSync)}）"
-            : $"本视频的视频同步：{SyncName(value)}");
+        m.ShowText($"本视频的视频同步：{SyncName(value)}");
     }
 
     /// <summary>
@@ -1312,7 +1310,7 @@ public partial class MainWindow : FluentWindow
                 if (arg != null) SetFileHwdec(arg == "global" ? null : arg);
                 break;
             case "vsync":
-                if (arg != null) SetFileVideoSync(arg == "global" ? null : arg);
+                if (arg != null) SetFileVideoSync(arg);
                 break;
             case "audio-delay-dec": AdjustAudioDelay(-S.SubDelayStepMs); break;
             case "audio-delay-inc": AdjustAudioDelay(S.SubDelayStepMs); break;
@@ -2113,13 +2111,10 @@ public partial class MainWindow : FluentWindow
         }
         else
         {
-            string? fileSync = FileVideoSync();
-            var sync = new List<MenuEntry>
-            {
-                new($"跟随全局设置（{SyncName(S.NoMatchSync)}）", Hp("vsync", "global"), Checked: playing && fileSync == null),
-                Sep,
-            };
-            sync.AddRange(SettingsWindow.NoMatchSyncChoices.Select(c => new MenuEntry(c.Name, Hp("vsync", c.Value), Checked: fileSync == c.Value)));
+            // 只有两个选项，不另设“跟随全局设置”：没单独选过时勾的是全局设置里的那个
+            string effective = FileVideoSync() ?? S.NoMatchSync;
+            var sync = SettingsWindow.NoMatchSyncChoices
+                .Select(c => new MenuEntry(c.Name, Hp("vsync", c.Value), Checked: playing && effective == c.Value)).ToList();
             items.Add(new MenuEntry("视频同步（本视频）", Sub: sync, Enabled: playing && _refreshChecked));
         }
         items.Add(Sep);
@@ -2561,7 +2556,7 @@ public partial class MainWindow : FluentWindow
                 Head("渲染输出");
                 Line("VO", $"{P("current-vo")}  API {P("gpu-api")}");
                 Line("视频同步", _refreshMatched ? "按显示器刷新率重采样（刷新率和帧率匹配）"
-                    : P("video-sync") == "display-resample" && m.GetFlag("interpolation") == true ? "帧插值 + 按显示器刷新率重采样（刷新率和帧率不匹配）"
+                    : P("video-sync") == "display-resample" && m.GetFlag("interpolation") == true ? "帧插值（刷新率和帧率不匹配）"
                     : P("video-sync") == "audio" ? "按音频同步（刷新率和帧率不匹配）"
                     : P("video-sync"));
                 Line("输出色彩", $"{P("video-target-params/primaries")} / {P("video-target-params/gamma")}  峰值 {P("video-target-params/max-luma")} nit");
