@@ -22,10 +22,19 @@ internal sealed class FileState
 {
     /// <summary>上次的播放位置（秒），0 = 从头开始。</summary>
     public double Position { get; set; }
-    /// <summary>音频延迟（秒，mpv 的 audio-delay）。</summary>
+    /// <summary>旧版本按视频记的音频延迟（秒）。现在按音轨记（<see cref="AudioDelays"/>），这个只在还没有按音轨的记录时用一次。</summary>
     public double AudioDelay { get; set; }
-    /// <summary>字幕延迟（秒，mpv 的 sub-delay）。</summary>
+    /// <summary>旧版本按视频记的字幕延迟（秒），同上。</summary>
     public double SubDelay { get; set; }
+    /// <summary>
+    /// 每条音轨的音频延迟（秒，mpv 的 audio-delay）：同一个视频的不同音轨可以一条准、一条不准。
+    /// 键见 MainWindow.TrackKey：内嵌轨是“ff:流序号:编码:语言”，外挂文件是“ext:完整路径”。
+    /// </summary>
+    public Dictionary<string, double>? AudioDelays { get; set; }
+    /// <summary>每条字幕的字幕延迟（秒，mpv 的 sub-delay），键同上。</summary>
+    public Dictionary<string, double>? SubDelays { get; set; }
+    /// <summary>只对这个文件生效的音频直通，null = 跟随全局设置。</summary>
+    public bool? Passthrough { get; set; }
     /// <summary>只对这个文件生效的解码方式（mpv 的 hwdec 值），null = 跟随全局设置。</summary>
     public string? Hwdec { get; set; }
     /// <summary>只对这个文件生效的防削波策略（"limit" / "dynaudnorm"），null = 跟随全局设置。</summary>
@@ -39,7 +48,8 @@ internal sealed class FileState
     /// <summary>最后一次播放的时间，记录太多时先淘汰最久没播的。</summary>
     public DateTime LastPlayed { get; set; }
 
-    public bool IsEmpty => Position <= 0 && AudioDelay == 0 && SubDelay == 0 && Hwdec == null && VideoSync == null && AntiClip == null && Audio == null && Sub == null;
+    public bool IsEmpty => Position <= 0 && AudioDelay == 0 && SubDelay == 0 && AudioDelays is not { Count: > 0 } &&
+                           SubDelays is not { Count: > 0 } && Passthrough == null && Hwdec == null && VideoSync == null && AntiClip == null && Audio == null && Sub == null;
 }
 
 /// <summary>

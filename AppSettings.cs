@@ -22,7 +22,7 @@ internal sealed class AppSettings
     /// <summary>杜比视界："rpu" = 应用 RPU 动态元数据（支持 Profile 5）；"strip" = 剥离 RPU，只播放基础层。</summary>
     public string DolbyVisionMode { get; set; } = "rpu";
 
-    // ---- 解码 / 渲染 ----
+    // ---- 视频 ----
     public string Hwdec { get; set; } = "d3d11va";
     /// <summary>软解线程数（vd-lavc-threads），0 = 自动：按 CPU 逻辑核心数，最多 16。</summary>
     public int DecoderThreads { get; set; } = 0;
@@ -44,6 +44,11 @@ internal sealed class AppSettings
 
     // ---- 音频 ----
     public string AudioDevice { get; set; } = "auto";
+    /// <summary>
+    /// 音频直通：AC3 / E-AC3 / DTS / DTS-HD / TrueHD 不解码，拆封装后原样以 HDMI（IEC 61937）码流送给功放 / 电视解码。
+    /// 开着时下混、防削波、音量调节都不起作用（声音不经过本机处理）。每个视频可以在右键菜单里单独开关。
+    /// </summary>
+    public bool AudioPassthrough { get; set; } = false;
     public bool DownmixToStereo { get; set; } = true;
     /// <summary>
     /// 防削波策略（替代以前的“下混时归一化”，那个是把下混系数整体缩小，整轨都变小声）：
@@ -71,7 +76,7 @@ internal sealed class AppSettings
     public bool RestorePlaylist { get; set; } = true;
     /// <summary>记住每个文件的播放进度，下次打开时从那里继续。</summary>
     public bool RememberPosition { get; set; } = true;
-    /// <summary>记住每个文件的音频延迟和字幕延迟。</summary>
+    /// <summary>按音轨 / 字幕记住音频延迟和字幕延迟（同一个视频的不同音轨 / 字幕各记各的）。</summary>
     public bool RememberDelays { get; set; } = true;
     /// <summary>记住每个文件选的音轨和字幕；记住的轨没了（例如外挂文件被删）就按首选语言规则选。</summary>
     public bool RememberTracks { get; set; } = true;

@@ -457,8 +457,33 @@ public partial class MainWindow : FluentWindow
 
     private bool DvStripped => S.DolbyVisionMode == "strip";
 
-    /// <summary>上次设置的音频滤镜：没变就不重设（重设会让音频链重新初始化，声音断一下）。</summary>
-    private volatile string? _lastAf;
+    /// <summary>上次设置的音频输出方式（直通 / 声道 / 滤镜）：没变就不重设（重设会让音频链重新初始化，声音断一下）。</summary>
+    private volatile string? _lastAudio;
+
+    /// <summary>直通的格式：mpv 的 audio-spdif。DTS-HD / TrueHD 要 HDMI（8 声道 IEC 61937）。</summary>
+    private const string PassthroughCodecs = "ac3,eac3,dts,dts-hd,truehd";
+
+    /// <summary>这个文件用不用音频直通：单独设置过的优先，否则用全局设置。</summary>
+    private bool EffectivePassthrough(string? path) =>
+        (path == null ? null : _fileStates.Get(path)?.Passthrough) ?? S.AudioPassthrough;
+
+    /// <summary>
+    /// 设置音频输出：直通时 audio-spdif 列出要直通的格式，滤镜清空（码流不能做 PCM 处理），声道数自动
+    /// （下混到立体声会挡住 TrueHD / DTS-HD 这类多声道码流；不支持直通的音轨按设备的声道数正常解码）；
+    /// 不直通时按下混设置和防削波策略。path = null 时用全局设置。
+    /// </summary>
+    private void ApplyAudioChain(Func<string, string, int> set, string? path)
+    {
+        bool pt = EffectivePassthrough(path);
+        string spdif = pt ? PassthroughCodecs : "";
+        string channels = pt ? "auto" : S.DownmixToStereo ? "stereo" : "auto-safe";
+        string af = pt ? "" : AudioFilters(EffectiveAntiClip(path));
+        string sig = spdif + "|" + channels + "|" + af;
+        if (sig == _lastAudio) return;
+        set("audio-spdif", spdif);
+        set("audio-channels", channels);
+        if (set("af", af) >= 0) _lastAudio = sig;
+    }
 
     /// <summary>
     /// 防削波的音频滤镜链。mpv 平时在所有音频滤镜之后才下混，那样限幅器看到的还是下混前的声道，
@@ -493,11 +518,9 @@ public partial class MainWindow : FluentWindow
         if (initial) { set("video-sync", "audio"); set("interpolation", "no"); }
         set("audio-device", string.IsNullOrEmpty(S.AudioDevice) ? "auto" : S.AudioDevice);
         // 5.1 / 7.1 → 立体声由 mpv（libswresample）按标准矩阵下混；不再用系数归一化（整轨都会变小声），
-        // 防削波交给下面的音频滤镜
-        set("audio-channels", S.DownmixToStereo ? "stereo" : "auto-safe");
+        // 防削波交给音频滤镜；音频直通时都不用（见 ApplyAudioChain）
         set("audio-normalize-downmix", "no");
-        string af = AudioFilters(initial || _idle ? S.AntiClip : EffectiveAntiClip(_currentPath));
-        if (af != _lastAf && set("af", af) >= 0) _lastAf = af;
+        ApplyAudioChain(set, initial || _idle ? null : _currentPath);
         set("alang", AppSettings.NormalizeLanguageList(S.AudioLanguages));
         set("slang", AppSettings.NormalizeLanguageList(S.SubLanguages));
         set("sub-auto", S.SubAuto);
@@ -741,6 +764,7 @@ public partial class MainWindow : FluentWindow
             case "aid":
             case "sid":
                 SnapshotTracks();
+                SwapTrackDelay(audio: name == "aid");
                 break;
             case "pause":
                 _paused = value is true;
@@ -818,6 +842,7 @@ public partial class MainWindow : FluentWindow
         _dvProfile = null;
         _autoHdrChecked = false;
         _refreshChecked = false;
+        _audioKey = _subKey = null;
         // 先按音频同步，视频参数出来以后再按刷新率是否匹配决定（纯音频文件就一直是音频同步）
         _refreshMatched = false;
         SetSyncMode("audio");
@@ -863,31 +888,95 @@ public partial class MainWindow : FluentWindow
     }
 
     /// <summary>
-    /// 打开文件时套用这个文件记住的状态：音频 / 字幕延迟（没记录过的文件归零，延迟是按文件的），
-    /// 以及上次的播放进度。重新载入（F5）时位置已经由 start 选项定好，不再跳。
+    /// 打开文件时套用这个文件记住的状态：上次的播放进度、音轨 / 字幕，以及选中的那条音轨 / 字幕的延迟
+    /// （延迟按音轨 / 字幕记，没记录过的归零）。重新载入（F5）时位置已经由 start 选项定好，不再跳。
     /// </summary>
     private void ApplyFileState(Mpv m, bool resumePosition)
     {
         if (_currentPath == null) return;
         var st = _fileStates.Get(_currentPath);
         var notes = new List<string>();
-        if (S.RememberDelays)
-        {
-            double ad = st?.AudioDelay ?? 0, sd = st?.SubDelay ?? 0;
-            m.SetProperty("audio-delay", ad);
-            m.SetProperty("sub-delay", sd);
-            if (ad != 0) notes.Add($"音频延迟 {ad * 1000:+0;-0} ms");
-            if (sd != 0) notes.Add($"字幕延迟 {sd * 1000:+0;-0} ms");
-        }
         double pos = st?.Position ?? 0;
         if (S.RememberPosition && resumePosition && pos > 0 && (_currentDuration <= 0 || pos < _currentDuration - 10))
         {
             m.Command("seek", pos.ToString("0.###", Inv), "absolute+exact");
-            notes.Insert(0, $"从上次的位置 {FormatTime(pos)} 继续（Home 键从头开始）");
+            notes.Add($"从上次的位置 {FormatTime(pos)} 继续（Home 键从头开始）");
         }
         if (S.RememberTracks) RestoreTracks(m, st);
         SnapshotTracks();
+
+        // 延迟：选好音轨 / 字幕之后，按选中的那条套用
+        _audioDelays = st?.AudioDelays != null ? new(st.AudioDelays) : new();
+        _subDelays = st?.SubDelays != null ? new(st.SubDelays) : new();
+        _audioKey = TrackKey("audio");
+        _subKey = TrackKey("sub");
+        if (S.RememberDelays)
+        {
+            // 旧版本按视频记的延迟：这个视频还没有按轨的记录时，算到现在选中的那条上
+            if (_audioDelays.Count == 0 && st is { AudioDelay: not 0 } && _audioKey != null) _audioDelays[_audioKey] = st.AudioDelay;
+            if (_subDelays.Count == 0 && st is { SubDelay: not 0 } && _subKey != null) _subDelays[_subKey] = st.SubDelay;
+            double ad = _audioKey != null ? _audioDelays.GetValueOrDefault(_audioKey) : 0;
+            double sd = _subKey != null ? _subDelays.GetValueOrDefault(_subKey) : 0;
+            m.SetProperty("audio-delay", ad);
+            m.SetProperty("sub-delay", sd);
+            if (ad != 0) notes.Add($"音频延迟 {ad * 1000:+0;-0} ms（这条音轨记住的）");
+            if (sd != 0) notes.Add($"字幕延迟 {sd * 1000:+0;-0} ms（这条字幕记住的）");
+        }
         if (notes.Count > 0) m.ShowText(string.Join("\n", notes), 3000);
+    }
+
+    // ---- 按音轨 / 字幕记住的延迟 ----
+
+    // 当前文件每条音轨 / 字幕的延迟（打开文件时从 file-states.json 读出，结束时写回），以及现在选中的是哪条
+    private Dictionary<string, double> _audioDelays = new(), _subDelays = new();
+    private string? _audioKey, _subKey;
+
+    /// <summary>
+    /// 选中的音轨 / 字幕的键：外挂文件按路径，内嵌轨按流序号 + 编码 + 语言（文件被换成别的版本时不会套错）。
+    /// 没选（关闭字幕）返回 null。
+    /// </summary>
+    private string? TrackKey(string type)
+    {
+        var t = Tracks().FirstOrDefault(o => TrackStr(o, "type") == type && TrackFlag(o, "selected"));
+        if (t == null) return null;
+        if (TrackFlag(t, "external"))
+            return "ext:" + FullPath(TrackStr(t, "external-filename")).ToUpperInvariant();
+        return $"ff:{TrackFfIndex(t)}:{TrackStr(t, "codec")}:{TrackStr(t, "lang")}";
+    }
+
+    /// <summary>
+    /// 换了音轨 / 字幕：先把刚才那条的延迟记下，再套用新那条记住的（没记过就是 0）。关闭字幕时不动延迟。
+    /// </summary>
+    private void SwapTrackDelay(bool audio)
+    {
+        var m = _mpv;
+        if (m == null || _currentPath == null || _idle || !S.RememberDelays) return;
+        if (Tracks().Count == 0) return; // 文件正在卸载
+        string? key = TrackKey(audio ? "audio" : "sub");
+        string? old = audio ? _audioKey : _subKey;
+        if (key == old) return;
+        string prop = audio ? "audio-delay" : "sub-delay";
+        var dict = audio ? _audioDelays : _subDelays;
+        double cur = m.GetDouble(prop) ?? 0;
+        if (old != null) dict[old] = cur;
+        if (audio) _audioKey = key; else _subKey = key;
+        if (key == null) return;
+        double next = dict.GetValueOrDefault(key);
+        if (Math.Abs(next - cur) < 1e-6) return;
+        m.SetProperty(prop, next);
+        if (next != 0)
+            m.ShowText($"{(audio ? "音频延迟" : "字幕延迟")} {next * 1000:+0;-0} ms（这条{(audio ? "音轨" : "字幕")}记住的）", 2500);
+    }
+
+    /// <summary>把当前选中的那条的延迟写进字典，只留非 0 的（结束时存盘用）。</summary>
+    private Dictionary<string, double>? CollectDelays(bool audio)
+    {
+        var m = _mpv;
+        var dict = audio ? _audioDelays : _subDelays;
+        string? key = audio ? _audioKey : _subKey;
+        if (m != null && key != null) dict[key] = m.GetDouble(audio ? "audio-delay" : "sub-delay") ?? 0;
+        var kept = dict.Where(kv => kv.Value != 0).ToDictionary(kv => kv.Key, kv => kv.Value);
+        return kept.Count > 0 ? kept : null;
     }
 
     // ---- 每个文件记住的音轨 / 字幕 ----
@@ -980,8 +1069,12 @@ public partial class MainWindow : FluentWindow
         var st = new FileState
         {
             Position = S.RememberPosition ? position : 0,
-            AudioDelay = S.RememberDelays ? m.GetDouble("audio-delay") ?? 0 : old?.AudioDelay ?? 0,
-            SubDelay = S.RememberDelays ? m.GetDouble("sub-delay") ?? 0 : old?.SubDelay ?? 0,
+            // 延迟按音轨 / 字幕记；旧的按视频记的值已经在打开时算到当时选中的那条上了，这里清掉
+            AudioDelays = S.RememberDelays ? CollectDelays(audio: true) : old?.AudioDelays,
+            SubDelays = S.RememberDelays ? CollectDelays(audio: false) : old?.SubDelays,
+            AudioDelay = S.RememberDelays ? 0 : old?.AudioDelay ?? 0,
+            SubDelay = S.RememberDelays ? 0 : old?.SubDelay ?? 0,
+            Passthrough = old?.Passthrough,
             Hwdec = old?.Hwdec,
             VideoSync = old?.VideoSync,
             AntiClip = old?.AntiClip,
@@ -1148,11 +1241,28 @@ public partial class MainWindow : FluentWindow
         var st = _fileStates.Get(path) ?? new FileState { LastPlayed = DateTime.UtcNow };
         st.AntiClip = value;
         _fileStates.Set(path, st);
-        string af = AudioFilters(value ?? S.AntiClip);
-        if (af != _lastAf && m.SetProperty("af", af) >= 0) _lastAf = af;
+        ApplyAudioChain(m.SetProperty, path);
         m.ShowText(value == null
             ? $"本视频的防削波：跟随全局设置（{AntiClipName(S.AntiClip)}）"
             : $"本视频的防削波：{AntiClipName(value)}");
+    }
+
+    /// <summary>
+    /// 右键菜单的“音频直通”：直接开 / 关这个视频的直通，按文件记住。切换后和全局设置一样时就清掉单独的设置，
+    /// 回到跟随全局设置（以后全局设置改了，它也跟着变）。
+    /// </summary>
+    private void ToggleFilePassthrough()
+    {
+        var m = _mpv;
+        string? path = _currentPath ?? (_idle ? null : m?.GetString("path"));
+        if (m == null || path == null) return;
+        bool next = !EffectivePassthrough(path);
+        var st = _fileStates.Get(path) ?? new FileState { LastPlayed = DateTime.UtcNow };
+        st.Passthrough = next == S.AudioPassthrough ? null : next;
+        _fileStates.Set(path, st);
+        ApplyAudioChain(m.SetProperty, path);
+        m.ShowText($"音频直通：{(next ? "开" : "关")}" +
+                   (st.Passthrough == null ? "（和全局设置一致）" : "（本视频单独设置）"));
     }
 
     /// <summary>右键菜单里给当前视频选同步方式（null = 跟随全局设置），记住；刷新率匹配不上时立即生效。</summary>
@@ -1411,6 +1521,7 @@ public partial class MainWindow : FluentWindow
             case "hwdec":
                 if (arg != null) SetFileHwdec(arg == "global" ? null : arg);
                 break;
+            case "passthrough": ToggleFilePassthrough(); break;
             case "anticlip":
                 if (arg != null) SetFileAntiClip(arg == "global" ? null : arg);
                 break;
@@ -1432,6 +1543,10 @@ public partial class MainWindow : FluentWindow
             case "hdr":
                 if (HdrBlockedReason() is { } why) m.ShowText(why);
                 else SetHdr(!_hdrOn, manual: true);
+                break;
+            // 关闭字幕时调字幕延迟没有意义（也可能是烧在画面里的硬字幕）
+            case "sub-delay-dec" or "sub-delay-inc" when m.GetString("sid") is "no" or null:
+                m.ShowText("当前无字幕或为硬字幕");
                 break;
             case "sub-delay-dec": AdjustSubDelay(-S.SubDelayStepMs); break;
             case "sub-delay-inc": AdjustSubDelay(S.SubDelayStepMs); break;
@@ -1865,9 +1980,8 @@ public partial class MainWindow : FluentWindow
     private void OnLoadHook(Mpv m)
     {
         string? path = m.GetString("path");
-        // 防削波：这个文件单独选过就用它的，否则用全局的。在音频链建立之前设好，不会断声
-        string af = AudioFilters(EffectiveAntiClip(path));
-        if (af != _lastAf && m.SetProperty("af", af) >= 0) _lastAf = af;
+        // 音频直通 / 防削波：这个文件单独选过就用它的，否则用全局的。在音频链建立之前设好，不会断声
+        ApplyAudioChain(m.SetProperty, path);
         string? perFile = path == null ? null : _fileStates.Get(path)?.Hwdec;
         m.SetProperty("file-local-options/hwdec", perFile ?? S.Hwdec);
     }
@@ -1991,6 +2105,8 @@ public partial class MainWindow : FluentWindow
             return;
         }
 
+        // 原来那条字幕的延迟先记下（切换事件要等一会儿才到，那时延迟已经被下面清零了）
+        if (_subKey != null) _subDelays[_subKey] = m.GetDouble("sub-delay") ?? 0;
         // 同名文件之前已经加载过（再次同步覆盖了它）：先移除旧的轨，避免出现两条一样的
         if (m.GetNode("track-list") is List<object?> now)
             foreach (var t in now.OfType<Dictionary<string, object?>>())
@@ -2001,6 +2117,8 @@ public partial class MainWindow : FluentWindow
         _subTouched = true;
         // 偏移已经写进字幕文件，之前手动调的字幕延迟要清零，否则会叠加
         m.SetProperty("sub-delay", 0.0);
+        _subKey = TrackKey("sub");
+        if (_subKey != null) _subDelays[_subKey] = 0;
         string scale = Math.Abs(res.Scale - 1) > 0.0005 ? $"，帧率校正 ×{res.Scale.ToString("0.0000", Inv)}" : "";
         m.ShowText($"字幕已同步：整体偏移 {res.Offset.ToString("+0.00;-0.00;0.00", Inv)} 秒{scale}\n已保存为 {Path.GetFileName(output)}", 5000);
     }
@@ -2145,6 +2263,7 @@ public partial class MainWindow : FluentWindow
             _fileStates.Set(output, new FileState
             {
                 Position = st.Position, AudioDelay = st.AudioDelay, SubDelay = st.SubDelay, Hwdec = st.Hwdec,
+                AudioDelays = st.AudioDelays, SubDelays = st.SubDelays, Passthrough = st.Passthrough,
                 VideoSync = st.VideoSync, AntiClip = st.AntiClip, Audio = st.Audio, Sub = st.Sub, LastPlayed = DateTime.UtcNow,
             });
         }
@@ -2220,7 +2339,7 @@ public partial class MainWindow : FluentWindow
 
         // ---- 音轨 / 字幕：子菜单里是 载入外部文件 / 可选的轨 / 延迟 ----
         var audioTracks = new List<MenuEntry>();
-        var subTracks = new List<MenuEntry> { new("关闭字幕", Hp("sid", "no"), Checked: playing && m?.GetString("sid") is "no" or null) };
+        var subTracks = new List<MenuEntry> { new("关闭字幕/硬字幕", Hp("sid", "no"), Checked: playing && m?.GetString("sid") is "no" or null) };
         if (playing && m?.GetNode("track-list") is List<object?> tracks)
         {
             foreach (var t in tracks.OfType<Dictionary<string, object?>>())
@@ -2305,7 +2424,10 @@ public partial class MainWindow : FluentWindow
         };
         antiClip.AddRange(SettingsWindow.AntiClipChoices
             .Select(c => new MenuEntry(c.Name, Hp("anticlip", c.Value), Checked: playing && fileAntiClip == c.Value)));
-        items.Add(new MenuEntry("防削波策略", Sub: antiClip, Enabled: playing));
+        // 音频直通：直接点击开关（不展开），默认跟随全局设置，按视频记住；开着时防削波不起作用，灰掉
+        bool passthrough = playing && EffectivePassthrough(path);
+        items.Add(new MenuEntry("音频直通", Hp("passthrough"), Checked: passthrough, Enabled: playing));
+        items.Add(new MenuEntry("防削波策略", Sub: antiClip, Enabled: playing && !passthrough));
         items.Add(Sep);
 
         // ---- 窗口 ----
@@ -2772,7 +2894,16 @@ public partial class MainWindow : FluentWindow
                     Line("输出声道", $"{P("audio-out-params/channel-count")} ch  {P("audio-out-params/hr-channels")}" +
                         (S.DownmixToStereo ? "  (下混到立体声)" : ""));
                 Line("采样率", $"{P("audio-params/samplerate")} Hz  {P("audio-params/format")}");
-                if (live) Line("防削波", EffectiveAntiClip(_currentPath) == "dynaudnorm" ? "拉平音量（dynaudnorm）+ 限幅" : "仅限幅（alimiter）");
+                if (live)
+                {
+                    bool pt = EffectivePassthrough(_currentPath);
+                    string outFmt = P("audio-out-params/format");
+                    Line("音频直通", !pt ? "关"
+                        : outFmt.StartsWith("spdif", StringComparison.OrdinalIgnoreCase) ? $"开（{outFmt}，由功放 / 电视解码）"
+                        : "开（这条音轨的格式或设备不支持，已改为正常解码）");
+                    Line("防削波", pt ? "不起作用（音频直通）"
+                        : EffectiveAntiClip(_currentPath) == "dynaudnorm" ? "拉平音量（dynaudnorm）+ 限幅" : "仅限幅（alimiter）");
+                }
                 if (live)
                 {
                     Line("码率", O("audio-bitrate"));
