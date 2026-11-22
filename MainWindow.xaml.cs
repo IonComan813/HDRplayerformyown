@@ -463,6 +463,16 @@ public partial class MainWindow : FluentWindow
     /// <summary>直通的格式：mpv 的 audio-spdif。DTS-HD / TrueHD 要 HDMI（8 声道 IEC 61937）。</summary>
     private const string PassthroughCodecs = "ac3,eac3,dts,dts-hd,truehd";
 
+    /// <summary>能直通的音轨编码（mpv track-list 里的 codec 名；DTS-HD 的 codec 也是 dts）。</summary>
+    private static readonly HashSet<string> PassthroughCodecSet = new(StringComparer.OrdinalIgnoreCase) { "ac3", "eac3", "dts", "truehd" };
+
+    /// <summary>当前选中的音轨的编码；没有音轨返回 null。</summary>
+    private string? CurrentAudioCodec() =>
+        Tracks().FirstOrDefault(t => TrackStr(t, "type") == "audio" && TrackFlag(t, "selected")) is { } a ? TrackStr(a, "codec") : null;
+
+    /// <summary>当前音轨的格式能不能直通（设备支不支持要真的试了才知道，见 UpdateBitstream）。</summary>
+    private bool CurrentAudioCanPassthrough() => CurrentAudioCodec() is { } c && PassthroughCodecSet.Contains(c);
+
     /// <summary>这个文件用不用音频直通：单独设置过的优先，否则用全局设置。</summary>
     private bool EffectivePassthrough(string? path) =>
         (path == null ? null : _fileStates.Get(path)?.Passthrough) ?? S.AudioPassthrough;
@@ -844,6 +854,7 @@ public partial class MainWindow : FluentWindow
         _autoHdrChecked = false;
         _refreshChecked = false;
         _audioKey = _subKey = null;
+        _ptWarned = false;
         // 先按音频同步，视频参数出来以后再按刷新率是否匹配决定（纯音频文件就一直是音频同步）
         _refreshMatched = false;
         SetSyncMode("audio");
@@ -1258,7 +1269,13 @@ public partial class MainWindow : FluentWindow
         var m = _mpv;
         string? path = _currentPath ?? (_idle ? null : m?.GetString("path"));
         if (m == null || path == null) return;
+        if (!CurrentAudioCanPassthrough())
+        {
+            m.ShowText($"当前音轨（{CurrentAudioCodec()?.ToUpperInvariant() ?? "无"}）无法直通，只支持 AC3 / E-AC3 / DTS / DTS-HD / TrueHD");
+            return;
+        }
         bool next = !EffectivePassthrough(path);
+        _ptWarned = false;
         var st = _fileStates.Get(path) ?? new FileState { LastPlayed = DateTime.UtcNow };
         st.Passthrough = next == S.AudioPassthrough ? null : next;
         _fileStates.Set(path, st);
@@ -1579,6 +1596,33 @@ public partial class MainWindow : FluentWindow
         _bitstream = m != null && !_idle &&
                      (m.GetString("audio-out-params/format") ?? "").StartsWith("spdif", StringComparison.OrdinalIgnoreCase);
         _bar.SetPassthrough(_bitstream);
+        if (!_bitstream && !_ptWarned && m != null && !_idle && EffectivePassthrough(_currentPath) && CurrentAudioCanPassthrough())
+            CheckPassthroughFallback();
+    }
+
+    /// <summary>这个文件已经提示过“设备不支持直通”了。</summary>
+    private bool _ptWarned;
+    private DispatcherTimer? _ptCheck;
+
+    /// <summary>
+    /// 格式能直通、却在正常解码：设备不接受这种码流，mpv 自动退回了解码。音频链可能还在重建，
+    /// 等 1.5 秒再看一次，确实不是码流才提示（每个文件只提示一次）。
+    /// </summary>
+    private void CheckPassthroughFallback()
+    {
+        _ptCheck?.Stop();
+        _ptCheck = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1500) };
+        _ptCheck.Tick += (_, _) =>
+        {
+            _ptCheck?.Stop();
+            var m = _mpv;
+            if (m == null || _idle || _ptWarned || !EffectivePassthrough(_currentPath) || !CurrentAudioCanPassthrough()) return;
+            string fmt = m.GetString("audio-out-params/format") ?? "";
+            if (fmt.Length == 0 || fmt.StartsWith("spdif", StringComparison.OrdinalIgnoreCase)) return;
+            _ptWarned = true;
+            m.ShowText($"音频直通：设备不支持 {CurrentAudioCodec()?.ToUpperInvariant()} 码流，已改为正常解码", 3500);
+        };
+        _ptCheck.Start();
     }
 
     /// <summary>
@@ -2443,8 +2487,13 @@ public partial class MainWindow : FluentWindow
         antiClip.AddRange(SettingsWindow.AntiClipChoices
             .Select(c => new MenuEntry(c.Name, Hp("anticlip", c.Value), Checked: playing && fileAntiClip == c.Value)));
         // 音频直通：直接点击开关（不展开），默认跟随全局设置，按视频记住；开着时防削波不起作用，灰掉
-        bool passthrough = playing && EffectivePassthrough(path);
-        items.Add(new MenuEntry("音频直通", Hp("passthrough"), Checked: passthrough, Enabled: playing));
+        // 当前音轨的格式不能直通（AAC、FLAC、Opus 等）时灰掉，标出原因
+        string? audioCodec = playing ? CurrentAudioCodec() : null;
+        bool canPassthrough = audioCodec != null && PassthroughCodecSet.Contains(audioCodec);
+        bool passthrough = canPassthrough && EffectivePassthrough(path);
+        string ptTitle = !playing || canPassthrough ? "音频直通"
+            : audioCodec == null ? "音频直通（没有音轨）" : $"音频直通（{audioCodec.ToUpperInvariant()} 不支持）";
+        items.Add(new MenuEntry(ptTitle, Hp("passthrough"), Checked: passthrough, Enabled: canPassthrough));
         items.Add(new MenuEntry("防削波策略", Sub: antiClip, Enabled: playing && !passthrough));
         items.Add(Sep);
 
