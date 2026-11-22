@@ -31,6 +31,12 @@ public sealed class VideoHost : HwndHost
     /// <summary>滚轮，参数为 WHEEL_DELTA 的倍数（向上为正）。</summary>
     public event Action<int>? Wheel;
 
+    /// <summary>
+    /// 左键是在画面上按下的。菜单开着时点画面：按下那一下被菜单拿走（用来关菜单），只有松开到这里，
+    /// 不能当成单击，否则关菜单的同时还会暂停 / 播放。
+    /// </summary>
+    private bool _leftDown;
+
     private bool _hideCursor;
     /// <summary>为 true 时鼠标指针停在画面上不显示（和悬浮控制栏一起隐藏）。</summary>
     public bool HideCursor
@@ -91,14 +97,17 @@ public sealed class VideoHost : HwndHost
             case Native.WM_LBUTTONDOWN:
             case Native.WM_RBUTTONDOWN:
             case Native.WM_MBUTTONDOWN:
+                if (msg == Native.WM_LBUTTONDOWN) _leftDown = true;
                 // 按住时移出画面也能收到松开
                 Native.SetCapture(Hwnd);
                 return true;
             case Native.WM_LBUTTONUP:
                 Native.ReleaseCapture();
-                if (IsCursorOver()) LeftClick?.Invoke();
+                if (_leftDown && IsCursorOver()) LeftClick?.Invoke();
+                _leftDown = false;
                 return true;
             case Native.WM_LBUTTONDBLCLK:
+                _leftDown = true;
                 Native.SetCapture(Hwnd);
                 LeftDoubleClick?.Invoke();
                 return true;

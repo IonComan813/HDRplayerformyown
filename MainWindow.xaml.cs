@@ -32,13 +32,15 @@ public sealed class PlaylistEntry : INotifyPropertyChanged
     public string Display { get; }
     public string Path { get; }
 
-    private bool _current, _failed, _isAudio;
+    private bool _current, _failed, _isAudio, _missing;
     private ImageSource? _thumbnail;
 
     /// <summary>正在播放（mpv 播放列表的 current 项，同一时间只有一项）。</summary>
     public bool Current { get => _current; set => Set(ref _current, value, nameof(Current)); }
     /// <summary>打不开（格式无法识别等），提示可以修复。</summary>
     public bool Failed { get => _failed; set => Set(ref _failed, value, nameof(Failed)); }
+    /// <summary>文件不在了（软件获得焦点、加载播放列表时检查）：右上角显示红色感叹号。</summary>
+    public bool Missing { get => _missing; set => Set(ref _missing, value, nameof(Missing)); }
     /// <summary>没有画面（纯音频），占位图换成音符。</summary>
     public bool IsAudio { get => _isAudio; set => Set(ref _isAudio, value, nameof(IsAudio)); }
     public ImageSource? Thumbnail { get => _thumbnail; set => Set(ref _thumbnail, value, nameof(Thumbnail)); }
@@ -144,6 +146,8 @@ public partial class MainWindow : FluentWindow
     /// <summary>最近一次键盘跳转：只让控制栏出现，不显示鼠标指针。</summary>
     private DateTime _lastKeyActivity = DateTime.MinValue;
     private bool _menuOpen;
+    /// <summary>右键菜单关闭的时间：关菜单的那一下点击不算单击画面（不暂停 / 播放）。</summary>
+    private DateTime _menuClosedAt = DateTime.MinValue;
 
     // 全屏
     private bool _fullscreen;
@@ -240,6 +244,9 @@ public partial class MainWindow : FluentWindow
             else if (PlaylistBox.SelectedItem is PlaylistEntry e) StartRepair(e.Path);
         };
         PlaylistBox.ContextMenuOpening += OnPlaylistMenuOpening;
+        PlMenuOpenDir.Click += (_, _) => { if (PlaylistBox.SelectedItem is PlaylistEntry e) OpenOriginalFolder(e.Path); };
+        BtnPlDeselect.Click += (_, _) => PlaylistBox.UnselectAll();
+        PlaylistBox.SelectionChanged += (_, _) => BtnPlDeselect.IsEnabled = PlaylistBox.SelectedItems.Count > 0;
         _plThumbs.Ready += (path, pos, kind, bmp, duration) =>
         {
             if (!_shuttingDown) Dispatcher.InvokeAsync(() => OnPlaylistThumb(path, pos, kind, bmp, duration));
@@ -256,7 +263,12 @@ public partial class MainWindow : FluentWindow
         PreviewKeyDown += OnPreviewKeyDown;
 
         SourceInitialized += (_, _) => _hwnd = new WindowInteropHelper(this).Handle;
-        Activated += (_, _) => _activatedAt = DateTime.UtcNow;
+        Activated += (_, _) =>
+        {
+            _activatedAt = DateTime.UtcNow;
+            // 回到播放器时（可能刚在资源管理器里删 / 移动了文件）检查播放列表里的文件还在不在
+            CheckMissingFiles();
+        };
         Deactivated += (_, _) => _deactivatedAt = DateTime.UtcNow;
         ContentRendered += OnContentRendered;
         LocationChanged += (_, _) => PositionBar();
@@ -1108,6 +1120,14 @@ public partial class MainWindow : FluentWindow
         if (_reloading) { _reloading = false; _mpv?.SetProperty("start", "none"); }
         // 打开失败时没有 file-loaded：用 start-file 时记下的路径，播放列表里标出来，右键菜单里可以修复它
         string? failed = _startingPath;
+        if (failed != null && IsLocalPath(failed) && !File.Exists(failed))
+        {
+            // 文件不在了：标上红色感叹号，不提示修复
+            foreach (var e in _playlist) if (SamePath(e.Path, failed)) e.Missing = true;
+            UpdatePlaylistFlags();
+            _mpv?.ShowText("找不到此视频：" + Path.GetFileName(failed), 4000);
+            return;
+        }
         bool local = failed != null && File.Exists(failed);
         if (local)
         {
@@ -1146,7 +1166,8 @@ public partial class MainWindow : FluentWindow
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (string f in saved.Files)
         {
-            if (!File.Exists(f) || !seen.Add(FullPath(f))) continue; // 文件已删除 / 移动 / 所在的盘没接上；重复的只留一个
+            // 找不到的文件（已删除 / 移动 / 所在的盘没接上）也留着，在列表里标出来；重复的只留一个
+            if (!seen.Add(FullPath(f))) continue;
             m.Command("loadfile", f, "append"); // append：空闲时只加入列表，不会开始播放
             restored++;
         }
@@ -1236,6 +1257,8 @@ public partial class MainWindow : FluentWindow
         if (_idle) return;
         var now = DateTime.UtcNow;
         if ((now - _lastDblClick).TotalMilliseconds < DoubleClickMs + 100) return; // 双击的第二下
+        // 菜单开着时点画面只是关菜单（VideoHost 已经不把只有松开的那一下当单击，这里再保险一下）
+        if (_menuOpen || (now - _menuClosedAt).TotalMilliseconds < 400) return;
         // 点在后台窗口上的那一下只用来激活窗口：窗口之前确实在后台待过（不是一闪而过的焦点变化），
         // 并且刚刚才激活（mpv 在松开按键时才发来单击，所以留 600ms）
         bool wasInBackground = _activatedAt - _deactivatedAt > TimeSpan.FromMilliseconds(500);
@@ -1527,6 +1550,7 @@ public partial class MainWindow : FluentWindow
             UpdatePlaylistFlags();
             foreach (var e in list) ApplyThumb(e);
             UpdateAllProgress();
+            CheckMissingFiles();
         }
         _bar.BtnPrev.IsEnabled = _bar.BtnNext.IsEnabled = items.Count > 1;
     }
@@ -1537,8 +1561,9 @@ public partial class MainWindow : FluentWindow
         foreach (var e in _playlist)
         {
             string key = FullPath(e.Path);
-            e.Failed = _failedPaths.Contains(key) ||
-                       (_thumbInfo.TryGetValue(key, out var info) && info.Kind == PlaylistThumbs.Kind.Failed);
+            // 找不到的文件不再提示“无法打开，可修复”，只显示红色感叹号
+            e.Failed = !e.Missing && (_failedPaths.Contains(key) ||
+                       (_thumbInfo.TryGetValue(key, out var info) && info.Kind == PlaylistThumbs.Kind.Failed));
         }
     }
 
@@ -1628,18 +1653,69 @@ public partial class MainWindow : FluentWindow
     private List<PlaylistEntry> SelectedEntries() =>
         PlaylistBox.SelectedItems.OfType<PlaylistEntry>().OrderBy(e => e.Index).ToList();
 
-    /// <summary>右键菜单：选中多项时只有“移除”；一项都没选（点在空白处）不弹。</summary>
+    /// <summary>
+    /// 右键菜单：选中多项时只有“移除”；找不到的文件只有“移除”和“打开原先所在目录”；一项都没选（点在空白处）不弹。
+    /// </summary>
     private void OnPlaylistMenuOpening(object sender, ContextMenuEventArgs e)
     {
         int n = PlaylistBox.SelectedItems.Count;
         if (n == 0) { e.Handled = true; return; }
         bool multi = n > 1;
-        var single = multi ? Visibility.Collapsed : Visibility.Visible;
-        PlMenuPlay.Visibility = PlMenuReveal.Visibility = PlMenuSep.Visibility = PlMenuRepair.Visibility = PlMenuInfo.Visibility = single;
+        var entry = PlaylistBox.SelectedItem as PlaylistEntry;
+        string? path = entry?.Path;
+        // 右键时再确认一次（可能是刚刚才删掉 / 恢复的）
+        if (!multi && entry != null && IsLocalPath(entry.Path)) entry.Missing = !File.Exists(entry.Path);
+        bool missing = !multi && entry is { Missing: true };
+        var normal = multi || missing ? Visibility.Collapsed : Visibility.Visible;
+        PlMenuPlay.Visibility = PlMenuReveal.Visibility = PlMenuSep.Visibility = PlMenuRepair.Visibility = PlMenuInfo.Visibility = normal;
+        PlMenuOpenDir.Visibility = missing ? Visibility.Visible : Visibility.Collapsed;
         PlMenuRemove.Header = multi ? $"移除选中的 {n} 项" : "移除";
-        string? path = (PlaylistBox.SelectedItem as PlaylistEntry)?.Path;
         PlMenuRepair.Header = _repair.Running || _repairChecking ? "取消修复视频" : "修复视频（重新封装）…";
         PlMenuRepair.IsEnabled = _repair.Running || _repairChecking || (path != null && File.Exists(path));
+    }
+
+    private static bool IsLocalPath(string path) => path.Length > 0 && !path.Contains("://");
+
+    private int _missingCheck;
+
+    /// <summary>
+    /// 检查播放列表里的本地文件还在不在（软件获得焦点、加载 / 改动播放列表时）。在后台线程查，
+    /// 免得网络路径、睡眠的硬盘卡住界面；查完列表已经变了（又调用了一次）就丢掉结果。
+    /// </summary>
+    private async void CheckMissingFiles()
+    {
+        var paths = _playlist.Select(e => e.Path).Where(IsLocalPath).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        if (paths.Count == 0) return;
+        int gen = ++_missingCheck;
+        HashSet<string> missing;
+        try
+        {
+            missing = await Task.Run(() => paths.Where(p => { try { return !File.Exists(p); } catch { return false; } })
+                .ToHashSet(StringComparer.OrdinalIgnoreCase));
+        }
+        catch { return; }
+        if (gen != _missingCheck || _shuttingDown) return;
+        foreach (var e in _playlist) e.Missing = IsLocalPath(e.Path) && missing.Contains(e.Path);
+        UpdatePlaylistFlags();
+    }
+
+    /// <summary>
+    /// 找不到的文件：打开它原来所在的文件夹。那个文件夹也没了就往上找到还在的那一级；整个盘都没接上就提示。
+    /// </summary>
+    private void OpenOriginalFolder(string path)
+    {
+        string? dir = null;
+        try { dir = Path.GetDirectoryName(Path.GetFullPath(path)); } catch { }
+        while (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) dir = Path.GetDirectoryName(dir);
+        if (string.IsNullOrEmpty(dir))
+        {
+            _mpv?.ShowText("原来所在的文件夹（和所在的盘）都找不到了", 3000);
+            return;
+        }
+        // 盘符根目录 “D:\” 末尾的反斜杠会把后面的引号转义掉，写成 “D:\.”
+        System.Diagnostics.Process.Start("explorer.exe", $"\"{(dir.EndsWith('\\') ? dir + "." : dir)}\"");
+        string? wanted = Path.GetDirectoryName(path);
+        if (!SamePath(dir, wanted)) _mpv?.ShowText($"原来的文件夹已经不在了，打开了还在的上一级：{dir}", 3000);
     }
 
     private void PlaySelected()
@@ -2139,7 +2215,7 @@ public partial class MainWindow : FluentWindow
             if (_shuttingDown) return;
             var menu = new ContextMenu();
             foreach (var mi in ToWpfMenu(items)) menu.Items.Add(mi);
-            menu.Closed += (_, _) => _menuOpen = false;
+            menu.Closed += (_, _) => { _menuOpen = false; _menuClosedAt = DateTime.UtcNow; };
             menu.PlacementTarget = this;
             menu.Placement = PlacementMode.MousePoint;
             Activate();
