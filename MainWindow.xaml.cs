@@ -459,8 +459,8 @@ public partial class MainWindow : FluentWindow
         set("scale", S.Scale);
         set("dscale", S.Dscale);
         set("deband", S.Deband ? "yes" : "no");
-        set("video-sync", S.Interpolation ? "display-resample" : S.VideoSync);
-        set("interpolation", S.Interpolation ? "yes" : "no");
+        // 视频同步每个文件单独决定（MaybeMatchRefresh）：刷新率和帧率匹配时按显示器重采样，否则按音频同步
+        if (initial) { set("video-sync", "audio"); set("interpolation", "no"); }
         set("audio-device", string.IsNullOrEmpty(S.AudioDevice) ? "auto" : S.AudioDevice);
         // 5.1 / 7.1 → 立体声由 mpv（libswresample）按标准矩阵下混
         set("audio-channels", S.DownmixToStereo ? "stereo" : "auto-safe");
@@ -759,6 +759,10 @@ public partial class MainWindow : FluentWindow
         _hdr10Plus = false;
         _dvProfile = null;
         _autoHdrChecked = false;
+        _refreshChecked = false;
+        // 先按音频同步，视频参数出来以后再按刷新率是否匹配决定（纯音频文件就一直是音频同步）
+        _refreshMatched = false;
+        SetSyncMode("audio");
         ApplyToneMapping();
     }
 
@@ -920,6 +924,7 @@ public partial class MainWindow : FluentWindow
             AudioDelay = S.RememberDelays ? m.GetDouble("audio-delay") ?? 0 : old?.AudioDelay ?? 0,
             SubDelay = S.RememberDelays ? m.GetDouble("sub-delay") ?? 0 : old?.SubDelay ?? 0,
             Hwdec = old?.Hwdec,
+            VideoSync = old?.VideoSync,
             Audio = S.RememberTracks && _audioTouched && _audioSel != null ? _audioSel : old?.Audio,
             Sub = S.RememberTracks && _subTouched && _subSel != null ? _subSel : old?.Sub,
             LastPlayed = DateTime.UtcNow,
@@ -946,6 +951,155 @@ public partial class MainWindow : FluentWindow
     {
         UpdateFormatLabel();
         MaybeAutoHdr();
+        MaybeMatchRefresh();
+    }
+
+    // =====================================================================
+    //  自动匹配刷新率
+    // =====================================================================
+
+    // 每个文件第一次 video-reconfig 时检查一次；_refreshGdi / _refreshOriginal：改过刷新率的显示器和它原来的刷新率（退出时还原）
+    private bool _refreshChecked;
+    /// <summary>当前文件的刷新率和帧率匹配（这时固定按显示器重采样，右键菜单里的视频同步变灰）。</summary>
+    private bool _refreshMatched;
+    private string? _refreshGdi;
+    private RefreshRate.Mode? _refreshOriginal;
+
+    /// <summary>
+    /// 开始播放时（不是打开播放器时）按视频帧率选刷新率，见 <see cref="RefreshRate"/>。切换到别的视频会再检查一次：
+    /// 新视频没有匹配的刷新率，就恢复成原来的。同时决定视频同步方式：
+    /// 刷新率和帧率匹配（恰好或足够近似的整数倍）时按显示器重采样，mpv 微调播放速度把那点差别补上，不重复 / 丢帧；
+    /// 不匹配时用这个视频单独选的方式，没选过就用全局设置（按音频同步，或帧插值 + 按显示器重采样）。
+    /// 关掉“自动匹配刷新率”时不切换，只看当前刷新率匹不匹配。
+    /// 音乐文件（只有封面）不动。
+    /// </summary>
+    private void MaybeMatchRefresh()
+    {
+        var m = _mpv;
+        if (_refreshChecked || m == null || _idle) return;
+        if (m.GetString("video-params/gamma") == null) return; // 还没解码出第一帧
+        _refreshChecked = true;
+        if (m.GetFlag("current-tracks/video/image") == true) { _refreshMatched = false; SetSyncMode("audio"); return; }
+
+        string gdi = CurrentGdiName();
+        // 播放器挪到了另一块屏幕上：先把之前改过的那块还原
+        if (_refreshGdi != null && !string.Equals(_refreshGdi, gdi, StringComparison.OrdinalIgnoreCase)) RestoreRefresh(announce: false);
+        double fps = m.GetDouble("container-fps") ?? 0;
+        if (fps <= 0) fps = m.GetDouble("estimated-vf-fps") ?? 0;
+        var query = RefreshRate.Query(gdi);
+        if (query == null || fps <= 0) { ApplyVideoSync(false); return; }
+        var (cur, all) = query.Value;
+        bool currentMatches = RefreshRate.Pick(fps, new[] { cur }, cur) != null;
+        if (!S.MatchRefreshRate) { ApplyVideoSync(currentMatches); return; }
+
+        var original = _refreshGdi != null && _refreshOriginal is { } o ? all.FirstOrDefault(x => x.DevHz == o.DevHz, o) : cur;
+        var pick = RefreshRate.Pick(fps, all, cur);
+        var target = pick ?? original;
+        if (target.DevHz == cur.DevHz)
+        {
+            if (pick == null && _refreshGdi != null) { _refreshGdi = null; _refreshOriginal = null; }
+            ApplyVideoSync(pick != null);
+            return;
+        }
+
+        // 显示器切换模式时会黑一下：正在播放就先暂停，免得错过开头（自动切 HDR 时已经暂停的话不重复）
+        bool resume = m.GetFlag("pause") == false;
+        if (resume) m.SetProperty("pause", true);
+        if (!RefreshRate.Set(gdi, target.DevHz, out string err))
+        {
+            if (resume) m.SetProperty("pause", false);
+            ApplyVideoSync(currentMatches);
+            m.ShowText($"切换刷新率失败（{target.Text} Hz）：{err}", 3000);
+            return;
+        }
+        if (target.DevHz == original.DevHz)
+        {
+            _refreshGdi = null;
+            _refreshOriginal = null;
+        }
+        else if (_refreshGdi == null)
+        {
+            _refreshGdi = gdi;
+            _refreshOriginal = cur;
+        }
+        SetDisplayFpsOverride(_refreshGdi != null ? target.Hz : 0);
+        ApplyVideoSync(pick != null);
+
+        string fpsText = fps.ToString("0.###", Inv);
+        m.ShowText(pick != null
+            ? $"刷新率 {cur.Text} → {target.Text} Hz（视频 {fpsText} 帧" +
+              (Math.Abs(target.Hz / Math.Round(target.Hz / fps) - fps) / fps < RefreshRate.ExactTolerance ? "）" : "，近似）")
+            : $"没有和 {fpsText} 帧匹配的刷新率，恢复为原来的 {target.Text} Hz", 3000);
+        if (resume)
+        {
+            var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1500) };
+            t.Tick += (_, _) => { t.Stop(); _mpv?.SetProperty("pause", false); };
+            t.Start();
+        }
+    }
+
+    /// <summary>
+    /// matched：刷新率和帧率匹配，按显示器重采样（不插值）。否则用这个视频单独选的方式，没选过用全局设置。
+    /// </summary>
+    private void ApplyVideoSync(bool matched)
+    {
+        _refreshMatched = matched;
+        SetSyncMode(matched ? "resample" : FileVideoSync() ?? S.NoMatchSync);
+    }
+
+    /// <summary>"resample" = 按显示器重采样；"interp" = 帧插值 + 按显示器重采样；其它 = 按音频同步。</summary>
+    private void SetSyncMode(string mode)
+    {
+        var m = _mpv;
+        if (m == null) return;
+        m.SetProperty("video-sync", mode is "resample" or "interp" ? "display-resample" : "audio");
+        m.SetProperty("interpolation", mode == "interp" ? "yes" : "no");
+    }
+
+    private static string SyncName(string value) =>
+        SettingsWindow.NoMatchSyncChoices.FirstOrDefault(c => c.Value == value).Name ?? value;
+
+    /// <summary>当前文件单独选的、刷新率匹配不上时的视频同步方式；null = 跟随全局设置。</summary>
+    private string? FileVideoSync()
+    {
+        string? path = _currentPath ?? (_idle ? null : _mpv?.GetString("path"));
+        return path == null ? null : _fileStates.Get(path)?.VideoSync;
+    }
+
+    /// <summary>右键菜单里给当前视频选同步方式，记住（优先于全局设置）；刷新率匹配不上时立即生效。</summary>
+    private void SetFileVideoSync(string value)
+    {
+        var m = _mpv;
+        string? path = _currentPath ?? (_idle ? null : m?.GetString("path"));
+        if (m == null || path == null) return;
+        var st = _fileStates.Get(path) ?? new FileState { LastPlayed = DateTime.UtcNow };
+        st.VideoSync = value;
+        _fileStates.Set(path, st);
+        if (!_refreshMatched) ApplyVideoSync(false);
+        m.ShowText($"本视频的视频同步：{SyncName(value)}");
+    }
+
+    /// <summary>
+    /// 刷新率改了以后直接告诉 mpv 新的精确值（0 = 让 mpv 自己检测）：嵌入的 mpv 窗口不一定收得到显示模式变化的通知，
+    /// 按显示器重采样要用准确的刷新率。旧版 mpv 的选项名是 display-fps。
+    /// </summary>
+    private void SetDisplayFpsOverride(double hz)
+    {
+        var m = _mpv;
+        if (m == null) return;
+        string v = hz > 0 ? hz.ToString("0.######", Inv) : "0";
+        if (m.SetProperty("display-fps-override", v) < 0) m.SetProperty("display-fps", v);
+    }
+
+    /// <summary>把改过的刷新率还原（退出、关掉设置时）。</summary>
+    private void RestoreRefresh(bool announce)
+    {
+        if (_refreshGdi == null || _refreshOriginal is not { } o) return;
+        RefreshRate.Restore(_refreshGdi, o.DevHz);
+        _refreshGdi = null;
+        _refreshOriginal = null;
+        SetDisplayFpsOverride(0);
+        if (announce) _mpv?.ShowText($"刷新率已还原为 {o.Text} Hz", 2500);
     }
 
     private void OnEndFile(MpvEndReason reason, int error, double position)
@@ -1154,6 +1308,9 @@ public partial class MainWindow : FluentWindow
                 break;
             case "hwdec":
                 if (arg != null) SetFileHwdec(arg == "global" ? null : arg);
+                break;
+            case "vsync":
+                if (arg != null) SetFileVideoSync(arg);
                 break;
             case "audio-delay-dec": AdjustAudioDelay(-S.SubDelayStepMs); break;
             case "audio-delay-inc": AdjustAudioDelay(S.SubDelayStepMs); break;
@@ -1824,7 +1981,7 @@ public partial class MainWindow : FluentWindow
             _fileStates.Set(output, new FileState
             {
                 Position = st.Position, AudioDelay = st.AudioDelay, SubDelay = st.SubDelay, Hwdec = st.Hwdec,
-                Audio = st.Audio, Sub = st.Sub, LastPlayed = DateTime.UtcNow,
+                VideoSync = st.VideoSync, Audio = st.Audio, Sub = st.Sub, LastPlayed = DateTime.UtcNow,
             });
         }
         _failedPaths.Remove(source);
@@ -1947,6 +2104,19 @@ public partial class MainWindow : FluentWindow
         };
         hwdec.AddRange(SettingsWindow.HwdecChoices.Select(c => new MenuEntry(c.Name, Hp("hwdec", c.Value), Checked: fileHwdec == c.Value)));
         items.Add(new MenuEntry("解码方式（本视频）", Sub: hwdec, Enabled: playing));
+        // 视频同步：刷新率和帧率匹配时固定按显示器重采样，灰掉；匹配不上时可以给这个视频单独选，记住，优先于全局设置
+        if (_refreshMatched && playing)
+        {
+            items.Add(new MenuEntry("视频同步（刷新率已匹配，按显示器重采样）", Enabled: false));
+        }
+        else
+        {
+            // 只有两个选项，不另设“跟随全局设置”：没单独选过时勾的是全局设置里的那个
+            string effective = FileVideoSync() ?? S.NoMatchSync;
+            var sync = SettingsWindow.NoMatchSyncChoices
+                .Select(c => new MenuEntry(c.Name, Hp("vsync", c.Value), Checked: playing && effective == c.Value)).ToList();
+            items.Add(new MenuEntry("视频同步（本视频）", Sub: sync, Enabled: playing && _refreshChecked));
+        }
         items.Add(Sep);
         items.Add(new MenuEntry("播放列表", Hp("playlist"), "P", Checked: PlaylistPanel.Visibility == Visibility.Visible, Enabled: !_fullscreen));
         items.Add(new MenuEntry("全屏", Hp("fullscreen"), "F / 双击", Checked: _fullscreen));
@@ -2277,11 +2447,21 @@ public partial class MainWindow : FluentWindow
         bool needsReload = copy.DecoderThreads != S.DecoderThreads || copy.AudioLanguages != S.AudioLanguages ||
                            copy.SubLanguages != S.SubLanguages || copy.SubAuto != S.SubAuto;
         bool dvChanged = copy.DolbyVisionMode != S.DolbyVisionMode;
+        bool refreshToggled = copy.MatchRefreshRate != S.MatchRefreshRate;
         if (copy.TargetPeakNits != S.TargetPeakNits) _displayPeak = 0;
         CopySettings(copy, S);
         S.Save();
         ApplyPlaybackOptions(m, initial: false);
         if (dvChanged) m.SetProperty("vf", DolbyVisionFilter());
+        // 全局的“无匹配时的视频同步”改了：当前视频匹配不上刷新率、又没单独选过的，马上用新的
+        if (!refreshToggled && !_idle && _refreshChecked && !_refreshMatched) ApplyVideoSync(false);
+        if (refreshToggled)
+        {
+            // 关掉：马上还原；之后（或者打开时）对当前视频重新判断一次刷新率和同步方式
+            if (!S.MatchRefreshRate) RestoreRefresh(announce: true);
+            _refreshChecked = false;
+            MaybeMatchRefresh();
+        }
         UpdateThumbnailSource();
         // 改设置不会去切换 Windows HDR，只重新应用 mpv 的 HDR 参数
         ApplyMpvHdrProps();
@@ -2375,6 +2555,10 @@ public partial class MainWindow : FluentWindow
             {
                 Head("渲染输出");
                 Line("VO", $"{P("current-vo")}  API {P("gpu-api")}");
+                Line("视频同步", _refreshMatched ? "按显示器刷新率重采样（刷新率和帧率匹配）"
+                    : P("video-sync") == "display-resample" && m.GetFlag("interpolation") == true ? "帧插值（刷新率和帧率不匹配）"
+                    : P("video-sync") == "audio" ? "按音频同步（刷新率和帧率不匹配）"
+                    : P("video-sync"));
                 Line("输出色彩", $"{P("video-target-params/primaries")} / {P("video-target-params/gamma")}  峰值 {P("video-target-params/max-luma")} nit");
                 Line("HDR 输出", _hdrOn ? $"开  目标峰值 {Math.Round(DisplayPeak())} nit" : "关（色调映射到 SDR）");
                 Line("色调映射", $"{P("tone-mapping")}  峰值检测 {P("hdr-compute-peak")}  色域映射 {P("gamut-mapping-mode")}");
@@ -2513,6 +2697,7 @@ public partial class MainWindow : FluentWindow
                     Dispatcher.InvokeAsync(() =>
                     {
                         RestoreWindowsHdr();
+                        try { RestoreRefresh(announce: false); } catch { }
                         _closeReady = true;
                         Close();
                     });

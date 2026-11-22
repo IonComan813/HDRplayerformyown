@@ -180,6 +180,34 @@ internal static unsafe class DisplayHelper
         return null;
     }
 
+    /// <summary>正在使用的刷新率的精确值（QueryDisplayConfig 的 targetInfo.refreshRate，例如 71.928 = 71928/1000）。</summary>
+    public static double? CurrentRefreshRate(string gdiName)
+    {
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, out uint np, out uint nm) != 0) return null;
+        var paths = new PATH_INFO[np];
+        var modes = new MODE_INFO[nm];
+        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, ref np, paths, ref nm, modes, IntPtr.Zero) != 0) return null;
+        for (int i = 0; i < np; i++)
+        {
+            var src = new SOURCE_DEVICE_NAME
+            {
+                header = new DEVICE_INFO_HEADER
+                {
+                    type = TYPE_GET_SOURCE_NAME,
+                    size = (uint)Marshal.SizeOf<SOURCE_DEVICE_NAME>(),
+                    adapterId = paths[i].sourceInfo.adapterId,
+                    id = paths[i].sourceInfo.id,
+                },
+                viewGdiDeviceName = "",
+            };
+            if (DisplayConfigGetDeviceInfo(ref src) != 0) continue;
+            if (!string.Equals(src.viewGdiDeviceName, gdiName, StringComparison.OrdinalIgnoreCase)) continue;
+            var rr = paths[i].targetInfo.refreshRate;
+            return rr.Denominator == 0 || rr.Numerator == 0 ? null : (double)rr.Numerator / rr.Denominator;
+        }
+        return null;
+    }
+
     /// <summary>查询指定 GDI 显示器（如 \\.\DISPLAY1）的 HDR 信息。</summary>
     public static MonitorHdrInfo? Query(string gdiName)
     {
@@ -393,5 +421,86 @@ internal static unsafe class DisplayHelper
             }
         }
         finally { Release(factory); }
+    }
+
+    // ---------------- DXGI：显示模式列表（刷新率的精确分数值）----------------
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct DXGI_MODE_DESC
+    {
+        public uint Width, Height;
+        public uint RefreshNumerator, RefreshDenominator;
+        public int Format, ScanlineOrdering, Scaling;
+    }
+
+    /// <summary>
+    /// 这块显示器在 width × height 下支持的刷新率（Hz，精确值，例如 71.928 = 72000/1001）。
+    /// 来自 IDXGIOutput::GetDisplayModeList：驱动根据 EDID（以及在显卡控制面板里加的自定义分辨率）给出的模式列表。
+    /// 旧的 EnumDisplaySettings 只给整数（59.94 写成 59），所以用它来取精确值。拿不到时返回空列表。
+    /// </summary>
+    public static List<double> DxgiRefreshRates(string gdiName, uint width, uint height)
+    {
+        var result = new List<double>();
+        if (CreateDXGIFactory1(IID_IDXGIFactory1, out IntPtr factory) < 0) return result;
+        try
+        {
+            var enumAdapters = (delegate* unmanaged[Stdcall]<IntPtr, uint, IntPtr*, int>)Vtbl(factory)[7];
+            for (uint a = 0; ; a++)
+            {
+                IntPtr adapter;
+                if (enumAdapters(factory, a, &adapter) < 0) break;
+                try
+                {
+                    var enumOutputs = (delegate* unmanaged[Stdcall]<IntPtr, uint, IntPtr*, int>)Vtbl(adapter)[7];
+                    for (uint o = 0; ; o++)
+                    {
+                        IntPtr output;
+                        if (enumOutputs(adapter, o, &output) < 0) break;
+                        IntPtr output6 = IntPtr.Zero;
+                        try
+                        {
+                            var qi = (delegate* unmanaged[Stdcall]<IntPtr, Guid*, IntPtr*, int>)Vtbl(output)[0];
+                            Guid iid = IID_IDXGIOutput6;
+                            if (qi(output, &iid, &output6) < 0) continue;
+                            var getDesc1 = (delegate* unmanaged[Stdcall]<IntPtr, DXGI_OUTPUT_DESC1*, int>)Vtbl(output6)[27];
+                            DXGI_OUTPUT_DESC1 d;
+                            if (getDesc1(output6, &d) < 0) continue;
+                            if (!string.Equals(new string(d.DeviceName), gdiName, StringComparison.OrdinalIgnoreCase)) continue;
+
+                            // IDXGIOutput::GetDisplayModeList 是 vtable 第 8 项（IUnknown 3 + IDXGIObject 4 + GetDesc）。
+                            // 不同格式下列出的模式基本一样，先用最常见的 8-bit，没有再试 10-bit
+                            var getModes = (delegate* unmanaged[Stdcall]<IntPtr, int, uint, uint*, DXGI_MODE_DESC*, int>)Vtbl(output)[8];
+                            foreach (int format in new[] { 87 /* B8G8R8A8_UNORM */, 28 /* R8G8B8A8_UNORM */, 24 /* R10G10B10A2_UNORM */ })
+                            {
+                                uint n = 0;
+                                if (getModes(output, format, 0, &n, null) < 0 || n == 0) continue;
+                                var modes = new DXGI_MODE_DESC[n];
+                                fixed (DXGI_MODE_DESC* pm = modes)
+                                    if (getModes(output, format, 0, &n, pm) < 0) continue;
+                                for (int i = 0; i < n; i++)
+                                {
+                                    var m = modes[i];
+                                    // 竖屏时 DXGI 给的是旋转前的宽高
+                                    bool size = (m.Width == width && m.Height == height) || (m.Width == height && m.Height == width);
+                                    if (!size || m.RefreshDenominator == 0) continue;
+                                    double hz = (double)m.RefreshNumerator / m.RefreshDenominator;
+                                    if (hz > 1 && !result.Any(r => Math.Abs(r - hz) < 0.0005)) result.Add(hz);
+                                }
+                                if (result.Count > 0) break;
+                            }
+                            return result;
+                        }
+                        finally
+                        {
+                            Release(output6);
+                            Release(output);
+                        }
+                    }
+                }
+                finally { Release(adapter); }
+            }
+        }
+        finally { Release(factory); }
+        return result;
     }
 }
