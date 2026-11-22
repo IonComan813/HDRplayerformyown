@@ -457,6 +457,25 @@ public partial class MainWindow : FluentWindow
 
     private bool DvStripped => S.DolbyVisionMode == "strip";
 
+    /// <summary>上次设置的音频滤镜：没变就不重设（重设会让音频链重新初始化，声音断一下）。</summary>
+    private volatile string? _lastAf;
+
+    /// <summary>
+    /// 防削波的音频滤镜链。mpv 平时在所有音频滤镜之后才下混，那样限幅器看到的还是下混前的声道，
+    /// 所以下混到立体声时先用 format 滤镜在这里就下混好，再接后面的处理：
+    /// 仅限幅：alimiter 把超过满幅的峰值压到 -0.2 dBFS 以下（level=0：不做自动电平，不改变整体音量）；
+    /// 拉平音量 + 限幅：先 dynaudnorm（150 ms 一帧、15 帧高斯平滑、峰值 0.9、最多放大 8 倍，
+    /// 比默认参数反应快，延迟约 1 秒，不至于明显地忽大忽小），再 alimiter。
+    /// </summary>
+    private string AudioFilters(string antiClip)
+    {
+        var parts = new List<string>();
+        if (S.DownmixToStereo) parts.Add("format=channels=stereo");
+        if (antiClip == "dynaudnorm") parts.Add("lavfi=[dynaudnorm=f=150:g=15:p=0.9:m=8]");
+        parts.Add("lavfi=[alimiter=limit=0.977:level=0]");
+        return string.Join(",", parts);
+    }
+
     /// <summary>可在初始化前（option）或运行时（property）应用的播放设置。</summary>
     private void ApplyPlaybackOptions(Mpv m, bool initial)
     {
@@ -473,9 +492,12 @@ public partial class MainWindow : FluentWindow
         // 视频同步每个文件单独决定（MaybeMatchRefresh）：刷新率和帧率匹配时按显示器重采样，否则按音频同步
         if (initial) { set("video-sync", "audio"); set("interpolation", "no"); }
         set("audio-device", string.IsNullOrEmpty(S.AudioDevice) ? "auto" : S.AudioDevice);
-        // 5.1 / 7.1 → 立体声由 mpv（libswresample）按标准矩阵下混
+        // 5.1 / 7.1 → 立体声由 mpv（libswresample）按标准矩阵下混；不再用系数归一化（整轨都会变小声），
+        // 防削波交给下面的音频滤镜
         set("audio-channels", S.DownmixToStereo ? "stereo" : "auto-safe");
-        set("audio-normalize-downmix", S.NormalizeDownmix ? "yes" : "no");
+        set("audio-normalize-downmix", "no");
+        string af = AudioFilters(initial || _idle ? S.AntiClip : EffectiveAntiClip(_currentPath));
+        if (af != _lastAf && set("af", af) >= 0) _lastAf = af;
         set("alang", AppSettings.NormalizeLanguageList(S.AudioLanguages));
         set("slang", AppSettings.NormalizeLanguageList(S.SubLanguages));
         set("sub-auto", S.SubAuto);
@@ -655,8 +677,31 @@ public partial class MainWindow : FluentWindow
 
     private void UpdateHdrButton()
     {
-        _bar.BtnHdr.Content = _hdrOn ? "HDR" : "SDR";
-        _bar.BtnHdr.Foreground = (Brush)FindResource(_hdrOn ? "HdrOnBrush" : "TextFillColorSecondaryBrush");
+        bool enabled = HdrBlockedReason() == null;
+        // SDR 视频 / 纯音频：画面本来就是 SDR，一律显示灰色的“SDR”（即使 Windows HDR 还开着，
+        // mpv 对 SDR 片源输出的也是 sRGB 画面）
+        _bar.BtnHdr.Content = _hdrOn && enabled ? "HDR" : "SDR";
+        // 文字颜色是这里直接设的，按钮样式里“禁用时变灰”盖不过它，禁用时自己换成灰色
+        _bar.BtnHdr.Foreground = (Brush)FindResource(!enabled ? "TextFillColorDisabledBrush" : _hdrOn ? "HdrOnBrush" : "TextFillColorSecondaryBrush");
+        _bar.BtnHdr.IsEnabled = enabled;
+    }
+
+    /// <summary>
+    /// 不能手动开关 HDR 输出的原因（null = 可以）：当前是 SDR 视频，或者是纯音频 / 音乐封面，HDR 输出没有意义。
+    /// 右键菜单的“HDR 输出”、快捷键 H、控制栏的 HDR 按钮都看它。没在播放、文件还在打开、
+    /// 还没解码出第一帧（不知道是不是 HDR）时都可以。按片源自动切换不受影响。
+    /// </summary>
+    private string? HdrBlockedReason()
+    {
+        var m = _mpv;
+        if (m == null || _idle) return null;
+        var tracks = Tracks();
+        if (tracks.Count == 0) return null; // 还在打开
+        bool hasVideo = tracks.Any(t => TrackStr(t, "type") == "video" && !TrackFlag(t, "image"));
+        if (!hasVideo) return "纯音频文件，不需要 HDR 输出";
+        string? gamma = m.GetString("video-params/gamma");
+        if (gamma == null || gamma is "pq" or "hlg" || _dvProfile != null) return null;
+        return "当前是 SDR 视频，不需要 HDR 输出";
     }
 
     private void RestoreWindowsHdr()
@@ -712,6 +757,7 @@ public partial class MainWindow : FluentWindow
                 }
                 ShowIdleHint(_idle);
                 UpdateAllProgress();
+                UpdateHdrButton();
                 break;
             case "duration":
                 _duration = value is double d ? d : 0;
@@ -811,6 +857,7 @@ public partial class MainWindow : FluentWindow
         ApplyFileState(m, resumePosition: !reloaded);
         UpdateFormatLabel();
         UpdateThumbnailSource();
+        UpdateHdrButton();
         MaybeAutoHdr();
     }
 
@@ -936,6 +983,7 @@ public partial class MainWindow : FluentWindow
             SubDelay = S.RememberDelays ? m.GetDouble("sub-delay") ?? 0 : old?.SubDelay ?? 0,
             Hwdec = old?.Hwdec,
             VideoSync = old?.VideoSync,
+            AntiClip = old?.AntiClip,
             Audio = S.RememberTracks && _audioTouched && _audioSel != null ? _audioSel : old?.Audio,
             Sub = S.RememberTracks && _subTouched && _subSel != null ? _subSel : old?.Sub,
             LastPlayed = DateTime.UtcNow,
@@ -960,6 +1008,7 @@ public partial class MainWindow : FluentWindow
 
     private void OnVideoReconfig()
     {
+        UpdateHdrButton();
         UpdateFormatLabel();
         MaybeAutoHdr();
         MaybeMatchRefresh();
@@ -980,8 +1029,8 @@ public partial class MainWindow : FluentWindow
     /// 开始播放时（不是打开播放器时）按视频帧率选刷新率，见 <see cref="RefreshRate"/>。切换到别的视频会再检查一次：
     /// 新视频没有匹配的刷新率，就恢复成原来的。同时决定视频同步方式：
     /// 刷新率和帧率匹配（恰好或足够近似的整数倍）时按显示器重采样，mpv 微调播放速度把那点差别补上，不重复 / 丢帧；
-    /// 不匹配时用这个视频单独选的方式，没选过就用全局设置（按音频同步，或帧插值 + 按显示器重采样）。
-    /// 音乐文件（只有封面）不动。
+    /// 不匹配时用这个视频单独选的方式，没选过就用全局设置（按音频同步，或帧插值）。
+    /// 关掉“自动匹配刷新率”时始终不改显示器刷新率，只看当前刷新率匹不匹配。音乐文件（只有封面）不动。
     /// </summary>
     private void MaybeMatchRefresh()
     {
@@ -1000,6 +1049,7 @@ public partial class MainWindow : FluentWindow
         if (query == null || fps <= 0) { ApplyVideoSync(false); return; }
         var (cur, all) = query.Value;
         bool currentMatches = RefreshRate.Pick(fps, new[] { cur }, cur) != null;
+        if (!S.MatchRefreshRate) { ApplyVideoSync(currentMatches); return; }
 
         var original = _refreshGdi != null && _refreshOriginal is { } o ? all.FirstOrDefault(x => x.DevHz == o.DevHz, o) : cur;
         var pick = RefreshRate.Pick(fps, all, cur);
@@ -1075,8 +1125,37 @@ public partial class MainWindow : FluentWindow
         return path == null ? null : _fileStates.Get(path)?.VideoSync;
     }
 
-    /// <summary>右键菜单里给当前视频选同步方式，记住（优先于全局设置）；刷新率匹配不上时立即生效。</summary>
-    private void SetFileVideoSync(string value)
+    private static string AntiClipName(string value) =>
+        SettingsWindow.AntiClipChoices.FirstOrDefault(c => c.Value == value).Name ?? value;
+
+    /// <summary>这个文件的防削波策略：单独选过的优先，否则用全局设置。</summary>
+    private string EffectiveAntiClip(string? path) => (path == null ? null : _fileStates.Get(path)?.AntiClip) ?? S.AntiClip;
+
+    /// <summary>当前文件单独选的防削波策略；null = 跟随全局设置。</summary>
+    private string? FileAntiClip()
+    {
+        string? path = _currentPath ?? (_idle ? null : _mpv?.GetString("path"));
+        return path == null ? null : _fileStates.Get(path)?.AntiClip;
+    }
+
+    /// <summary>右键菜单里给当前视频选防削波策略（null = 跟随全局设置），记住，立即生效。</summary>
+    private void SetFileAntiClip(string? value)
+    {
+        var m = _mpv;
+        string? path = _currentPath ?? (_idle ? null : m?.GetString("path"));
+        if (m == null || path == null) return;
+        var st = _fileStates.Get(path) ?? new FileState { LastPlayed = DateTime.UtcNow };
+        st.AntiClip = value;
+        _fileStates.Set(path, st);
+        string af = AudioFilters(value ?? S.AntiClip);
+        if (af != _lastAf && m.SetProperty("af", af) >= 0) _lastAf = af;
+        m.ShowText(value == null
+            ? $"本视频的防削波：跟随全局设置（{AntiClipName(S.AntiClip)}）"
+            : $"本视频的防削波：{AntiClipName(value)}");
+    }
+
+    /// <summary>右键菜单里给当前视频选同步方式（null = 跟随全局设置），记住；刷新率匹配不上时立即生效。</summary>
+    private void SetFileVideoSync(string? value)
     {
         var m = _mpv;
         string? path = _currentPath ?? (_idle ? null : m?.GetString("path"));
@@ -1085,7 +1164,9 @@ public partial class MainWindow : FluentWindow
         st.VideoSync = value;
         _fileStates.Set(path, st);
         if (!_refreshMatched) ApplyVideoSync(false);
-        m.ShowText($"本视频的视频同步：{SyncName(value)}");
+        m.ShowText(value == null
+            ? $"本视频的视频同步：跟随全局设置（{SyncName(S.NoMatchSync)}）"
+            : $"本视频的视频同步：{SyncName(value)}");
     }
 
     /// <summary>
@@ -1329,8 +1410,11 @@ public partial class MainWindow : FluentWindow
             case "hwdec":
                 if (arg != null) SetFileHwdec(arg == "global" ? null : arg);
                 break;
+            case "anticlip":
+                if (arg != null) SetFileAntiClip(arg == "global" ? null : arg);
+                break;
             case "vsync":
-                if (arg != null) SetFileVideoSync(arg);
+                if (arg != null) SetFileVideoSync(arg == "global" ? null : arg);
                 break;
             case "audio-delay-dec": AdjustAudioDelay(-S.SubDelayStepMs); break;
             case "audio-delay-inc": AdjustAudioDelay(S.SubDelayStepMs); break;
@@ -1344,7 +1428,10 @@ public partial class MainWindow : FluentWindow
             case "load-audio": LoadAudioTrack(); break;
             case "settings": OpenSettings(); break;
             case "quit": Close(); break;
-            case "hdr": SetHdr(!_hdrOn, manual: true); break;
+            case "hdr":
+                if (HdrBlockedReason() is { } why) m.ShowText(why);
+                else SetHdr(!_hdrOn, manual: true);
+                break;
             case "sub-delay-dec": AdjustSubDelay(-S.SubDelayStepMs); break;
             case "sub-delay-inc": AdjustSubDelay(S.SubDelayStepMs); break;
             case "sub-toggle": m.CommandString("no-osd cycle sub-visibility"); m.ShowText("字幕显示：${sub-visibility}"); break;
@@ -1777,6 +1864,9 @@ public partial class MainWindow : FluentWindow
     private void OnLoadHook(Mpv m)
     {
         string? path = m.GetString("path");
+        // 防削波：这个文件单独选过就用它的，否则用全局的。在音频链建立之前设好，不会断声
+        string af = AudioFilters(EffectiveAntiClip(path));
+        if (af != _lastAf && m.SetProperty("af", af) >= 0) _lastAf = af;
         string? perFile = path == null ? null : _fileStates.Get(path)?.Hwdec;
         m.SetProperty("file-local-options/hwdec", perFile ?? S.Hwdec);
     }
@@ -2054,7 +2144,7 @@ public partial class MainWindow : FluentWindow
             _fileStates.Set(output, new FileState
             {
                 Position = st.Position, AudioDelay = st.AudioDelay, SubDelay = st.SubDelay, Hwdec = st.Hwdec,
-                VideoSync = st.VideoSync, Audio = st.Audio, Sub = st.Sub, LastPlayed = DateTime.UtcNow,
+                VideoSync = st.VideoSync, AntiClip = st.AntiClip, Audio = st.Audio, Sub = st.Sub, LastPlayed = DateTime.UtcNow,
             });
         }
         _failedPaths.Remove(source);
@@ -2093,7 +2183,7 @@ public partial class MainWindow : FluentWindow
 
     /// <summary>
     /// 菜单项：Cmd 是点击时执行的 mpv 命令（一般是 script-message hp …，回到 DoAction 处理）。
-    /// Checked 为 null 表示不是可勾选的项；true / false 的项前面留出对勾的位置，选中的显示对勾。
+    /// Checked 为 true 的项是当前选中的，左边显示蓝色竖条（和全局设置里下拉菜单的选中标记一样），不占位置，文字不缩进。
     /// </summary>
     private sealed record MenuEntry(string Title, string? Cmd = null, string? Shortcut = null,
         bool? Checked = null, bool Enabled = true, List<MenuEntry>? Sub = null)
@@ -2111,24 +2201,25 @@ public partial class MainWindow : FluentWindow
         var m = _mpv;
         bool playing = !_idle;
         string? path = playing ? m?.GetString("path") : null;
+        bool local = path != null && File.Exists(path);
+
+        // ---- 文件 ----
         var items = new List<MenuEntry>
         {
-            new("视频参数…", Hp("info"), "I"),
-            new("在资源管理器中显示", Hp("reveal"), Enabled: path != null && File.Exists(path)),
-            Sep,
             new("打开文件…", Hp("open"), "Ctrl+O"),
-            new("加载字幕…", Hp("load-sub"), Enabled: playing),
-            new("加载外部音轨…", Hp("load-audio"), Enabled: playing),
             new("重新载入当前文件", Hp("reload"), "F5", Enabled: playing),
+            // 修复视频：只针对正在播放的文件；打不开的文件在播放列表里右键修复
+            _repair.Running || _repairChecking
+                ? new MenuEntry("取消修复视频", Hp("repair-cancel"))
+                : new MenuEntry("修复视频（重新封装）…", Hp("repair"), Enabled: RepairTarget() != null),
+            new("视频参数…", Hp("info"), "I"),
+            new("在资源管理器中显示", Hp("reveal"), Enabled: local),
+            Sep,
         };
-        // 修复视频：只针对正在播放的文件；打不开的文件在播放列表里右键修复
-        items.Add(_repair.Running || _repairChecking
-            ? new MenuEntry("取消修复视频", Hp("repair-cancel"))
-            : new MenuEntry("修复视频（重新封装）…", Hp("repair"), Enabled: RepairTarget() != null));
-        items.Add(Sep);
 
-        var audio = new List<MenuEntry>();
-        var subs = new List<MenuEntry> { new("关闭字幕", Hp("sid", "no"), Checked: m?.GetString("sid") is "no" or null) };
+        // ---- 音轨 / 字幕：子菜单里是 载入外部文件 / 可选的轨 / 延迟 ----
+        var audioTracks = new List<MenuEntry>();
+        var subTracks = new List<MenuEntry> { new("关闭字幕", Hp("sid", "no"), Checked: playing && m?.GetString("sid") is "no" or null) };
         if (playing && m?.GetNode("track-list") is List<object?> tracks)
         {
             foreach (var t in tracks.OfType<Dictionary<string, object?>>())
@@ -2138,23 +2229,28 @@ public partial class MainWindow : FluentWindow
                 long id = t.GetValueOrDefault("id") is long l ? l : 0;
                 var entry = new MenuEntry(TrackText(t), Hp(type == "audio" ? "aid" : "sid", id.ToString(Inv)),
                     Checked: t.GetValueOrDefault("selected") is true);
-                (type == "audio" ? audio : subs).Add(entry);
+                (type == "audio" ? audioTracks : subTracks).Add(entry);
             }
         }
-        items.Add(new MenuEntry("音轨", Sub: audio, Enabled: audio.Count > 0));
-        items.Add(new MenuEntry("字幕", Sub: subs, Enabled: playing));
-
-        // 音频 / 字幕延迟：按文件记住（见 file-states.json），所以放在这里而不是全局设置里
+        // 音频 / 字幕延迟按文件记住（见 file-states.json），所以放在这里而不是全局设置里
         int step = S.SubDelayStepMs;
         double ad = (m?.GetDouble("audio-delay") ?? 0) * 1000, sd = (m?.GetDouble("sub-delay") ?? 0) * 1000;
-        items.Add(new MenuEntry("音频延迟", Enabled: playing, Sub: new()
+
+        var audio = new List<MenuEntry> { new("载入外部音轨…", Hp("load-audio")), Sep };
+        if (audioTracks.Count > 0) { audio.AddRange(audioTracks); audio.Add(Sep); }
+        audio.Add(new MenuEntry("音频延迟", Sub: new()
         {
             new($"当前：{ad:+0;-0;0} ms", Enabled: false),
             new($"提前 {step} ms", Hp("audio-delay-dec")),
             new($"延后 {step} ms", Hp("audio-delay-inc")),
             new("重置", Hp("audio-delay-reset")),
         }));
-        items.Add(new MenuEntry("字幕延迟", Enabled: playing, Sub: new()
+        items.Add(new MenuEntry("音轨", Sub: audio, Enabled: playing));
+
+        var subs = new List<MenuEntry> { new("载入外部字幕…", Hp("load-sub")), Sep };
+        subs.AddRange(subTracks);
+        subs.Add(Sep);
+        subs.Add(new MenuEntry("字幕延迟", Sub: new()
         {
             new($"当前：{sd:+0;-0;0} ms", Enabled: false),
             new($"提前 {step} ms", Hp("sub-delay-dec"), "Z"),
@@ -2163,12 +2259,15 @@ public partial class MainWindow : FluentWindow
             Sep,
             _subSync.Running
                 ? new MenuEntry("取消自动同步", Hp("sub-sync"))
-                : new MenuEntry("自动同步字幕（ffsubsync）…", Hp("sub-sync"), Enabled: path != null && File.Exists(path)),
+                : new MenuEntry("自动同步字幕（ffsubsync）…", Hp("sub-sync"), Enabled: local),
         }));
+        items.Add(new MenuEntry("字幕", Sub: subs, Enabled: playing));
         items.Add(Sep);
 
-        items.Add(new MenuEntry("HDR 输出", Hp("hdr"), "H", Checked: _hdrOn));
-        // 解码方式：只对当前这个视频生效并按文件记住，优先于全局设置
+        // ---- 画面 / 声音的处理方式（后三项按文件记住，优先于全局设置）----
+        // SDR 视频、纯音频时 HDR 输出没有意义，灰掉（快捷键 H、控制栏按钮也一样）
+        bool hdrAllowed = HdrBlockedReason() == null;
+        items.Add(new MenuEntry("HDR 输出", Hp("hdr"), "H", Checked: _hdrOn && hdrAllowed, Enabled: hdrAllowed));
         string? fileHwdec = FileHwdec();
         var hwdec = new List<MenuEntry>
         {
@@ -2176,26 +2275,42 @@ public partial class MainWindow : FluentWindow
             Sep,
         };
         hwdec.AddRange(SettingsWindow.HwdecChoices.Select(c => new MenuEntry(c.Name, Hp("hwdec", c.Value), Checked: fileHwdec == c.Value)));
-        items.Add(new MenuEntry("解码方式（本视频）", Sub: hwdec, Enabled: playing));
-        // 视频同步：刷新率和帧率匹配时固定按显示器重采样，灰掉；匹配不上时可以给这个视频单独选，记住，优先于全局设置
+        items.Add(new MenuEntry("解码方式", Sub: hwdec, Enabled: playing));
+        // 视频同步：刷新率和帧率匹配时固定按显示器重采样，灰掉；匹配不上时可以给这个视频单独选
         if (_refreshMatched && playing)
         {
             items.Add(new MenuEntry("视频同步（刷新率已匹配）", Enabled: false));
         }
         else
         {
-            // 只有两个选项，不另设“跟随全局设置”：没单独选过时勾的是全局设置里的那个
-            string effective = FileVideoSync() ?? S.NoMatchSync;
-            var sync = SettingsWindow.NoMatchSyncChoices
-                .Select(c => new MenuEntry(c.Name, Hp("vsync", c.Value), Checked: playing && effective == c.Value)).ToList();
-            items.Add(new MenuEntry("视频同步（本视频）", Sub: sync, Enabled: playing && _refreshChecked));
+            // 跟随全局设置：全局设置改了，这个视频也跟着改；单独选过的按文件记住，不受全局设置影响
+            string? fileSync = FileVideoSync();
+            var sync = new List<MenuEntry>
+            {
+                new($"跟随全局设置（{SyncName(S.NoMatchSync)}）", Hp("vsync", "global"), Checked: playing && fileSync == null),
+                Sep,
+            };
+            sync.AddRange(SettingsWindow.NoMatchSyncChoices
+                .Select(c => new MenuEntry(c.Name, Hp("vsync", c.Value), Checked: playing && fileSync == c.Value)));
+            items.Add(new MenuEntry("视频同步", Sub: sync, Enabled: playing && _refreshChecked));
         }
+        string? fileAntiClip = FileAntiClip();
+        var antiClip = new List<MenuEntry>
+        {
+            new($"跟随全局设置（{AntiClipName(S.AntiClip)}）", Hp("anticlip", "global"), Checked: playing && fileAntiClip == null),
+            Sep,
+        };
+        antiClip.AddRange(SettingsWindow.AntiClipChoices
+            .Select(c => new MenuEntry(c.Name, Hp("anticlip", c.Value), Checked: playing && fileAntiClip == c.Value)));
+        items.Add(new MenuEntry("防削波策略", Sub: antiClip, Enabled: playing));
         items.Add(Sep);
+
+        // ---- 窗口 ----
         items.Add(new MenuEntry("播放列表", Hp("playlist"), "P", Checked: PlaylistPanel.Visibility == Visibility.Visible, Enabled: !_fullscreen));
         items.Add(new MenuEntry("全屏", Hp("fullscreen"), "F / 双击", Checked: _fullscreen));
         items.Add(new MenuEntry("全局设置…", Hp("settings")));
         items.Add(Sep);
-        items.Add(new MenuEntry("退出", Hp("quit")));
+        items.Add(new MenuEntry("退出软件", Hp("quit")));
         return items;
     }
 
@@ -2235,31 +2350,38 @@ public partial class MainWindow : FluentWindow
         t.Start();
     }
 
-    private List<object> ToWpfMenu(List<MenuEntry> items)
-    {
-        // 这一级菜单里有打勾的项时，所有项都留出对勾的位置，文字对齐；一项都没勾就都不留
-        bool reserveTick = items.Any(e => e.Checked == true);
-        return items.Select(e => ToWpfMenuItem(e, reserveTick)).ToList();
-    }
+    private List<object> ToWpfMenu(List<MenuEntry> items) => items.Select(ToWpfMenuItem).ToList();
 
-    private object ToWpfMenuItem(MenuEntry e, bool reserveTick)
+    /// <summary>
+    /// WPF-UI 菜单项模板（SubmenuItemTemplate）：高亮的圆角框里，标题从左边 8 px 开始。
+    /// 选中标记照着全局设置里下拉菜单的样子画（WPF-UI ComboBoxItem 的 ActiveRectangle：3 × 16、圆角 2、
+    /// 颜色 ComboBoxItemPillFillBrush），贴在高亮框的最左边，所以往左挪 8 px。
+    /// </summary>
+    private const double MenuHeaderInset = 8;
+
+    private object ToWpfMenuItem(MenuEntry e)
     {
         if (e.IsSeparator) return (object)new Separator();
-        // MenuItem 会把 “_” 当作访问键，转义一下
-        var mi = new MenuItem
-        {
-            Header = e.Title.Replace("_", "__"), InputGestureText = e.Shortcut ?? "", IsEnabled = e.Enabled,
-        };
-        // WPF-UI 的菜单只有 IsCheckable 时才画勾选框（而且每项都是一个框），这里自己在图标位置画对勾
+        var mi = new MenuItem { InputGestureText = e.Shortcut ?? "", IsEnabled = e.Enabled };
         if (e.Checked == true)
         {
-            var tick = new SymbolIcon { Symbol = SymbolRegular.Checkmark24, FontSize = 16, Width = 16 };
-            tick.SetResourceReference(Control.ForegroundProperty, "AccentTextFillColorPrimaryBrush");
-            mi.Icon = tick;
+            // 标题换成“文字 + 一个不占位置的竖条”：竖条放在宽度为 0 的 Canvas 里、往左画出去，
+            // 选中项的文字和其它项对齐（以前的对勾会让整级菜单都缩进）
+            var pill = new System.Windows.Shapes.Rectangle { Width = 3, Height = 16, RadiusX = 2, RadiusY = 2 };
+            pill.SetResourceReference(System.Windows.Shapes.Shape.FillProperty, "ComboBoxItemPillFillBrush");
+            Canvas.SetLeft(pill, -MenuHeaderInset);
+            Canvas.SetTop(pill, -8);
+            var canvas = new Canvas { Width = 0, Height = 0, HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Center };
+            canvas.Children.Add(pill);
+            var header = new Grid();
+            header.Children.Add(new System.Windows.Controls.TextBlock { Text = e.Title });
+            header.Children.Add(canvas);
+            mi.Header = header;
         }
-        else if (reserveTick)
+        else
         {
-            mi.Icon = new Border { Width = 16 };
+            // 字符串标题里 MenuItem 会把 “_” 当作访问键，转义一下
+            mi.Header = e.Title.Replace("_", "__");
         }
         if (e.Sub != null) foreach (var sub in ToWpfMenu(e.Sub)) mi.Items.Add(sub);
         if (e.Cmd != null) { string cmd = e.Cmd; mi.Click += (_, _) => _mpv?.CommandString(cmd); }
@@ -2520,13 +2642,21 @@ public partial class MainWindow : FluentWindow
         bool needsReload = copy.DecoderThreads != S.DecoderThreads || copy.AudioLanguages != S.AudioLanguages ||
                            copy.SubLanguages != S.SubLanguages || copy.SubAuto != S.SubAuto;
         bool dvChanged = copy.DolbyVisionMode != S.DolbyVisionMode;
+        bool refreshToggled = copy.MatchRefreshRate != S.MatchRefreshRate;
         if (copy.TargetPeakNits != S.TargetPeakNits) _displayPeak = 0;
         CopySettings(copy, S);
         S.Save();
         ApplyPlaybackOptions(m, initial: false);
         if (dvChanged) m.SetProperty("vf", DolbyVisionFilter());
-        // 全局的“无匹配时的视频同步”改了：当前视频匹配不上刷新率、又没单独选过的，马上用新的
-        if (!_idle && _refreshChecked && !_refreshMatched) ApplyVideoSync(false);
+        if (refreshToggled)
+        {
+            // 关掉：马上还原刷新率；之后（或者打开时）对当前视频重新判断一次刷新率和同步方式
+            if (!S.MatchRefreshRate) RestoreRefresh(announce: true);
+            _refreshChecked = false;
+            MaybeMatchRefresh();
+        }
+        // 全局的“无匹配时的视频同步”改了：当前视频匹配不上刷新率、又跟随全局设置的，马上用新的
+        else if (!_idle && _refreshChecked && !_refreshMatched) ApplyVideoSync(false);
         UpdateThumbnailSource();
         // 改设置不会去切换 Windows HDR，只重新应用 mpv 的 HDR 参数
         ApplyMpvHdrProps();
@@ -2639,6 +2769,7 @@ public partial class MainWindow : FluentWindow
                     Line("输出声道", $"{P("audio-out-params/channel-count")} ch  {P("audio-out-params/hr-channels")}" +
                         (S.DownmixToStereo ? "  (下混到立体声)" : ""));
                 Line("采样率", $"{P("audio-params/samplerate")} Hz  {P("audio-params/format")}");
+                if (live) Line("防削波", EffectiveAntiClip(_currentPath) == "dynaudnorm" ? "拉平音量（dynaudnorm）+ 限幅" : "仅限幅（alimiter）");
                 if (live)
                 {
                     Line("码率", O("audio-bitrate"));
