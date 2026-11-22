@@ -970,7 +970,6 @@ public partial class MainWindow : FluentWindow
     /// 新视频没有匹配的刷新率，就恢复成原来的。同时决定视频同步方式：
     /// 刷新率和帧率匹配（恰好或足够近似的整数倍）时按显示器重采样，mpv 微调播放速度把那点差别补上，不重复 / 丢帧；
     /// 不匹配时用这个视频单独选的方式，没选过就用全局设置（按音频同步，或帧插值 + 按显示器重采样）。
-    /// 关掉“自动匹配刷新率”时不切换，只看当前刷新率匹不匹配。
     /// 音乐文件（只有封面）不动。
     /// </summary>
     private void MaybeMatchRefresh()
@@ -990,7 +989,6 @@ public partial class MainWindow : FluentWindow
         if (query == null || fps <= 0) { ApplyVideoSync(false); return; }
         var (cur, all) = query.Value;
         bool currentMatches = RefreshRate.Pick(fps, new[] { cur }, cur) != null;
-        if (!S.MatchRefreshRate) { ApplyVideoSync(currentMatches); return; }
 
         var original = _refreshGdi != null && _refreshOriginal is { } o ? all.FirstOrDefault(x => x.DevHz == o.DevHz, o) : cur;
         var pick = RefreshRate.Pick(fps, all, cur);
@@ -2107,7 +2105,7 @@ public partial class MainWindow : FluentWindow
         // 视频同步：刷新率和帧率匹配时固定按显示器重采样，灰掉；匹配不上时可以给这个视频单独选，记住，优先于全局设置
         if (_refreshMatched && playing)
         {
-            items.Add(new MenuEntry("视频同步（刷新率已匹配，按显示器重采样）", Enabled: false));
+            items.Add(new MenuEntry("视频同步（刷新率已匹配）", Enabled: false));
         }
         else
         {
@@ -2447,21 +2445,13 @@ public partial class MainWindow : FluentWindow
         bool needsReload = copy.DecoderThreads != S.DecoderThreads || copy.AudioLanguages != S.AudioLanguages ||
                            copy.SubLanguages != S.SubLanguages || copy.SubAuto != S.SubAuto;
         bool dvChanged = copy.DolbyVisionMode != S.DolbyVisionMode;
-        bool refreshToggled = copy.MatchRefreshRate != S.MatchRefreshRate;
         if (copy.TargetPeakNits != S.TargetPeakNits) _displayPeak = 0;
         CopySettings(copy, S);
         S.Save();
         ApplyPlaybackOptions(m, initial: false);
         if (dvChanged) m.SetProperty("vf", DolbyVisionFilter());
         // 全局的“无匹配时的视频同步”改了：当前视频匹配不上刷新率、又没单独选过的，马上用新的
-        if (!refreshToggled && !_idle && _refreshChecked && !_refreshMatched) ApplyVideoSync(false);
-        if (refreshToggled)
-        {
-            // 关掉：马上还原；之后（或者打开时）对当前视频重新判断一次刷新率和同步方式
-            if (!S.MatchRefreshRate) RestoreRefresh(announce: true);
-            _refreshChecked = false;
-            MaybeMatchRefresh();
-        }
+        if (!_idle && _refreshChecked && !_refreshMatched) ApplyVideoSync(false);
         UpdateThumbnailSource();
         // 改设置不会去切换 Windows HDR，只重新应用 mpv 的 HDR 参数
         ApplyMpvHdrProps();

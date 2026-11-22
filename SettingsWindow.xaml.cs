@@ -186,10 +186,6 @@ public partial class SettingsWindow : FluentWindow
         AddCombo(p, "放大算法", null, ScaleChoices, _s.Scale, v => _s.Scale = v);
         AddCombo(p, "缩小算法", null, DscaleChoices, _s.Dscale, v => _s.Dscale = v);
         AddToggle(p, "去色带 (deband)", null, _s.Deband, v => _s.Deband = v);
-        AddToggle(p, "自动匹配刷新率",
-            "开始播放时把显示器切到视频帧率的整数倍（不低于 47.952 Hz，选符合条件的最低刷新率；没有恰好的就用最接近的，" +
-            "如 119.88 帧用 120 Hz），切换视频时重新匹配，退出时还原。只在系统列出的刷新率里选，不设置自定义刷新率",
-            _s.MatchRefreshRate, v => _s.MatchRefreshRate = v);
         AddCombo(p, "视频同步",
             "如果有近似匹配的刷新率，则直接按显示器刷新率重采样；此处选择无匹配时的优先策略，" +
             "可在每个视频文件中单独调整（画面右键 → 视频同步）",
