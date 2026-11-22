@@ -246,7 +246,6 @@ public partial class MainWindow : FluentWindow
         PlaylistBox.ContextMenuOpening += OnPlaylistMenuOpening;
         PlMenuOpenDir.Click += (_, _) => { if (PlaylistBox.SelectedItem is PlaylistEntry e) OpenOriginalFolder(e.Path); };
         BtnPlDeselect.Click += (_, _) => PlaylistBox.UnselectAll();
-        PlaylistBox.SelectionChanged += (_, _) => BtnPlDeselect.IsEnabled = PlaylistBox.SelectedItems.Count > 0;
         _plThumbs.Ready += (path, pos, kind, bmp, duration) =>
         {
             if (!_shuttingDown) Dispatcher.InvokeAsync(() => OnPlaylistThumb(path, pos, kind, bmp, duration));
