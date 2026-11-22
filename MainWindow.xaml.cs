@@ -414,6 +414,8 @@ public partial class MainWindow : FluentWindow
         m.StartFile += () =>
         {
             _lastPos = 0;
+            // 在事件线程上清掉：紧接着的 on_load 钩子（也在事件线程上）要按“没退回过解码”来设置音频输出
+            _ptFallback = false;
             string? starting = m.GetString("path");
             Ui(() => { _startingPath = starting; OnStartFile(); });
         };
@@ -479,12 +481,15 @@ public partial class MainWindow : FluentWindow
 
     /// <summary>
     /// 设置音频输出：直通时 audio-spdif 列出要直通的格式，滤镜清空（码流不能做 PCM 处理），声道数自动
-    /// （下混到立体声会挡住 TrueHD / DTS-HD 这类多声道码流；不支持直通的音轨按设备的声道数正常解码）；
-    /// 不直通时按下混设置和防削波策略。path = null 时用全局设置。
+    /// （下混到立体声会挡住 TrueHD / DTS-HD 这类多声道码流）；不直通时按下混设置和防削波策略。path = null 时用全局设置。
+    /// 以下情况虽然直通设置开着，实际是正常 PCM 解码，就按正常解码设置（下混、防削波照常生效）：
+    /// 当前音轨的格式不能直通（tracksKnown：已经知道选的是哪条音轨；打开文件前的 on_load 钩子里还不知道），
+    /// 或者 mpv 打不开直通输出、自己退回了解码（_ptFallback）。
     /// </summary>
-    private void ApplyAudioChain(Func<string, string, int> set, string? path)
+    private void ApplyAudioChain(Func<string, string, int> set, string? path, bool tracksKnown)
     {
-        bool pt = EffectivePassthrough(path);
+        bool pt = EffectivePassthrough(path) && !_ptFallback;
+        if (pt && tracksKnown && !_idle && !CurrentAudioCanPassthrough()) pt = false;
         string spdif = pt ? PassthroughCodecs : "";
         string channels = pt ? "auto" : S.DownmixToStereo ? "stereo" : "auto-safe";
         string af = pt ? "" : AudioFilters(EffectiveAntiClip(path));
@@ -530,7 +535,7 @@ public partial class MainWindow : FluentWindow
         // 5.1 / 7.1 → 立体声由 mpv（libswresample）按标准矩阵下混；不再用系数归一化（整轨都会变小声），
         // 防削波交给音频滤镜；音频直通时都不用（见 ApplyAudioChain）
         set("audio-normalize-downmix", "no");
-        ApplyAudioChain(set, initial || _idle ? null : _currentPath);
+        ApplyAudioChain(set, initial || _idle ? null : _currentPath, tracksKnown: !initial && !_idle);
         set("alang", AppSettings.NormalizeLanguageList(S.AudioLanguages));
         set("slang", AppSettings.NormalizeLanguageList(S.SubLanguages));
         set("sub-auto", S.SubAuto);
@@ -775,6 +780,13 @@ public partial class MainWindow : FluentWindow
             case "sid":
                 SnapshotTracks();
                 SwapTrackDelay(audio: name == "aid");
+                if (name == "aid" && _currentPath != null && !_idle && _mpv is { } am)
+                {
+                    // 换了音轨：新音轨可能能直通、也可能不能，重新试一次直通
+                    _ptFallback = false;
+                    _ptWarned = false;
+                    ApplyAudioChain(am.SetProperty, _currentPath, tracksKnown: true);
+                }
                 break;
             case "pause":
                 _paused = value is true;
@@ -855,7 +867,6 @@ public partial class MainWindow : FluentWindow
         _refreshChecked = false;
         _audioKey = _subKey = null;
         _ptWarned = false;
-        _ptFallback = false;
         // 先按音频同步，视频参数出来以后再按刷新率是否匹配决定（纯音频文件就一直是音频同步）
         _refreshMatched = false;
         SetSyncMode("audio");
@@ -897,6 +908,8 @@ public partial class MainWindow : FluentWindow
         UpdateFormatLabel();
         UpdateThumbnailSource();
         UpdateHdrButton();
+        // 知道选的是哪条音轨了：直通开着但这条音轨不能直通（AAC 等）时，改按正常解码设置
+        ApplyAudioChain(m.SetProperty, _currentPath, tracksKnown: true);
         UpdateBitstream(); // 没有音轨的文件不会再有音频重配置，这里也更新一次
         MaybeAutoHdr();
     }
@@ -1255,7 +1268,7 @@ public partial class MainWindow : FluentWindow
         var st = _fileStates.Get(path) ?? new FileState { LastPlayed = DateTime.UtcNow };
         st.AntiClip = value;
         _fileStates.Set(path, st);
-        ApplyAudioChain(m.SetProperty, path);
+        ApplyAudioChain(m.SetProperty, path, tracksKnown: true);
         m.ShowText(value == null
             ? $"本视频的防削波：跟随全局设置（{AntiClipName(S.AntiClip)}）"
             : $"本视频的防削波：{AntiClipName(value)}");
@@ -1278,8 +1291,10 @@ public partial class MainWindow : FluentWindow
         _ptWarned = false;
         if (_ptFallback && EffectivePassthrough(path))
         {
-            // 刚才设备没接受码流、退回了解码：这次点击是重试，不改设置。重建音频输出，mpv 会再试一次直通
+            // 刚才 mpv 打不开直通输出、退回了解码：这次点击是重试，不改设置。
+            // 先换回直通的设置（清空滤镜），再重建音频输出，mpv 会再走一遍直通流程，不行还会再退回解码
             _ptFallback = false;
+            ApplyAudioChain(m.SetProperty, path, tracksKnown: true);
             m.Command("ao-reload");
             m.ShowText("重新尝试音频直通…");
             return;
@@ -1288,7 +1303,7 @@ public partial class MainWindow : FluentWindow
         var st = _fileStates.Get(path) ?? new FileState { LastPlayed = DateTime.UtcNow };
         st.Passthrough = next == S.AudioPassthrough ? null : next;
         _fileStates.Set(path, st);
-        ApplyAudioChain(m.SetProperty, path);
+        ApplyAudioChain(m.SetProperty, path, tracksKnown: true);
         m.ShowText($"音频直通：{(next ? "开" : "关")}" +
                    (st.Passthrough == null ? "（和全局设置一致）" : "（本视频单独设置）"));
     }
@@ -1606,19 +1621,24 @@ public partial class MainWindow : FluentWindow
                      (m.GetString("audio-out-params/format") ?? "").StartsWith("spdif", StringComparison.OrdinalIgnoreCase);
         _bar.SetPassthrough(_bitstream);
         if (_bitstream) _ptFallback = false;
-        if (!_bitstream && !_ptWarned && m != null && !_idle && EffectivePassthrough(_currentPath) && CurrentAudioCanPassthrough())
+        if (!_bitstream && !_ptWarned && !_ptFallback && m != null && !_idle && EffectivePassthrough(_currentPath) && CurrentAudioCanPassthrough())
             CheckPassthroughFallback();
     }
 
     /// <summary>这个文件已经提示过“设备不支持直通”了。</summary>
     private bool _ptWarned;
-    /// <summary>直通开着、格式也能直通，但设备不接受，mpv 退回了正常解码：菜单里不显示开启，点一下是重试。</summary>
-    private bool _ptFallback;
+    /// <summary>
+    /// 直通开着、格式也能直通，但 mpv 打不开直通输出（Windows / 驱动不接受这种码流格式），自己退回了正常解码：
+    /// 这时就是普通 PCM 播放，下混和防削波照常生效；菜单里不显示开启，点一下是重试。
+    /// 码流发出去了但功放 / 电视解不了，mpv 这边看不出来，那种情况仍显示为直通。
+    /// 在 mpv 事件线程（start-file）和 UI 线程上都会写。
+    /// </summary>
+    private volatile bool _ptFallback;
     private DispatcherTimer? _ptCheck;
 
     /// <summary>
-    /// 格式能直通、却在正常解码：设备不接受这种码流，mpv 自动退回了解码。音频链可能还在重建，
-    /// 等 1.5 秒再看一次，确实不是码流才提示（每个文件只提示一次）。
+    /// 格式能直通、却在正常解码：mpv 打不开直通输出，自己退回了解码。音频链可能还在重建，
+    /// 等 1.5 秒再看一次，确实不是码流才算退回：提示一次，并按正常解码套上下混和防削波。
     /// </summary>
     private void CheckPassthroughFallback()
     {
@@ -1628,12 +1648,13 @@ public partial class MainWindow : FluentWindow
         {
             _ptCheck?.Stop();
             var m = _mpv;
-            if (m == null || _idle || _ptWarned || !EffectivePassthrough(_currentPath) || !CurrentAudioCanPassthrough()) return;
+            if (m == null || _idle || _ptWarned || _ptFallback || !EffectivePassthrough(_currentPath) || !CurrentAudioCanPassthrough()) return;
             string fmt = m.GetString("audio-out-params/format") ?? "";
             if (fmt.Length == 0 || fmt.StartsWith("spdif", StringComparison.OrdinalIgnoreCase)) return;
             _ptWarned = true;
             _ptFallback = true;
-            m.ShowText($"音频直通：设备不支持 {CurrentAudioCodec()?.ToUpperInvariant()} 码流，已改为正常解码（右键 → 音频直通 可以再试一次）", 3500);
+            ApplyAudioChain(m.SetProperty, _currentPath, tracksKnown: true);
+            m.ShowText($"音频直通：无法以 {CurrentAudioCodec()?.ToUpperInvariant()} 码流输出，已改为正常解码（右键 → 音频直通 可以再试一次）", 3500);
         };
         _ptCheck.Start();
     }
@@ -2055,8 +2076,9 @@ public partial class MainWindow : FluentWindow
     private void OnLoadHook(Mpv m)
     {
         string? path = m.GetString("path");
-        // 音频直通 / 防削波：这个文件单独选过就用它的，否则用全局的。在音频链建立之前设好，不会断声
-        ApplyAudioChain(m.SetProperty, path);
+        // 音频直通 / 防削波：这个文件单独选过就用它的，否则用全局的。在音频链建立之前设好，不会断声。
+        // 这时还不知道会选哪条音轨，直通开着就先按直通设；载入后发现音轨格式不能直通再改（OnFileLoaded）
+        ApplyAudioChain(m.SetProperty, path, tracksKnown: false);
         string? perFile = path == null ? null : _fileStates.Get(path)?.Hwdec;
         m.SetProperty("file-local-options/hwdec", perFile ?? S.Hwdec);
     }
@@ -2508,8 +2530,8 @@ public partial class MainWindow : FluentWindow
         string ptTitle = !playing || canPassthrough ? "音频直通"
             : audioCodec == null ? "音频直通（没有音轨）" : $"音频直通（{audioCodec.ToUpperInvariant()} 不支持）";
         items.Add(new MenuEntry(ptTitle, Hp("passthrough"), Checked: passthrough, Enabled: canPassthrough));
-        // 直通设置开着时滤镜链是空的（退回解码时也一样），防削波不起作用，保持灰色
-        items.Add(new MenuEntry("防削波策略", Sub: antiClip, Enabled: playing && !(canPassthrough && EffectivePassthrough(path))));
+        // 真正在直通时防削波不起作用，灰掉；退回解码、音轨格式不能直通时就是正常解码，照常可选
+        items.Add(new MenuEntry("防削波策略", Sub: antiClip, Enabled: playing && !passthrough));
         items.Add(Sep);
 
         // ---- 窗口 ----
@@ -2983,7 +3005,7 @@ public partial class MainWindow : FluentWindow
                     Line("音频直通", !pt ? "关"
                         : outFmt.StartsWith("spdif", StringComparison.OrdinalIgnoreCase) ? $"开（{outFmt}，由功放 / 电视解码）"
                         : "开（这条音轨的格式或设备不支持，已改为正常解码）");
-                    Line("防削波", pt ? "不起作用（音频直通）"
+                    Line("防削波", pt && _bitstream ? "不起作用（音频直通）"
                         : EffectiveAntiClip(_currentPath) == "dynaudnorm" ? "拉平音量（dynaudnorm）+ 限幅" : "仅限幅（alimiter）");
                 }
                 if (live)
