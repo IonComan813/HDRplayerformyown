@@ -3000,11 +3000,16 @@ public partial class MainWindow : FluentWindow
                 Line("采样率", $"{P("audio-params/samplerate")} Hz  {P("audio-params/format")}");
                 if (live)
                 {
-                    bool pt = EffectivePassthrough(_currentPath);
+                    // 按实际状态写：音轨格式不能直通时就是“不可用”（不存在“开着但不支持”）
+                    string? codec = CurrentAudioCodec();
+                    bool canPt = codec != null && PassthroughCodecSet.Contains(codec);
+                    bool pt = canPt && EffectivePassthrough(_currentPath);
                     string outFmt = P("audio-out-params/format");
-                    Line("音频直通", !pt ? "关"
-                        : outFmt.StartsWith("spdif", StringComparison.OrdinalIgnoreCase) ? $"开（{outFmt}，由功放 / 电视解码）"
-                        : "开（这条音轨的格式或设备不支持，已改为正常解码）");
+                    Line("音频直通", !canPt ? $"不可用（{(codec == null ? "没有音轨" : codec.ToUpperInvariant() + " 不能直通")}）"
+                        : !pt ? "关"
+                        : _bitstream ? $"开（{outFmt}，由功放 / 电视解码）"
+                        : _ptFallback ? "无法以码流输出，已改为正常解码（右键 → 音频直通 可以再试一次）"
+                        : "正在打开…");
                     Line("防削波", pt && _bitstream ? "不起作用（音频直通）"
                         : EffectiveAntiClip(_currentPath) == "dynaudnorm" ? "拉平音量（dynaudnorm）+ 限幅" : "仅限幅（alimiter）");
                 }
