@@ -678,7 +678,9 @@ public partial class MainWindow : FluentWindow
     private void UpdateHdrButton()
     {
         bool enabled = HdrBlockedReason() == null;
-        _bar.BtnHdr.Content = _hdrOn ? "HDR" : "SDR";
+        // SDR 视频 / 纯音频：画面本来就是 SDR，一律显示灰色的“SDR”（即使 Windows HDR 还开着，
+        // mpv 对 SDR 片源输出的也是 sRGB 画面）
+        _bar.BtnHdr.Content = _hdrOn && enabled ? "HDR" : "SDR";
         // 文字颜色是这里直接设的，按钮样式里“禁用时变灰”盖不过它，禁用时自己换成灰色
         _bar.BtnHdr.Foreground = (Brush)FindResource(!enabled ? "TextFillColorDisabledBrush" : _hdrOn ? "HdrOnBrush" : "TextFillColorSecondaryBrush");
         _bar.BtnHdr.IsEnabled = enabled;
@@ -2264,7 +2266,8 @@ public partial class MainWindow : FluentWindow
 
         // ---- 画面 / 声音的处理方式（后三项按文件记住，优先于全局设置）----
         // SDR 视频、纯音频时 HDR 输出没有意义，灰掉（快捷键 H、控制栏按钮也一样）
-        items.Add(new MenuEntry("HDR 输出", Hp("hdr"), "H", Checked: _hdrOn, Enabled: HdrBlockedReason() == null));
+        bool hdrAllowed = HdrBlockedReason() == null;
+        items.Add(new MenuEntry("HDR 输出", Hp("hdr"), "H", Checked: _hdrOn && hdrAllowed, Enabled: hdrAllowed));
         string? fileHwdec = FileHwdec();
         var hwdec = new List<MenuEntry>
         {
