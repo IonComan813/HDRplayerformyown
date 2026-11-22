@@ -123,7 +123,7 @@ public partial class SettingsWindow : FluentWindow
         var pages = new List<SettingsNavItem>
         {
             new("HDR", SymbolRegular.Lightbulb24, BuildHdrPage()),
-            new("解码 / 渲染", SymbolRegular.Video24, BuildRenderPage()),
+            new("视频", SymbolRegular.Video24, BuildRenderPage()),
             new("音频", SymbolRegular.Speaker224, BuildAudioPage()),
             new("字幕", SymbolRegular.ClosedCaption24, BuildSubPage()),
             new("操作", SymbolRegular.Keyboard24, BuildControlPage()),
@@ -182,7 +182,7 @@ public partial class SettingsWindow : FluentWindow
 
     private StackPanel BuildRenderPage()
     {
-        var p = NewPage("解码 / 渲染");
+        var p = NewPage("视频");
         AddCombo(p, "解码方式", null, HwdecChoices, _s.Hwdec, v => _s.Hwdec = v);
         AddNumber(p, "软解线程数", $"0 = 自动（按 CPU 逻辑核心数，最多 16；本机 {Environment.ProcessorCount} 个逻辑核心）。" + ReloadNote,
             _s.DecoderThreads, 0, 64, 1, v => _s.DecoderThreads = (int)v);
@@ -222,6 +222,11 @@ public partial class SettingsWindow : FluentWindow
             }
         }
         AddCombo(p, "输出设备", null, devices.ToArray(), _s.AudioDevice, v => _s.AudioDevice = v);
+        AddToggle(p, "音频直通",
+            "AC3 / E-AC3 / DTS / DTS-HD / TrueHD 不在本机解码，拆封装后原样以 HDMI 码流发送给功放或电视解码。" +
+            "开启后下面的下混和防削波不起作用，音量也由功放 / 电视控制；设备或音轨格式不支持时自动改为正常解码。" +
+            "每个视频可以在画面右键菜单里单独开关",
+            _s.AudioPassthrough, v => _s.AudioPassthrough = v);
         AddToggle(p, "多声道下混到立体声", "5.1 / 7.1 → 2.0", _s.DownmixToStereo, v => _s.DownmixToStereo = v);
         AddCombo(p, "防削波策略",
             "仅限幅：只把超过满幅的峰值压下去（下混后最容易出现），其它地方不动，保留原来的动态范围。" +
@@ -231,7 +236,7 @@ public partial class SettingsWindow : FluentWindow
             "有多条音轨时优先选这种语言；选的不是英语时，找不到这种语言就用英语音轨。" +
             "手动输入则完全按你填的顺序匹配，不会自动回退。" + ReloadNote,
             LanguagePresets.Audio, _s.AudioLanguages, v => _s.AudioLanguages = v);
-        AddNote(p, "音频延迟按文件记忆，在画面右键菜单 → 音频延迟 里调整。");
+        AddNote(p, "音频延迟按音轨记忆，在画面右键菜单 → 音轨 → 音频延迟 里调整。");
         return p;
     }
 
@@ -245,7 +250,7 @@ public partial class SettingsWindow : FluentWindow
             "有多条字幕轨时优先选这种语言。简体中文找不到就用繁体中文，繁体中文找不到就用简体中文，都没有就用英语；" +
             "其它语言找不到也用英语。手动输入则完全按你填的顺序匹配，不会自动回退。" + ReloadNote,
             LanguagePresets.Subtitle, _s.SubLanguages, v => _s.SubLanguages = v);
-        AddNote(p, "把字幕文件直接拖到画面上即可加载。字幕延迟按文件记忆，在画面右键菜单 → 字幕延迟 里调整。\n" +
+        AddNote(p, "把字幕文件直接拖到画面上即可加载。字幕延迟按字幕记忆，在画面右键菜单 → 字幕 → 字幕延迟 里调整。\n" +
                    "快捷键：Z 提前 / X 延后 / V 显示开关 / J 切换字幕轨。");
         return p;
     }
@@ -260,7 +265,7 @@ public partial class SettingsWindow : FluentWindow
             _s.RestorePlaylist, v => _s.RestorePlaylist = v);
         AddToggle(p, "记住每个文件的播放进度", "再次打开时从上次的位置继续（Home 键从头开始）；看完或只剩最后 10 秒的下次从头开始",
             _s.RememberPosition, v => _s.RememberPosition = v);
-        AddToggle(p, "记住每个文件的音频 / 字幕延迟", "关闭则延迟在切换文件时保持不变，退出后归零",
+        AddToggle(p, "记住每条音轨 / 字幕的延迟", "同一个视频的不同音轨、不同字幕各记各的，换轨时自动套用；关闭则延迟在切换文件时保持不变，退出后归零",
             _s.RememberDelays, v => _s.RememberDelays = v);
         AddToggle(p, "记住每个文件的音轨和字幕", "包括关闭字幕和外挂的字幕 / 音轨文件；下次打开时记住的轨已经没了（例如外挂文件被删），就按首选语言规则选",
             _s.RememberTracks, v => _s.RememberTracks = v);
