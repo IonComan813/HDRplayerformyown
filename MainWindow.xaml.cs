@@ -457,6 +457,25 @@ public partial class MainWindow : FluentWindow
 
     private bool DvStripped => S.DolbyVisionMode == "strip";
 
+    /// <summary>上次设置的音频滤镜：没变就不重设（重设会让音频链重新初始化，声音断一下）。</summary>
+    private string? _lastAf;
+
+    /// <summary>
+    /// 防削波的音频滤镜链。mpv 平时在所有音频滤镜之后才下混，那样限幅器看到的还是下混前的声道，
+    /// 所以下混到立体声时先用 format 滤镜在这里就下混好，再接后面的处理：
+    /// 仅限幅：alimiter 把超过满幅的峰值压到 -0.2 dBFS 以下（level=0：不做自动电平，不改变整体音量）；
+    /// 拉平音量 + 限幅：先 dynaudnorm（150 ms 一帧、15 帧高斯平滑、峰值 0.9、最多放大 8 倍，
+    /// 比默认参数反应快，延迟约 1 秒，不至于明显地忽大忽小），再 alimiter。
+    /// </summary>
+    private string AudioFilters()
+    {
+        var parts = new List<string>();
+        if (S.DownmixToStereo) parts.Add("format=channels=stereo");
+        if (S.AntiClip == "dynaudnorm") parts.Add("lavfi=[dynaudnorm=f=150:g=15:p=0.9:m=8]");
+        parts.Add("lavfi=[alimiter=limit=0.977:level=0]");
+        return string.Join(",", parts);
+    }
+
     /// <summary>可在初始化前（option）或运行时（property）应用的播放设置。</summary>
     private void ApplyPlaybackOptions(Mpv m, bool initial)
     {
@@ -473,9 +492,12 @@ public partial class MainWindow : FluentWindow
         // 视频同步每个文件单独决定（MaybeMatchRefresh）：刷新率和帧率匹配时按显示器重采样，否则按音频同步
         if (initial) { set("video-sync", "audio"); set("interpolation", "no"); }
         set("audio-device", string.IsNullOrEmpty(S.AudioDevice) ? "auto" : S.AudioDevice);
-        // 5.1 / 7.1 → 立体声由 mpv（libswresample）按标准矩阵下混
+        // 5.1 / 7.1 → 立体声由 mpv（libswresample）按标准矩阵下混；不再用系数归一化（整轨都会变小声），
+        // 防削波交给下面的音频滤镜
         set("audio-channels", S.DownmixToStereo ? "stereo" : "auto-safe");
-        set("audio-normalize-downmix", S.NormalizeDownmix ? "yes" : "no");
+        set("audio-normalize-downmix", "no");
+        string af = AudioFilters();
+        if (af != _lastAf && set("af", af) >= 0) _lastAf = af;
         set("alang", AppSettings.NormalizeLanguageList(S.AudioLanguages));
         set("slang", AppSettings.NormalizeLanguageList(S.SubLanguages));
         set("sub-auto", S.SubAuto);
@@ -980,8 +1002,8 @@ public partial class MainWindow : FluentWindow
     /// 开始播放时（不是打开播放器时）按视频帧率选刷新率，见 <see cref="RefreshRate"/>。切换到别的视频会再检查一次：
     /// 新视频没有匹配的刷新率，就恢复成原来的。同时决定视频同步方式：
     /// 刷新率和帧率匹配（恰好或足够近似的整数倍）时按显示器重采样，mpv 微调播放速度把那点差别补上，不重复 / 丢帧；
-    /// 不匹配时用这个视频单独选的方式，没选过就用全局设置（按音频同步，或帧插值 + 按显示器重采样）。
-    /// 音乐文件（只有封面）不动。
+    /// 不匹配时用这个视频单独选的方式，没选过就用全局设置（按音频同步，或帧插值）。
+    /// 关掉“自动匹配刷新率”时始终不改显示器刷新率，只看当前刷新率匹不匹配。音乐文件（只有封面）不动。
     /// </summary>
     private void MaybeMatchRefresh()
     {
@@ -1000,6 +1022,7 @@ public partial class MainWindow : FluentWindow
         if (query == null || fps <= 0) { ApplyVideoSync(false); return; }
         var (cur, all) = query.Value;
         bool currentMatches = RefreshRate.Pick(fps, new[] { cur }, cur) != null;
+        if (!S.MatchRefreshRate) { ApplyVideoSync(currentMatches); return; }
 
         var original = _refreshGdi != null && _refreshOriginal is { } o ? all.FirstOrDefault(x => x.DevHz == o.DevHz, o) : cur;
         var pick = RefreshRate.Pick(fps, all, cur);
@@ -1075,8 +1098,8 @@ public partial class MainWindow : FluentWindow
         return path == null ? null : _fileStates.Get(path)?.VideoSync;
     }
 
-    /// <summary>右键菜单里给当前视频选同步方式，记住（优先于全局设置）；刷新率匹配不上时立即生效。</summary>
-    private void SetFileVideoSync(string value)
+    /// <summary>右键菜单里给当前视频选同步方式（null = 跟随全局设置），记住；刷新率匹配不上时立即生效。</summary>
+    private void SetFileVideoSync(string? value)
     {
         var m = _mpv;
         string? path = _currentPath ?? (_idle ? null : m?.GetString("path"));
@@ -1085,7 +1108,9 @@ public partial class MainWindow : FluentWindow
         st.VideoSync = value;
         _fileStates.Set(path, st);
         if (!_refreshMatched) ApplyVideoSync(false);
-        m.ShowText($"本视频的视频同步：{SyncName(value)}");
+        m.ShowText(value == null
+            ? $"本视频的视频同步：跟随全局设置（{SyncName(S.NoMatchSync)}）"
+            : $"本视频的视频同步：{SyncName(value)}");
     }
 
     /// <summary>
@@ -1330,7 +1355,7 @@ public partial class MainWindow : FluentWindow
                 if (arg != null) SetFileHwdec(arg == "global" ? null : arg);
                 break;
             case "vsync":
-                if (arg != null) SetFileVideoSync(arg);
+                if (arg != null) SetFileVideoSync(arg == "global" ? null : arg);
                 break;
             case "audio-delay-dec": AdjustAudioDelay(-S.SubDelayStepMs); break;
             case "audio-delay-inc": AdjustAudioDelay(S.SubDelayStepMs); break;
@@ -2184,10 +2209,15 @@ public partial class MainWindow : FluentWindow
         }
         else
         {
-            // 只有两个选项，不另设“跟随全局设置”：没单独选过时勾的是全局设置里的那个
-            string effective = FileVideoSync() ?? S.NoMatchSync;
-            var sync = SettingsWindow.NoMatchSyncChoices
-                .Select(c => new MenuEntry(c.Name, Hp("vsync", c.Value), Checked: playing && effective == c.Value)).ToList();
+            // 跟随全局设置：全局设置改了，这个视频也跟着改；单独选过的按文件记住，不受全局设置影响
+            string? fileSync = FileVideoSync();
+            var sync = new List<MenuEntry>
+            {
+                new($"跟随全局设置（{SyncName(S.NoMatchSync)}）", Hp("vsync", "global"), Checked: playing && fileSync == null),
+                Sep,
+            };
+            sync.AddRange(SettingsWindow.NoMatchSyncChoices
+                .Select(c => new MenuEntry(c.Name, Hp("vsync", c.Value), Checked: playing && fileSync == c.Value)));
             items.Add(new MenuEntry("视频同步（本视频）", Sub: sync, Enabled: playing && _refreshChecked));
         }
         items.Add(Sep);
@@ -2520,13 +2550,21 @@ public partial class MainWindow : FluentWindow
         bool needsReload = copy.DecoderThreads != S.DecoderThreads || copy.AudioLanguages != S.AudioLanguages ||
                            copy.SubLanguages != S.SubLanguages || copy.SubAuto != S.SubAuto;
         bool dvChanged = copy.DolbyVisionMode != S.DolbyVisionMode;
+        bool refreshToggled = copy.MatchRefreshRate != S.MatchRefreshRate;
         if (copy.TargetPeakNits != S.TargetPeakNits) _displayPeak = 0;
         CopySettings(copy, S);
         S.Save();
         ApplyPlaybackOptions(m, initial: false);
         if (dvChanged) m.SetProperty("vf", DolbyVisionFilter());
-        // 全局的“无匹配时的视频同步”改了：当前视频匹配不上刷新率、又没单独选过的，马上用新的
-        if (!_idle && _refreshChecked && !_refreshMatched) ApplyVideoSync(false);
+        if (refreshToggled)
+        {
+            // 关掉：马上还原刷新率；之后（或者打开时）对当前视频重新判断一次刷新率和同步方式
+            if (!S.MatchRefreshRate) RestoreRefresh(announce: true);
+            _refreshChecked = false;
+            MaybeMatchRefresh();
+        }
+        // 全局的“无匹配时的视频同步”改了：当前视频匹配不上刷新率、又跟随全局设置的，马上用新的
+        else if (!_idle && _refreshChecked && !_refreshMatched) ApplyVideoSync(false);
         UpdateThumbnailSource();
         // 改设置不会去切换 Windows HDR，只重新应用 mpv 的 HDR 参数
         ApplyMpvHdrProps();
@@ -2639,6 +2677,7 @@ public partial class MainWindow : FluentWindow
                     Line("输出声道", $"{P("audio-out-params/channel-count")} ch  {P("audio-out-params/hr-channels")}" +
                         (S.DownmixToStereo ? "  (下混到立体声)" : ""));
                 Line("采样率", $"{P("audio-params/samplerate")} Hz  {P("audio-params/format")}");
+                if (live) Line("防削波", S.AntiClip == "dynaudnorm" ? "拉平音量（dynaudnorm）+ 限幅" : "仅限幅（alimiter）");
                 if (live)
                 {
                     Line("码率", O("audio-bitrate"));

@@ -93,6 +93,10 @@ public partial class SettingsWindow : FluentWindow
     public static readonly (string Value, string Name)[] NoMatchSyncChoices =
         { ("audio", "按音频同步"), ("interp", "帧插值") };
 
+    /// <summary>防削波策略：仅限幅排第一（默认）。</summary>
+    private static readonly (string, string)[] AntiClipChoices =
+        { ("limit", "仅限幅"), ("dynaudnorm", "拉平音量 + 限幅") };
+
     private static readonly (string, string)[] SubAutoChoices =
         { ("no", "不自动加载"), ("exact", "完全同名"), ("fuzzy", "包含文件名"), ("all", "目录下全部") };
 
@@ -186,6 +190,11 @@ public partial class SettingsWindow : FluentWindow
         AddCombo(p, "放大算法", null, ScaleChoices, _s.Scale, v => _s.Scale = v);
         AddCombo(p, "缩小算法", null, DscaleChoices, _s.Dscale, v => _s.Dscale = v);
         AddToggle(p, "去色带 (deband)", null, _s.Deband, v => _s.Deband = v);
+        AddToggle(p, "自动匹配刷新率",
+            "开始播放时把显示器切到视频帧率的整数倍（不低于 47.952 Hz，选符合条件的最低刷新率；没有恰好的就用最接近的，" +
+            "如 119.88 帧用 120 Hz），切换视频时重新匹配，退出时还原。只在系统列出的刷新率里选，不设置自定义刷新率。" +
+            "关掉则始终不改显示器刷新率，只看当前刷新率是否匹配",
+            _s.MatchRefreshRate, v => _s.MatchRefreshRate = v);
         AddCombo(p, "视频同步",
             "如果有近似匹配的刷新率，则直接按显示器刷新率重采样；此处选择无匹配时的优先策略，" +
             "可在每个视频文件中单独调整（画面右键 → 视频同步）",
@@ -214,7 +223,10 @@ public partial class SettingsWindow : FluentWindow
         }
         AddCombo(p, "输出设备", null, devices.ToArray(), _s.AudioDevice, v => _s.AudioDevice = v);
         AddToggle(p, "多声道下混到立体声", "5.1 / 7.1 → 2.0", _s.DownmixToStereo, v => _s.DownmixToStereo = v);
-        AddToggle(p, "下混时归一化", "防削波，但整体音量会变小", _s.NormalizeDownmix, v => _s.NormalizeDownmix = v);
+        AddCombo(p, "防削波策略",
+            "仅限幅：只把超过满幅的峰值压下去（下混后最容易出现），其它地方不动，保留原来的动态范围。" +
+            "拉平音量 + 限幅：先把大声和小声拉得更接近（对白更清楚，适合夜里看），再限幅，但会损失动态范围",
+            AntiClipChoices, _s.AntiClip, v => _s.AntiClip = v);
         AddLanguagePicker(p, "首选音轨语言",
             "有多条音轨时优先选这种语言；选的不是英语时，找不到这种语言就用英语音轨。" +
             "手动输入则完全按你填的顺序匹配，不会自动回退。" + ReloadNote,

@@ -31,7 +31,12 @@ internal sealed class AppSettings
     public string Dscale { get; set; } = "mitchell";
     public bool Deband { get; set; } = false;
     /// <summary>
-    /// 刷新率和帧率匹配不上时的视频同步方式（刷新率总是自动匹配，匹配上时一律按显示器重采样，见 MainWindow.MaybeMatchRefresh）："audio" = 按音频同步；"interp" = 帧插值（mpv 的插值要求按显示器同步，所以同时按显示器刷新率重采样）。
+    /// 开始播放时按视频帧率把显示器切到整数倍（或近似）的刷新率，切换文件时重新匹配，退出时还原。
+    /// 关掉则始终不改显示器刷新率：当前刷新率恰好或近似匹配就按显示器重采样，否则用 <see cref="NoMatchSync"/>。
+    /// </summary>
+    public bool MatchRefreshRate { get; set; } = true;
+    /// <summary>
+    /// 刷新率和帧率匹配不上时的视频同步方式（匹配上时一律按显示器重采样，见 MainWindow.MaybeMatchRefresh）："audio" = 按音频同步；"interp" = 帧插值（mpv 的插值要求按显示器同步，所以同时按显示器刷新率重采样）。
     /// 每个文件可以在右键菜单里单独选（记在 file-states.json），优先于这里。
     /// </summary>
     public string NoMatchSync { get; set; } = "audio";
@@ -40,7 +45,12 @@ internal sealed class AppSettings
     // ---- 音频 ----
     public string AudioDevice { get; set; } = "auto";
     public bool DownmixToStereo { get; set; } = true;
-    public bool NormalizeDownmix { get; set; } = false;
+    /// <summary>
+    /// 防削波策略（替代以前的“下混时归一化”，那个是把下混系数整体缩小，整轨都变小声）：
+    /// "limit" = 仅限幅，只把超过满幅的峰值压下去，保留动态范围；
+    /// "dynaudnorm" = 先用 dynaudnorm 拉平音量（大声和小声更接近），再限幅。
+    /// </summary>
+    public string AntiClip { get; set; } = "limit";
     public string AudioLanguages { get; set; } = LanguagePresets.DefaultAudio;
     public double Volume { get; set; } = 100;
 
