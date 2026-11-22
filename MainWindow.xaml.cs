@@ -681,9 +681,10 @@ public partial class MainWindow : FluentWindow
         // SDR 视频 / 纯音频：画面本来就是 SDR，一律显示灰色的“SDR”（即使 Windows HDR 还开着，
         // mpv 对 SDR 片源输出的也是 sRGB 画面）
         _bar.BtnHdr.Content = _hdrOn && enabled ? "HDR" : "SDR";
-        // 文字颜色是这里直接设的，按钮样式里“禁用时变灰”盖不过它，禁用时自己换成灰色
-        _bar.BtnHdr.Foreground = (Brush)FindResource(!enabled ? "TextFillColorDisabledBrush" : _hdrOn ? "HdrOnBrush" : "TextFillColorSecondaryBrush");
-        _bar.BtnHdr.IsEnabled = enabled;
+        // 不能切换时只把文字变灰：不用 IsEnabled = false（WPF-UI 的按钮禁用时会画一个灰色底框，像是被强调了），
+        // 而是关掉鼠标命中，点不动、也没有悬停效果。能切换时 SDR 是白字，HDR 是黄字
+        _bar.BtnHdr.Foreground = (Brush)FindResource(!enabled ? "TextFillColorDisabledBrush" : _hdrOn ? "HdrOnBrush" : "TextFillColorPrimaryBrush");
+        _bar.BtnHdr.IsHitTestVisible = enabled;
     }
 
     /// <summary>
@@ -2250,7 +2251,9 @@ public partial class MainWindow : FluentWindow
         var subs = new List<MenuEntry> { new("载入外部字幕…", Hp("load-sub")), Sep };
         subs.AddRange(subTracks);
         subs.Add(Sep);
-        subs.Add(new MenuEntry("字幕延迟", Sub: new()
+        // 关闭字幕时，字幕延迟没有意义，灰掉
+        bool subOff = !playing || m?.GetString("sid") is "no" or null;
+        subs.Add(new MenuEntry("字幕延迟", Enabled: !subOff, Sub: new()
         {
             new($"当前：{sd:+0;-0;0} ms", Enabled: false),
             new($"提前 {step} ms", Hp("sub-delay-dec"), "Z"),
