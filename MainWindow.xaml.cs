@@ -458,7 +458,7 @@ public partial class MainWindow : FluentWindow
     private bool DvStripped => S.DolbyVisionMode == "strip";
 
     /// <summary>上次设置的音频滤镜：没变就不重设（重设会让音频链重新初始化，声音断一下）。</summary>
-    private string? _lastAf;
+    private volatile string? _lastAf;
 
     /// <summary>
     /// 防削波的音频滤镜链。mpv 平时在所有音频滤镜之后才下混，那样限幅器看到的还是下混前的声道，
@@ -467,11 +467,11 @@ public partial class MainWindow : FluentWindow
     /// 拉平音量 + 限幅：先 dynaudnorm（150 ms 一帧、15 帧高斯平滑、峰值 0.9、最多放大 8 倍，
     /// 比默认参数反应快，延迟约 1 秒，不至于明显地忽大忽小），再 alimiter。
     /// </summary>
-    private string AudioFilters()
+    private string AudioFilters(string antiClip)
     {
         var parts = new List<string>();
         if (S.DownmixToStereo) parts.Add("format=channels=stereo");
-        if (S.AntiClip == "dynaudnorm") parts.Add("lavfi=[dynaudnorm=f=150:g=15:p=0.9:m=8]");
+        if (antiClip == "dynaudnorm") parts.Add("lavfi=[dynaudnorm=f=150:g=15:p=0.9:m=8]");
         parts.Add("lavfi=[alimiter=limit=0.977:level=0]");
         return string.Join(",", parts);
     }
@@ -496,7 +496,7 @@ public partial class MainWindow : FluentWindow
         // 防削波交给下面的音频滤镜
         set("audio-channels", S.DownmixToStereo ? "stereo" : "auto-safe");
         set("audio-normalize-downmix", "no");
-        string af = AudioFilters();
+        string af = AudioFilters(initial || _idle ? S.AntiClip : EffectiveAntiClip(_currentPath));
         if (af != _lastAf && set("af", af) >= 0) _lastAf = af;
         set("alang", AppSettings.NormalizeLanguageList(S.AudioLanguages));
         set("slang", AppSettings.NormalizeLanguageList(S.SubLanguages));
@@ -958,6 +958,7 @@ public partial class MainWindow : FluentWindow
             SubDelay = S.RememberDelays ? m.GetDouble("sub-delay") ?? 0 : old?.SubDelay ?? 0,
             Hwdec = old?.Hwdec,
             VideoSync = old?.VideoSync,
+            AntiClip = old?.AntiClip,
             Audio = S.RememberTracks && _audioTouched && _audioSel != null ? _audioSel : old?.Audio,
             Sub = S.RememberTracks && _subTouched && _subSel != null ? _subSel : old?.Sub,
             LastPlayed = DateTime.UtcNow,
@@ -1096,6 +1097,35 @@ public partial class MainWindow : FluentWindow
     {
         string? path = _currentPath ?? (_idle ? null : _mpv?.GetString("path"));
         return path == null ? null : _fileStates.Get(path)?.VideoSync;
+    }
+
+    private static string AntiClipName(string value) =>
+        SettingsWindow.AntiClipChoices.FirstOrDefault(c => c.Value == value).Name ?? value;
+
+    /// <summary>这个文件的防削波策略：单独选过的优先，否则用全局设置。</summary>
+    private string EffectiveAntiClip(string? path) => (path == null ? null : _fileStates.Get(path)?.AntiClip) ?? S.AntiClip;
+
+    /// <summary>当前文件单独选的防削波策略；null = 跟随全局设置。</summary>
+    private string? FileAntiClip()
+    {
+        string? path = _currentPath ?? (_idle ? null : _mpv?.GetString("path"));
+        return path == null ? null : _fileStates.Get(path)?.AntiClip;
+    }
+
+    /// <summary>右键菜单里给当前视频选防削波策略（null = 跟随全局设置），记住，立即生效。</summary>
+    private void SetFileAntiClip(string? value)
+    {
+        var m = _mpv;
+        string? path = _currentPath ?? (_idle ? null : m?.GetString("path"));
+        if (m == null || path == null) return;
+        var st = _fileStates.Get(path) ?? new FileState { LastPlayed = DateTime.UtcNow };
+        st.AntiClip = value;
+        _fileStates.Set(path, st);
+        string af = AudioFilters(value ?? S.AntiClip);
+        if (af != _lastAf && m.SetProperty("af", af) >= 0) _lastAf = af;
+        m.ShowText(value == null
+            ? $"本视频的防削波：跟随全局设置（{AntiClipName(S.AntiClip)}）"
+            : $"本视频的防削波：{AntiClipName(value)}");
     }
 
     /// <summary>右键菜单里给当前视频选同步方式（null = 跟随全局设置），记住；刷新率匹配不上时立即生效。</summary>
@@ -1353,6 +1383,9 @@ public partial class MainWindow : FluentWindow
                 break;
             case "hwdec":
                 if (arg != null) SetFileHwdec(arg == "global" ? null : arg);
+                break;
+            case "anticlip":
+                if (arg != null) SetFileAntiClip(arg == "global" ? null : arg);
                 break;
             case "vsync":
                 if (arg != null) SetFileVideoSync(arg == "global" ? null : arg);
@@ -1802,6 +1835,9 @@ public partial class MainWindow : FluentWindow
     private void OnLoadHook(Mpv m)
     {
         string? path = m.GetString("path");
+        // 防削波：这个文件单独选过就用它的，否则用全局的。在音频链建立之前设好，不会断声
+        string af = AudioFilters(EffectiveAntiClip(path));
+        if (af != _lastAf && m.SetProperty("af", af) >= 0) _lastAf = af;
         string? perFile = path == null ? null : _fileStates.Get(path)?.Hwdec;
         m.SetProperty("file-local-options/hwdec", perFile ?? S.Hwdec);
     }
@@ -2079,7 +2115,7 @@ public partial class MainWindow : FluentWindow
             _fileStates.Set(output, new FileState
             {
                 Position = st.Position, AudioDelay = st.AudioDelay, SubDelay = st.SubDelay, Hwdec = st.Hwdec,
-                VideoSync = st.VideoSync, Audio = st.Audio, Sub = st.Sub, LastPlayed = DateTime.UtcNow,
+                VideoSync = st.VideoSync, AntiClip = st.AntiClip, Audio = st.Audio, Sub = st.Sub, LastPlayed = DateTime.UtcNow,
             });
         }
         _failedPaths.Remove(source);
@@ -2118,7 +2154,7 @@ public partial class MainWindow : FluentWindow
 
     /// <summary>
     /// 菜单项：Cmd 是点击时执行的 mpv 命令（一般是 script-message hp …，回到 DoAction 处理）。
-    /// Checked 为 null 表示不是可勾选的项；true / false 的项前面留出对勾的位置，选中的显示对勾。
+    /// Checked 为 true 的项是当前选中的，左边显示蓝色竖条（和全局设置里下拉菜单的选中标记一样），不占位置，文字不缩进。
     /// </summary>
     private sealed record MenuEntry(string Title, string? Cmd = null, string? Shortcut = null,
         bool? Checked = null, bool Enabled = true, List<MenuEntry>? Sub = null)
@@ -2192,7 +2228,11 @@ public partial class MainWindow : FluentWindow
         }));
         items.Add(Sep);
 
-        items.Add(new MenuEntry("HDR 输出", Hp("hdr"), "H", Checked: _hdrOn));
+        // 当前视频本身是 SDR：HDR 输出没有意义，灰掉（还没解码出第一帧、纯音频、音乐封面时不灰）
+        string? gamma = playing ? m?.GetString("video-params/gamma") : null;
+        bool sdrVideo = gamma != null && gamma is not ("pq" or "hlg") && _dvProfile == null &&
+                        m?.GetFlag("current-tracks/video/image") != true;
+        items.Add(new MenuEntry("HDR 输出", Hp("hdr"), "H", Checked: _hdrOn, Enabled: !sdrVideo));
         // 解码方式：只对当前这个视频生效并按文件记住，优先于全局设置
         string? fileHwdec = FileHwdec();
         var hwdec = new List<MenuEntry>
@@ -2220,6 +2260,16 @@ public partial class MainWindow : FluentWindow
                 .Select(c => new MenuEntry(c.Name, Hp("vsync", c.Value), Checked: playing && fileSync == c.Value)));
             items.Add(new MenuEntry("视频同步（本视频）", Sub: sync, Enabled: playing && _refreshChecked));
         }
+        // 防削波：跟随全局设置，或者给这个视频单独选（按文件记住）
+        string? fileAntiClip = FileAntiClip();
+        var antiClip = new List<MenuEntry>
+        {
+            new($"跟随全局设置（{AntiClipName(S.AntiClip)}）", Hp("anticlip", "global"), Checked: playing && fileAntiClip == null),
+            Sep,
+        };
+        antiClip.AddRange(SettingsWindow.AntiClipChoices
+            .Select(c => new MenuEntry(c.Name, Hp("anticlip", c.Value), Checked: playing && fileAntiClip == c.Value)));
+        items.Add(new MenuEntry("防削波（本视频）", Sub: antiClip, Enabled: playing));
         items.Add(Sep);
         items.Add(new MenuEntry("播放列表", Hp("playlist"), "P", Checked: PlaylistPanel.Visibility == Visibility.Visible, Enabled: !_fullscreen));
         items.Add(new MenuEntry("全屏", Hp("fullscreen"), "F / 双击", Checked: _fullscreen));
@@ -2265,31 +2315,38 @@ public partial class MainWindow : FluentWindow
         t.Start();
     }
 
-    private List<object> ToWpfMenu(List<MenuEntry> items)
-    {
-        // 这一级菜单里有打勾的项时，所有项都留出对勾的位置，文字对齐；一项都没勾就都不留
-        bool reserveTick = items.Any(e => e.Checked == true);
-        return items.Select(e => ToWpfMenuItem(e, reserveTick)).ToList();
-    }
+    private List<object> ToWpfMenu(List<MenuEntry> items) => items.Select(ToWpfMenuItem).ToList();
 
-    private object ToWpfMenuItem(MenuEntry e, bool reserveTick)
+    /// <summary>
+    /// WPF-UI 菜单项模板（SubmenuItemTemplate）：高亮的圆角框里，标题从左边 8 px 开始。
+    /// 选中标记照着全局设置里下拉菜单的样子画（WPF-UI ComboBoxItem 的 ActiveRectangle：3 × 16、圆角 2、
+    /// 颜色 ComboBoxItemPillFillBrush），贴在高亮框的最左边，所以往左挪 8 px。
+    /// </summary>
+    private const double MenuHeaderInset = 8;
+
+    private object ToWpfMenuItem(MenuEntry e)
     {
         if (e.IsSeparator) return (object)new Separator();
-        // MenuItem 会把 “_” 当作访问键，转义一下
-        var mi = new MenuItem
-        {
-            Header = e.Title.Replace("_", "__"), InputGestureText = e.Shortcut ?? "", IsEnabled = e.Enabled,
-        };
-        // WPF-UI 的菜单只有 IsCheckable 时才画勾选框（而且每项都是一个框），这里自己在图标位置画对勾
+        var mi = new MenuItem { InputGestureText = e.Shortcut ?? "", IsEnabled = e.Enabled };
         if (e.Checked == true)
         {
-            var tick = new SymbolIcon { Symbol = SymbolRegular.Checkmark24, FontSize = 16, Width = 16 };
-            tick.SetResourceReference(Control.ForegroundProperty, "AccentTextFillColorPrimaryBrush");
-            mi.Icon = tick;
+            // 标题换成“文字 + 一个不占位置的竖条”：竖条放在宽度为 0 的 Canvas 里、往左画出去，
+            // 选中项的文字和其它项对齐（以前的对勾会让整级菜单都缩进）
+            var pill = new System.Windows.Shapes.Rectangle { Width = 3, Height = 16, RadiusX = 2, RadiusY = 2 };
+            pill.SetResourceReference(System.Windows.Shapes.Shape.FillProperty, "ComboBoxItemPillFillBrush");
+            Canvas.SetLeft(pill, -MenuHeaderInset);
+            Canvas.SetTop(pill, -8);
+            var canvas = new Canvas { Width = 0, Height = 0, HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Center };
+            canvas.Children.Add(pill);
+            var header = new Grid();
+            header.Children.Add(new System.Windows.Controls.TextBlock { Text = e.Title });
+            header.Children.Add(canvas);
+            mi.Header = header;
         }
-        else if (reserveTick)
+        else
         {
-            mi.Icon = new Border { Width = 16 };
+            // 字符串标题里 MenuItem 会把 “_” 当作访问键，转义一下
+            mi.Header = e.Title.Replace("_", "__");
         }
         if (e.Sub != null) foreach (var sub in ToWpfMenu(e.Sub)) mi.Items.Add(sub);
         if (e.Cmd != null) { string cmd = e.Cmd; mi.Click += (_, _) => _mpv?.CommandString(cmd); }
@@ -2677,7 +2734,7 @@ public partial class MainWindow : FluentWindow
                     Line("输出声道", $"{P("audio-out-params/channel-count")} ch  {P("audio-out-params/hr-channels")}" +
                         (S.DownmixToStereo ? "  (下混到立体声)" : ""));
                 Line("采样率", $"{P("audio-params/samplerate")} Hz  {P("audio-params/format")}");
-                if (live) Line("防削波", S.AntiClip == "dynaudnorm" ? "拉平音量（dynaudnorm）+ 限幅" : "仅限幅（alimiter）");
+                if (live) Line("防削波", EffectiveAntiClip(_currentPath) == "dynaudnorm" ? "拉平音量（dynaudnorm）+ 限幅" : "仅限幅（alimiter）");
                 if (live)
                 {
                     Line("码率", O("audio-bitrate"));

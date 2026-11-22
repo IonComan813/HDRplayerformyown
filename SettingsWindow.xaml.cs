@@ -94,7 +94,7 @@ public partial class SettingsWindow : FluentWindow
         { ("audio", "按音频同步"), ("interp", "帧插值") };
 
     /// <summary>防削波策略：仅限幅排第一（默认）。</summary>
-    private static readonly (string, string)[] AntiClipChoices =
+    public static readonly (string Value, string Name)[] AntiClipChoices =
         { ("limit", "仅限幅"), ("dynaudnorm", "拉平音量 + 限幅") };
 
     private static readonly (string, string)[] SubAutoChoices =
