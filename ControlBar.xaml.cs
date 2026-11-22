@@ -133,8 +133,34 @@ public partial class ControlBar : Window
     public void SetMuted(bool muted)
     {
         _muted = muted;
-        MuteIcon.Symbol = muted ? Wpf.Ui.Controls.SymbolRegular.SpeakerMute24 : Wpf.Ui.Controls.SymbolRegular.Speaker224;
+        if (!_passthrough)
+            MuteIcon.Symbol = muted ? Wpf.Ui.Controls.SymbolRegular.SpeakerMute24 : Wpf.Ui.Controls.SymbolRegular.Speaker224;
         if (_tipOwner == TipOwner.Volume) ShowVolumeTip();
+    }
+
+    private bool _passthrough;
+
+    /// <summary>
+    /// 音频直通（码流原样送给功放 / 电视）时：本机调不了音量，也没法发合法的静音帧，
+    /// 所以去掉音量条（静音按钮挨着 SDR / HDR 按钮），静音按钮显示“有声音”的灰色图标、不接收鼠标。
+    /// </summary>
+    public void SetPassthrough(bool on)
+    {
+        if (_passthrough == on) return;
+        _passthrough = on;
+        VolumeSlider.Visibility = on ? Visibility.Collapsed : Visibility.Visible;
+        BtnMute.IsHitTestVisible = !on;
+        if (on)
+        {
+            if (_tipOwner == TipOwner.Volume) CloseTip(TipOwner.Volume);
+            MuteIcon.Symbol = Wpf.Ui.Controls.SymbolRegular.Speaker224;
+            BtnMute.SetResourceReference(ForegroundProperty, "TextFillColorDisabledBrush");
+        }
+        else
+        {
+            BtnMute.ClearValue(ForegroundProperty);
+            SetMuted(_muted);
+        }
     }
 
     // ------------------------------------------------------------------ 悬停提示（进度条 / 音量）

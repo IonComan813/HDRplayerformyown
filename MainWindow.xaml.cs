@@ -421,7 +421,7 @@ public partial class MainWindow : FluentWindow
         // 在事件线程上先取下结束时的位置，再交给 UI 线程（那时新文件的 time-pos 可能已经开始刷新了）
         m.EndFile += (r, err) => { double pos = _lastPos; Ui(() => OnEndFile(r, err, pos)); };
         m.VideoReconfig += () => Ui(OnVideoReconfig);
-        m.AudioReconfig += () => Ui(UpdateFormatLabel);
+        m.AudioReconfig += () => Ui(() => { UpdateFormatLabel(); UpdateBitstream(); });
         m.ClientMessage += a => Ui(() => OnClientMessage(a));
         m.Hook += name => { if (name == "on_load") OnLoadHook(m); };
 
@@ -783,6 +783,7 @@ public partial class MainWindow : FluentWindow
                 ShowIdleHint(_idle);
                 UpdateAllProgress();
                 UpdateHdrButton();
+                UpdateBitstream();
                 break;
             case "duration":
                 _duration = value is double d ? d : 0;
@@ -884,6 +885,7 @@ public partial class MainWindow : FluentWindow
         UpdateFormatLabel();
         UpdateThumbnailSource();
         UpdateHdrButton();
+        UpdateBitstream(); // 没有音轨的文件不会再有音频重配置，这里也更新一次
         MaybeAutoHdr();
     }
 
@@ -1490,6 +1492,10 @@ public partial class MainWindow : FluentWindow
             case "seek-fwd": Seek(S.SeekStep, seekMode); break;
             case "seek-back-big": Seek(-S.SeekStepLarge, seekMode); break;
             case "seek-fwd-big": Seek(S.SeekStepLarge, seekMode); break;
+            // 音频直通时本机调不了音量（码流原样送出），只提示
+            case "vol-up" or "vol-down" or "mute" when _bitstream:
+                m.ShowText("音频直通中：音量和静音由功放 / 电视控制");
+                break;
             case "vol-up": m.CommandString($"no-osd add volume {S.VolumeStep.ToString(Inv)}"); m.ShowText("音量 ${volume}"); break;
             case "vol-down": m.CommandString($"no-osd add volume {(-S.VolumeStep).ToString(Inv)}"); m.ShowText("音量 ${volume}"); break;
             case "mute": ToggleMute(); break;
@@ -1561,6 +1567,18 @@ public partial class MainWindow : FluentWindow
             case "frame-step": m.CommandString("frame-step"); RevealBarForKeyboard(); break;
             case "frame-back": m.CommandString("frame-back-step"); RevealBarForKeyboard(); break;
         }
+    }
+
+    /// <summary>正在以码流直通（mpv 的输出格式是 spdif-…）。直通开着但这条音轨不能直通（如 AAC）时为 false，音量照常能调。</summary>
+    private bool _bitstream;
+
+    /// <summary>按 mpv 实际的输出格式更新：直通时去掉音量条、静音按钮变灰（见 ControlBar.SetPassthrough）。</summary>
+    private void UpdateBitstream()
+    {
+        var m = _mpv;
+        _bitstream = m != null && !_idle &&
+                     (m.GetString("audio-out-params/format") ?? "").StartsWith("spdif", StringComparison.OrdinalIgnoreCase);
+        _bar.SetPassthrough(_bitstream);
     }
 
     /// <summary>
