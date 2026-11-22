@@ -677,8 +677,29 @@ public partial class MainWindow : FluentWindow
 
     private void UpdateHdrButton()
     {
+        bool enabled = HdrBlockedReason() == null;
         _bar.BtnHdr.Content = _hdrOn ? "HDR" : "SDR";
-        _bar.BtnHdr.Foreground = (Brush)FindResource(_hdrOn ? "HdrOnBrush" : "TextFillColorSecondaryBrush");
+        // 文字颜色是这里直接设的，按钮样式里“禁用时变灰”盖不过它，禁用时自己换成灰色
+        _bar.BtnHdr.Foreground = (Brush)FindResource(!enabled ? "TextFillColorDisabledBrush" : _hdrOn ? "HdrOnBrush" : "TextFillColorSecondaryBrush");
+        _bar.BtnHdr.IsEnabled = enabled;
+    }
+
+    /// <summary>
+    /// 不能手动开关 HDR 输出的原因（null = 可以）：当前是 SDR 视频，或者是纯音频 / 音乐封面，HDR 输出没有意义。
+    /// 右键菜单的“HDR 输出”、快捷键 H、控制栏的 HDR 按钮都看它。没在播放、文件还在打开、
+    /// 还没解码出第一帧（不知道是不是 HDR）时都可以。按片源自动切换不受影响。
+    /// </summary>
+    private string? HdrBlockedReason()
+    {
+        var m = _mpv;
+        if (m == null || _idle) return null;
+        var tracks = Tracks();
+        if (tracks.Count == 0) return null; // 还在打开
+        bool hasVideo = tracks.Any(t => TrackStr(t, "type") == "video" && !TrackFlag(t, "image"));
+        if (!hasVideo) return "纯音频文件，不需要 HDR 输出";
+        string? gamma = m.GetString("video-params/gamma");
+        if (gamma == null || gamma is "pq" or "hlg" || _dvProfile != null) return null;
+        return "当前是 SDR 视频，不需要 HDR 输出";
     }
 
     private void RestoreWindowsHdr()
@@ -734,6 +755,7 @@ public partial class MainWindow : FluentWindow
                 }
                 ShowIdleHint(_idle);
                 UpdateAllProgress();
+                UpdateHdrButton();
                 break;
             case "duration":
                 _duration = value is double d ? d : 0;
@@ -833,6 +855,7 @@ public partial class MainWindow : FluentWindow
         ApplyFileState(m, resumePosition: !reloaded);
         UpdateFormatLabel();
         UpdateThumbnailSource();
+        UpdateHdrButton();
         MaybeAutoHdr();
     }
 
@@ -983,6 +1006,7 @@ public partial class MainWindow : FluentWindow
 
     private void OnVideoReconfig()
     {
+        UpdateHdrButton();
         UpdateFormatLabel();
         MaybeAutoHdr();
         MaybeMatchRefresh();
@@ -1402,7 +1426,10 @@ public partial class MainWindow : FluentWindow
             case "load-audio": LoadAudioTrack(); break;
             case "settings": OpenSettings(); break;
             case "quit": Close(); break;
-            case "hdr": SetHdr(!_hdrOn, manual: true); break;
+            case "hdr":
+                if (HdrBlockedReason() is { } why) m.ShowText(why);
+                else SetHdr(!_hdrOn, manual: true);
+                break;
             case "sub-delay-dec": AdjustSubDelay(-S.SubDelayStepMs); break;
             case "sub-delay-inc": AdjustSubDelay(S.SubDelayStepMs); break;
             case "sub-toggle": m.CommandString("no-osd cycle sub-visibility"); m.ShowText("字幕显示：${sub-visibility}"); break;
@@ -2172,24 +2199,25 @@ public partial class MainWindow : FluentWindow
         var m = _mpv;
         bool playing = !_idle;
         string? path = playing ? m?.GetString("path") : null;
+        bool local = path != null && File.Exists(path);
+
+        // ---- 文件 ----
         var items = new List<MenuEntry>
         {
-            new("视频参数…", Hp("info"), "I"),
-            new("在资源管理器中显示", Hp("reveal"), Enabled: path != null && File.Exists(path)),
-            Sep,
             new("打开文件…", Hp("open"), "Ctrl+O"),
-            new("加载字幕…", Hp("load-sub"), Enabled: playing),
-            new("加载外部音轨…", Hp("load-audio"), Enabled: playing),
             new("重新载入当前文件", Hp("reload"), "F5", Enabled: playing),
+            // 修复视频：只针对正在播放的文件；打不开的文件在播放列表里右键修复
+            _repair.Running || _repairChecking
+                ? new MenuEntry("取消修复视频", Hp("repair-cancel"))
+                : new MenuEntry("修复视频（重新封装）…", Hp("repair"), Enabled: RepairTarget() != null),
+            new("视频参数…", Hp("info"), "I"),
+            new("在资源管理器中显示", Hp("reveal"), Enabled: local),
+            Sep,
         };
-        // 修复视频：只针对正在播放的文件；打不开的文件在播放列表里右键修复
-        items.Add(_repair.Running || _repairChecking
-            ? new MenuEntry("取消修复视频", Hp("repair-cancel"))
-            : new MenuEntry("修复视频（重新封装）…", Hp("repair"), Enabled: RepairTarget() != null));
-        items.Add(Sep);
 
-        var audio = new List<MenuEntry>();
-        var subs = new List<MenuEntry> { new("关闭字幕", Hp("sid", "no"), Checked: m?.GetString("sid") is "no" or null) };
+        // ---- 音轨 / 字幕：子菜单里是 载入外部文件 / 可选的轨 / 延迟 ----
+        var audioTracks = new List<MenuEntry>();
+        var subTracks = new List<MenuEntry> { new("关闭字幕", Hp("sid", "no"), Checked: playing && m?.GetString("sid") is "no" or null) };
         if (playing && m?.GetNode("track-list") is List<object?> tracks)
         {
             foreach (var t in tracks.OfType<Dictionary<string, object?>>())
@@ -2199,23 +2227,28 @@ public partial class MainWindow : FluentWindow
                 long id = t.GetValueOrDefault("id") is long l ? l : 0;
                 var entry = new MenuEntry(TrackText(t), Hp(type == "audio" ? "aid" : "sid", id.ToString(Inv)),
                     Checked: t.GetValueOrDefault("selected") is true);
-                (type == "audio" ? audio : subs).Add(entry);
+                (type == "audio" ? audioTracks : subTracks).Add(entry);
             }
         }
-        items.Add(new MenuEntry("音轨", Sub: audio, Enabled: audio.Count > 0));
-        items.Add(new MenuEntry("字幕", Sub: subs, Enabled: playing));
-
-        // 音频 / 字幕延迟：按文件记住（见 file-states.json），所以放在这里而不是全局设置里
+        // 音频 / 字幕延迟按文件记住（见 file-states.json），所以放在这里而不是全局设置里
         int step = S.SubDelayStepMs;
         double ad = (m?.GetDouble("audio-delay") ?? 0) * 1000, sd = (m?.GetDouble("sub-delay") ?? 0) * 1000;
-        items.Add(new MenuEntry("音频延迟", Enabled: playing, Sub: new()
+
+        var audio = new List<MenuEntry> { new("载入外部音轨…", Hp("load-audio")), Sep };
+        if (audioTracks.Count > 0) { audio.AddRange(audioTracks); audio.Add(Sep); }
+        audio.Add(new MenuEntry("音频延迟", Sub: new()
         {
             new($"当前：{ad:+0;-0;0} ms", Enabled: false),
             new($"提前 {step} ms", Hp("audio-delay-dec")),
             new($"延后 {step} ms", Hp("audio-delay-inc")),
             new("重置", Hp("audio-delay-reset")),
         }));
-        items.Add(new MenuEntry("字幕延迟", Enabled: playing, Sub: new()
+        items.Add(new MenuEntry("音轨", Sub: audio, Enabled: playing));
+
+        var subs = new List<MenuEntry> { new("载入外部字幕…", Hp("load-sub")), Sep };
+        subs.AddRange(subTracks);
+        subs.Add(Sep);
+        subs.Add(new MenuEntry("字幕延迟", Sub: new()
         {
             new($"当前：{sd:+0;-0;0} ms", Enabled: false),
             new($"提前 {step} ms", Hp("sub-delay-dec"), "Z"),
@@ -2224,16 +2257,14 @@ public partial class MainWindow : FluentWindow
             Sep,
             _subSync.Running
                 ? new MenuEntry("取消自动同步", Hp("sub-sync"))
-                : new MenuEntry("自动同步字幕（ffsubsync）…", Hp("sub-sync"), Enabled: path != null && File.Exists(path)),
+                : new MenuEntry("自动同步字幕（ffsubsync）…", Hp("sub-sync"), Enabled: local),
         }));
+        items.Add(new MenuEntry("字幕", Sub: subs, Enabled: playing));
         items.Add(Sep);
 
-        // 当前视频本身是 SDR：HDR 输出没有意义，灰掉（还没解码出第一帧、纯音频、音乐封面时不灰）
-        string? gamma = playing ? m?.GetString("video-params/gamma") : null;
-        bool sdrVideo = gamma != null && gamma is not ("pq" or "hlg") && _dvProfile == null &&
-                        m?.GetFlag("current-tracks/video/image") != true;
-        items.Add(new MenuEntry("HDR 输出", Hp("hdr"), "H", Checked: _hdrOn, Enabled: !sdrVideo));
-        // 解码方式：只对当前这个视频生效并按文件记住，优先于全局设置
+        // ---- 画面 / 声音的处理方式（后三项按文件记住，优先于全局设置）----
+        // SDR 视频、纯音频时 HDR 输出没有意义，灰掉（快捷键 H、控制栏按钮也一样）
+        items.Add(new MenuEntry("HDR 输出", Hp("hdr"), "H", Checked: _hdrOn, Enabled: HdrBlockedReason() == null));
         string? fileHwdec = FileHwdec();
         var hwdec = new List<MenuEntry>
         {
@@ -2241,8 +2272,8 @@ public partial class MainWindow : FluentWindow
             Sep,
         };
         hwdec.AddRange(SettingsWindow.HwdecChoices.Select(c => new MenuEntry(c.Name, Hp("hwdec", c.Value), Checked: fileHwdec == c.Value)));
-        items.Add(new MenuEntry("解码方式（本视频）", Sub: hwdec, Enabled: playing));
-        // 视频同步：刷新率和帧率匹配时固定按显示器重采样，灰掉；匹配不上时可以给这个视频单独选，记住，优先于全局设置
+        items.Add(new MenuEntry("解码方式", Sub: hwdec, Enabled: playing));
+        // 视频同步：刷新率和帧率匹配时固定按显示器重采样，灰掉；匹配不上时可以给这个视频单独选
         if (_refreshMatched && playing)
         {
             items.Add(new MenuEntry("视频同步（刷新率已匹配）", Enabled: false));
@@ -2258,9 +2289,8 @@ public partial class MainWindow : FluentWindow
             };
             sync.AddRange(SettingsWindow.NoMatchSyncChoices
                 .Select(c => new MenuEntry(c.Name, Hp("vsync", c.Value), Checked: playing && fileSync == c.Value)));
-            items.Add(new MenuEntry("视频同步（本视频）", Sub: sync, Enabled: playing && _refreshChecked));
+            items.Add(new MenuEntry("视频同步", Sub: sync, Enabled: playing && _refreshChecked));
         }
-        // 防削波：跟随全局设置，或者给这个视频单独选（按文件记住）
         string? fileAntiClip = FileAntiClip();
         var antiClip = new List<MenuEntry>
         {
@@ -2269,13 +2299,15 @@ public partial class MainWindow : FluentWindow
         };
         antiClip.AddRange(SettingsWindow.AntiClipChoices
             .Select(c => new MenuEntry(c.Name, Hp("anticlip", c.Value), Checked: playing && fileAntiClip == c.Value)));
-        items.Add(new MenuEntry("防削波（本视频）", Sub: antiClip, Enabled: playing));
+        items.Add(new MenuEntry("防削波策略", Sub: antiClip, Enabled: playing));
         items.Add(Sep);
+
+        // ---- 窗口 ----
         items.Add(new MenuEntry("播放列表", Hp("playlist"), "P", Checked: PlaylistPanel.Visibility == Visibility.Visible, Enabled: !_fullscreen));
         items.Add(new MenuEntry("全屏", Hp("fullscreen"), "F / 双击", Checked: _fullscreen));
         items.Add(new MenuEntry("全局设置…", Hp("settings")));
         items.Add(Sep);
-        items.Add(new MenuEntry("退出", Hp("quit")));
+        items.Add(new MenuEntry("退出软件", Hp("quit")));
         return items;
     }
 
