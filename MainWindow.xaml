@@ -65,9 +65,12 @@
                         <StackPanel Grid.Column="1" Orientation="Horizontal">
                             <ui:Button x:Name="BtnPlAdd" Appearance="Transparent" BorderThickness="0" Padding="8,6" ToolTip="添加文件" Icon="{ui:SymbolIcon Add24}" />
                             <!-- 取消选中：一直可以点，没选中时点了没有效果。Fluent 图标里没有“方框里一条斜线”，自己画：
-                                 按 24×24 的图标格子画（和旁边的 Fluent 图标一样的线宽），缩到 16×16，颜色跟随按钮文字颜色 -->
+                                 按 24×24 的图标格子画（和旁边的 Fluent 图标一样的线宽），缩到 15×15、往下挪 0.5 像素（和旁边的图标对齐），颜色跟随按钮文字颜色 -->
                             <ui:Button x:Name="BtnPlDeselect" Appearance="Transparent" BorderThickness="0" Padding="8,6" ToolTip="取消选中">
-                                <Viewbox Width="16" Height="16">
+                                <Viewbox Width="15" Height="15">
+                                    <Viewbox.RenderTransform>
+                                        <TranslateTransform Y="0.5" />
+                                    </Viewbox.RenderTransform>
                                     <Canvas Width="24" Height="24">
                                         <Rectangle
                                             Canvas.Left="3.25"
