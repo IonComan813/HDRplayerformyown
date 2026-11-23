@@ -33,8 +33,12 @@ internal sealed class FileState
     public Dictionary<string, double>? AudioDelays { get; set; }
     /// <summary>每条字幕的字幕延迟（秒，mpv 的 sub-delay），键同上。</summary>
     public Dictionary<string, double>? SubDelays { get; set; }
+    /// <summary>只对这个文件生效的音频输出设备（mpv 的 audio-device 值），null = 跟随全局设置。</summary>
+    public string? AudioDevice { get; set; }
     /// <summary>只对这个文件生效的音频直通，null = 跟随全局设置。</summary>
     public bool? Passthrough { get; set; }
+    /// <summary>只对这个文件生效的“多声道下混到立体声”，null = 跟随全局设置。</summary>
+    public bool? Downmix { get; set; }
     /// <summary>只对这个文件生效的解码方式（mpv 的 hwdec 值），null = 跟随全局设置。</summary>
     public string? Hwdec { get; set; }
     /// <summary>只对这个文件生效的防削波策略（"limit" / "dynaudnorm"），null = 跟随全局设置。</summary>
@@ -49,7 +53,7 @@ internal sealed class FileState
     public DateTime LastPlayed { get; set; }
 
     public bool IsEmpty => Position <= 0 && AudioDelay == 0 && SubDelay == 0 && AudioDelays is not { Count: > 0 } &&
-                           SubDelays is not { Count: > 0 } && Passthrough == null && Hwdec == null && VideoSync == null && AntiClip == null && Audio == null && Sub == null;
+                           SubDelays is not { Count: > 0 } && AudioDevice == null && Passthrough == null && Downmix == null && Hwdec == null && VideoSync == null && AntiClip == null && Audio == null && Sub == null;
 }
 
 /// <summary>

@@ -93,6 +93,27 @@ public partial class SettingsWindow : FluentWindow
     public static readonly (string Value, string Name)[] NoMatchSyncChoices =
         { ("audio", "按音频同步"), ("interp", "帧插值") };
 
+    /// <summary>
+    /// 音频输出设备（画面右键菜单里也用）。mpv 的设备列表里除了 WASAPI 设备，还有 OpenAL 等其它输出后端各自的
+    /// “Default (openal)” 之类的默认设备。它们和 “自动” 指向的都是系统默认设备，只是换了一个后端，
+    /// 看起来像重复项，这里只保留 WASAPI 设备。
+    /// </summary>
+    internal static (string Value, string Name)[] AudioDeviceChoices(Mpv? mpv)
+    {
+        var devices = new List<(string, string)> { ("auto", "自动（跟随系统默认设备）") };
+        if (mpv?.GetNode("audio-device-list") is List<object?> list)
+        {
+            foreach (var d in list.OfType<Dictionary<string, object?>>())
+            {
+                string name = d.GetValueOrDefault("name") as string ?? "";
+                if (!name.StartsWith("wasapi/", StringComparison.OrdinalIgnoreCase)) continue;
+                string desc = d.GetValueOrDefault("description") as string ?? name;
+                devices.Add((name, desc));
+            }
+        }
+        return devices.ToArray();
+    }
+
     /// <summary>防削波策略：仅限幅排第一（默认）。</summary>
     public static readonly (string Value, string Name)[] AntiClipChoices =
         { ("limit", "仅限幅"), ("dynaudnorm", "拉平音量 + 限幅") };
@@ -196,8 +217,7 @@ public partial class SettingsWindow : FluentWindow
             "关掉则始终不改显示器刷新率，只看当前刷新率是否匹配",
             _s.MatchRefreshRate, v => _s.MatchRefreshRate = v);
         AddCombo(p, "视频同步",
-            "如果有近似匹配的刷新率，则直接按显示器刷新率重采样；此处选择无匹配时的优先策略，" +
-            "可在每个视频文件中单独调整（画面右键 → 视频同步）",
+            "如果有近似匹配的刷新率，则直接按显示器刷新率重采样；此处选择无匹配时的优先策略",
             NoMatchSyncChoices, _s.NoMatchSync, v => _s.NoMatchSync = v);
         AddToggle(p, "写 mpv 日志", @"%APPDATA%\HdrPlayer\mpv.log，重启后生效", _s.DebugLog, v => _s.DebugLog = v);
         AddNote(p, "能否硬解取决于显卡支持的格式；HDR10+ 动态元数据在硬解下同样可用。\n" +
@@ -208,24 +228,11 @@ public partial class SettingsWindow : FluentWindow
     private StackPanel BuildAudioPage()
     {
         var p = NewPage("音频");
-        // mpv 的设备列表里除了 WASAPI 设备，还有 OpenAL 等其它输出后端各自的 “Default (openal)” 之类的默认设备。
-        // 它们和 “自动” 指向的都是系统默认设备，只是换了一个后端，看起来像重复项，这里只保留 WASAPI 设备。
-        var devices = new List<(string, string)> { ("auto", "自动（跟随系统默认设备）") };
-        if (_mpv.GetNode("audio-device-list") is List<object?> list)
-        {
-            foreach (var d in list.OfType<Dictionary<string, object?>>())
-            {
-                string name = d.GetValueOrDefault("name") as string ?? "";
-                if (!name.StartsWith("wasapi/", StringComparison.OrdinalIgnoreCase)) continue;
-                string desc = d.GetValueOrDefault("description") as string ?? name;
-                devices.Add((name, desc));
-            }
-        }
-        AddCombo(p, "输出设备", null, devices.ToArray(), _s.AudioDevice, v => _s.AudioDevice = v);
+        AddCombo(p, "输出设备", null, AudioDeviceChoices(_mpv), _s.AudioDevice, v => _s.AudioDevice = v);
         AddToggle(p, "音频直通",
             "AC3 / E-AC3 / DTS / DTS-HD / TrueHD 不在本机解码，拆封装后原样以 HDMI 码流发送给功放或电视解码。" +
-            "开启后下面的下混和防削波不起作用，音量也由功放 / 电视控制；设备或音轨格式不支持时自动改为正常解码。" +
-            "每个视频可以在画面右键菜单里单独开关",
+            "直通时下混和防削波不起作用（仍可以设置，对不直通的视频生效），音量也由功放 / 电视控制；" +
+            "设备或音轨格式不支持时自动改为正常解码",
             _s.AudioPassthrough, v => _s.AudioPassthrough = v);
         AddToggle(p, "多声道下混到立体声", "5.1 / 7.1 → 2.0", _s.DownmixToStereo, v => _s.DownmixToStereo = v);
         AddCombo(p, "防削波策略",
