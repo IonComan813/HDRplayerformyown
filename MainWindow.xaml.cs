@@ -483,21 +483,32 @@ public partial class MainWindow : FluentWindow
     private bool EffectiveDownmix(string? path) =>
         (path == null ? null : _fileStates.Get(path)?.Downmix) ?? S.DownmixToStereo;
 
-    private string GlobalAudioDevice => string.IsNullOrEmpty(S.AudioDevice) ? "auto" : S.AudioDevice;
+    /// <summary>全局设置里选的输出设备（可能已经没连接，见 <see cref="GlobalAudioDevice"/>）。</summary>
+    private string GlobalAudioDeviceSetting => string.IsNullOrEmpty(S.AudioDevice) ? "auto" : S.AudioDevice;
 
     /// <summary>
-    /// 这个文件用的音频输出设备：单独选过的优先，否则用全局设置。单独选的设备现在不在设备列表里（拔掉了、驱动换了）
-    /// 就用全局设置，免得没声音；设备回来以后再打开这个视频，又会用回它。
+    /// 全局设置实际用的输出设备：选的设备现在不在设备列表里（拔掉了、功放关了、驱动换了）就用系统默认设备（auto），
+    /// 免得没声音。设置本身不改，设备回来以后打开下一个视频（或改一下设置）就又用回它。
+    /// </summary>
+    private string GlobalAudioDevice => AudioDeviceAvailable(GlobalAudioDeviceSetting) ? GlobalAudioDeviceSetting : "auto";
+
+    /// <summary>
+    /// 这个文件用的音频输出设备：单独选过的优先，否则用全局设置。单独选的设备现在不在设备列表里
+    /// 就用全局设置（全局的也不在就用系统默认设备）；设备回来以后再打开这个视频，又会用回它。
     /// </summary>
     private string EffectiveAudioDevice(string? path)
     {
         string? dev = path == null ? null : _fileStates.Get(path)?.AudioDevice;
-        if (dev == null || dev == "auto") return dev ?? GlobalAudioDevice;
-        return AudioDeviceAvailable(dev) ? dev : GlobalAudioDevice;
+        return dev != null && AudioDeviceAvailable(dev) ? dev : GlobalAudioDevice;
     }
 
+    /// <summary>
+    /// 设备在不在 mpv 的设备列表里。"auto" 总是在；拿不到列表时（mpv 还没初始化）当作在，
+    /// 之后每个文件打开时（on_load 钩子）会再按列表检查一次。
+    /// </summary>
     private bool AudioDeviceAvailable(string name) =>
-        _mpv?.GetNode("audio-device-list") is List<object?> list &&
+        name == "auto" ||
+        _mpv?.GetNode("audio-device-list") is not List<object?> list ||
         list.OfType<Dictionary<string, object?>>().Any(d => string.Equals(d.GetValueOrDefault("name") as string, name, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>设置音频输出设备；和现在的一样就不设（重设会重建音频输出，声音断一下）。</summary>
@@ -1385,7 +1396,7 @@ public partial class MainWindow : FluentWindow
         ApplyAudioDevice(m, m.SetProperty, EffectiveAudioDevice(path), initial: false);
         var choices = SettingsWindow.AudioDeviceChoices(m);
         m.ShowText(value == null
-            ? $"本视频的输出设备：跟随全局设置（{AudioDeviceName(GlobalAudioDevice, choices)}）"
+            ? $"本视频的输出设备：跟随全局设置（{(GlobalAudioDevice == GlobalAudioDeviceSetting ? AudioDeviceName(GlobalAudioDevice, choices) : "选的设备未连接，暂用系统默认设备")}）"
             : $"本视频的输出设备：{AudioDeviceName(value, choices)}");
     }
 
@@ -2606,7 +2617,10 @@ public partial class MainWindow : FluentWindow
         string? fileDev = FileAudioDevice();
         var devices = new List<MenuEntry>
         {
-            new($"跟随全局设置（{AudioDeviceName(GlobalAudioDevice, devChoices)}）", Hp("audiodev", "global"), Checked: playing && fileDev == null),
+            new(GlobalAudioDevice == GlobalAudioDeviceSetting
+                    ? $"跟随全局设置（{AudioDeviceName(GlobalAudioDevice, devChoices)}）"
+                    : "跟随全局设置（选的设备未连接，暂用系统默认设备）",
+                Hp("audiodev", "global"), Checked: playing && fileDev == null),
             Sep,
         };
         devices.AddRange(devChoices.Select(c => new MenuEntry(c.Name, Hp("audiodev", c.Value),
