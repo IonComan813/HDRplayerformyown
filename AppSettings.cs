@@ -46,7 +46,8 @@ internal sealed class AppSettings
     public string AudioDevice { get; set; } = "auto";
     /// <summary>
     /// 音频直通：AC3 / E-AC3 / DTS / DTS-HD / TrueHD 不解码，拆封装后原样以 HDMI（IEC 61937）码流送给功放 / 电视解码。
-    /// 开着时下混、防削波、音量调节都不起作用（声音不经过本机处理）。每个视频可以在右键菜单里单独开关。
+    /// 真正在直通的音轨，下混、防削波、音量调节都不起作用（声音不经过本机处理）；下混、防削波的设置仍可以改，
+    /// 对不直通的视频（单独关了直通、音轨格式不能直通、设备不接受码流）照常生效。每个视频可以在右键菜单里单独开关。
     /// </summary>
     public bool AudioPassthrough { get; set; } = false;
     public bool DownmixToStereo { get; set; } = true;

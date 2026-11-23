@@ -479,6 +479,70 @@ public partial class MainWindow : FluentWindow
     private bool EffectivePassthrough(string? path) =>
         (path == null ? null : _fileStates.Get(path)?.Passthrough) ?? S.AudioPassthrough;
 
+    /// <summary>这个文件下不下混到立体声：单独设置过的优先，否则用全局设置。</summary>
+    private bool EffectiveDownmix(string? path) =>
+        (path == null ? null : _fileStates.Get(path)?.Downmix) ?? S.DownmixToStereo;
+
+    /// <summary>
+    /// 全局设置的输出设备：选的设备现在不在设备列表里（拔掉了、功放关了、驱动换了）就用系统默认设备（auto），
+    /// 免得没声音；设置本身由 <see cref="DropMissingAudioDevices"/> 改回系统默认。
+    /// </summary>
+    private string GlobalAudioDevice
+    {
+        get
+        {
+            string dev = string.IsNullOrEmpty(S.AudioDevice) ? "auto" : S.AudioDevice;
+            return AudioDeviceAvailable(dev) ? dev : "auto";
+        }
+    }
+
+    /// <summary>
+    /// 这个文件用的音频输出设备：单独选过的优先，否则用全局设置。单独选的设备现在不在设备列表里就用全局设置
+    /// （单独的选择由 <see cref="DropMissingAudioDevices"/> 清掉，回到跟随全局设置）。
+    /// </summary>
+    private string EffectiveAudioDevice(string? path)
+    {
+        string? dev = path == null ? null : _fileStates.Get(path)?.AudioDevice;
+        return dev != null && AudioDeviceAvailable(dev) ? dev : GlobalAudioDevice;
+    }
+
+    /// <summary>
+    /// 设备在不在 mpv 的设备列表里。"auto" 总是在；拿不到列表时（mpv 还没初始化）当作在，
+    /// 之后每个文件打开时（on_load 钩子）会再按列表检查一次。
+    /// </summary>
+    private bool AudioDeviceAvailable(string name) =>
+        name == "auto" ||
+        _mpv?.GetNode("audio-device-list") is not List<object?> list ||
+        list.OfType<Dictionary<string, object?>>().Any(d => string.Equals(d.GetValueOrDefault("name") as string, name, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// 去掉已经没连接的设备选择（UI 线程）：全局设置选的设备不在了就改回系统默认设备并保存；
+    /// 当前视频单独选的设备不在了就清掉，回到跟随全局设置。拿不到设备列表时什么都不改。
+    /// 打开文件、弹出右键菜单、打开全局设置时检查，所以全局设置和右键菜单里都只会出现现有的设备。
+    /// </summary>
+    private void DropMissingAudioDevices()
+    {
+        if (_mpv?.GetNode("audio-device-list") is not List<object?>) return;
+        if (!string.IsNullOrEmpty(S.AudioDevice) && !AudioDeviceAvailable(S.AudioDevice))
+        {
+            S.AudioDevice = "auto";
+            S.Save();
+        }
+        string? path = _currentPath ?? (_idle ? null : _mpv?.GetString("path"));
+        if (path != null && _fileStates.Get(path) is { AudioDevice: { } dev } st && !AudioDeviceAvailable(dev))
+        {
+            st.AudioDevice = null;
+            _fileStates.Set(path, st);
+        }
+    }
+
+    /// <summary>设置音频输出设备；和现在的一样就不设（重设会重建音频输出，声音断一下）。</summary>
+    private static void ApplyAudioDevice(Mpv m, Func<string, string, int> set, string device, bool initial)
+    {
+        if (!initial && string.Equals(m.GetString("audio-device"), device, StringComparison.OrdinalIgnoreCase)) return;
+        set("audio-device", device);
+    }
+
     /// <summary>
     /// 设置音频输出：直通时 audio-spdif 列出要直通的格式，滤镜清空（码流不能做 PCM 处理），声道数自动
     /// （下混到立体声会挡住 TrueHD / DTS-HD 这类多声道码流）；不直通时按下混设置和防削波策略。path = null 时用全局设置。
@@ -491,8 +555,9 @@ public partial class MainWindow : FluentWindow
         bool pt = EffectivePassthrough(path) && !_ptFallback;
         if (pt && tracksKnown && !_idle && !CurrentAudioCanPassthrough()) pt = false;
         string spdif = pt ? PassthroughCodecs : "";
-        string channels = pt ? "auto" : S.DownmixToStereo ? "stereo" : "auto-safe";
-        string af = pt ? "" : AudioFilters(EffectiveAntiClip(path));
+        bool downmix = EffectiveDownmix(path);
+        string channels = pt ? "auto" : downmix ? "stereo" : "auto-safe";
+        string af = pt ? "" : AudioFilters(EffectiveAntiClip(path), downmix);
         string sig = spdif + "|" + channels + "|" + af;
         if (sig == _lastAudio) return;
         set("audio-spdif", spdif);
@@ -507,10 +572,10 @@ public partial class MainWindow : FluentWindow
     /// 拉平音量 + 限幅：先 dynaudnorm（150 ms 一帧、15 帧高斯平滑、峰值 0.9、最多放大 8 倍，
     /// 比默认参数反应快，延迟约 1 秒，不至于明显地忽大忽小），再 alimiter。
     /// </summary>
-    private string AudioFilters(string antiClip)
+    private static string AudioFilters(string antiClip, bool downmix)
     {
         var parts = new List<string>();
-        if (S.DownmixToStereo) parts.Add("format=channels=stereo");
+        if (downmix) parts.Add("format=channels=stereo");
         if (antiClip == "dynaudnorm") parts.Add("lavfi=[dynaudnorm=f=150:g=15:p=0.9:m=8]");
         parts.Add("lavfi=[alimiter=limit=0.977:level=0]");
         return string.Join(",", parts);
@@ -531,7 +596,8 @@ public partial class MainWindow : FluentWindow
         set("deband", S.Deband ? "yes" : "no");
         // 视频同步每个文件单独决定（MaybeMatchRefresh）：刷新率和帧率匹配时按显示器重采样，否则按音频同步
         if (initial) { set("video-sync", "audio"); set("interpolation", "no"); }
-        set("audio-device", string.IsNullOrEmpty(S.AudioDevice) ? "auto" : S.AudioDevice);
+        // 输出设备：每个文件打开时由 on_load 钩子按“本视频的选择 ?? 全局设置”设置；播放中改了全局设置，当前文件没有单独选择时立即生效
+        ApplyAudioDevice(m, set, initial || _idle ? GlobalAudioDevice : EffectiveAudioDevice(_currentPath), initial);
         // 5.1 / 7.1 → 立体声由 mpv（libswresample）按标准矩阵下混；不再用系数归一化（整轨都会变小声），
         // 防削波交给音频滤镜；音频直通时都不用（见 ApplyAudioChain）
         set("audio-normalize-downmix", "no");
@@ -878,6 +944,8 @@ public partial class MainWindow : FluentWindow
         var m = _mpv;
         if (m == null) return;
         bool reloaded = _reloading;
+        // 设置里 / 这个视频单独选的输出设备没连接：设置改回系统默认 / 跟随全局设置（on_load 钩子里已经按回退的设备打开）
+        DropMissingAudioDevices();
         if (_reloading)
         {
             // start 是全局选项，不清掉的话之后打开的每个文件都会从这个位置开始
@@ -1101,7 +1169,9 @@ public partial class MainWindow : FluentWindow
             SubDelays = S.RememberDelays ? CollectDelays(audio: false) : old?.SubDelays,
             AudioDelay = S.RememberDelays ? 0 : old?.AudioDelay ?? 0,
             SubDelay = S.RememberDelays ? 0 : old?.SubDelay ?? 0,
+            AudioDevice = old?.AudioDevice,
             Passthrough = old?.Passthrough,
+            Downmix = old?.Downmix,
             Hwdec = old?.Hwdec,
             VideoSync = old?.VideoSync,
             AntiClip = old?.AntiClip,
@@ -1306,6 +1376,55 @@ public partial class MainWindow : FluentWindow
         ApplyAudioChain(m.SetProperty, path, tracksKnown: true);
         m.ShowText($"音频直通：{(next ? "开" : "关")}" +
                    (st.Passthrough == null ? "（和全局设置一致）" : "（本视频单独设置）"));
+    }
+
+    /// <summary>
+    /// 右键菜单的“多声道下混到立体声”：直接开 / 关这个视频的下混，按文件记住。切换后和全局设置一样时就清掉单独的设置，
+    /// 回到跟随全局设置。真正在直通时菜单里是灰的（码流不经过本机处理）。
+    /// </summary>
+    private void ToggleFileDownmix()
+    {
+        var m = _mpv;
+        string? path = _currentPath ?? (_idle ? null : m?.GetString("path"));
+        if (m == null || path == null) return;
+        if (_bitstream)
+        {
+            m.ShowText("音频直通中：下混不起作用");
+            return;
+        }
+        bool next = !EffectiveDownmix(path);
+        var st = _fileStates.Get(path) ?? new FileState { LastPlayed = DateTime.UtcNow };
+        st.Downmix = next == S.DownmixToStereo ? null : next;
+        _fileStates.Set(path, st);
+        ApplyAudioChain(m.SetProperty, path, tracksKnown: true);
+        m.ShowText($"多声道下混到立体声：{(next ? "开" : "关")}" +
+                   (st.Downmix == null ? "（和全局设置一致）" : "（本视频单独设置）"));
+    }
+
+    private static string AudioDeviceName(string value, (string Value, string Name)[] choices) =>
+        choices.FirstOrDefault(c => string.Equals(c.Value, value, StringComparison.OrdinalIgnoreCase)).Name ?? value;
+
+    /// <summary>当前文件单独选的输出设备；null = 跟随全局设置。</summary>
+    private string? FileAudioDevice()
+    {
+        string? path = _currentPath ?? (_idle ? null : _mpv?.GetString("path"));
+        return path == null ? null : _fileStates.Get(path)?.AudioDevice;
+    }
+
+    /// <summary>右键菜单里给当前视频选输出设备（null = 跟随全局设置），记住，立即生效。</summary>
+    private void SetFileAudioDevice(string? value)
+    {
+        var m = _mpv;
+        string? path = _currentPath ?? (_idle ? null : m?.GetString("path"));
+        if (m == null || path == null) return;
+        var st = _fileStates.Get(path) ?? new FileState { LastPlayed = DateTime.UtcNow };
+        st.AudioDevice = value;
+        _fileStates.Set(path, st);
+        ApplyAudioDevice(m, m.SetProperty, EffectiveAudioDevice(path), initial: false);
+        var choices = SettingsWindow.AudioDeviceChoices(m);
+        m.ShowText(value == null
+            ? $"本视频的输出设备：跟随全局设置（{AudioDeviceName(GlobalAudioDevice, choices)}）"
+            : $"本视频的输出设备：{AudioDeviceName(value, choices)}");
     }
 
     /// <summary>右键菜单里给当前视频选同步方式（null = 跟随全局设置），记住；刷新率匹配不上时立即生效。</summary>
@@ -1569,6 +1688,10 @@ public partial class MainWindow : FluentWindow
                 if (arg != null) SetFileHwdec(arg == "global" ? null : arg);
                 break;
             case "passthrough": ToggleFilePassthrough(); break;
+            case "downmix": ToggleFileDownmix(); break;
+            case "audiodev":
+                if (arg != null) SetFileAudioDevice(arg == "global" ? null : arg);
+                break;
             case "anticlip":
                 if (arg != null) SetFileAntiClip(arg == "global" ? null : arg);
                 break;
@@ -1654,7 +1777,7 @@ public partial class MainWindow : FluentWindow
             _ptWarned = true;
             _ptFallback = true;
             ApplyAudioChain(m.SetProperty, _currentPath, tracksKnown: true);
-            m.ShowText($"音频直通：无法以 {CurrentAudioCodec()?.ToUpperInvariant()} 码流输出，已改为正常解码（右键 → 音频直通 可以再试一次）", 3500);
+            m.ShowText($"音频直通：无法以 {CurrentAudioCodec()?.ToUpperInvariant()} 码流输出，已改为正常解码（右键 → 音频设置 → 音频直通 可以再试一次）", 3500);
         };
         _ptCheck.Start();
     }
@@ -2076,8 +2199,9 @@ public partial class MainWindow : FluentWindow
     private void OnLoadHook(Mpv m)
     {
         string? path = m.GetString("path");
-        // 音频直通 / 防削波：这个文件单独选过就用它的，否则用全局的。在音频链建立之前设好，不会断声。
+        // 输出设备 / 音频直通 / 下混 / 防削波：这个文件单独选过就用它的，否则用全局的。在音频链建立之前设好，不会断声。
         // 这时还不知道会选哪条音轨，直通开着就先按直通设；载入后发现音轨格式不能直通再改（OnFileLoaded）
+        ApplyAudioDevice(m, m.SetProperty, EffectiveAudioDevice(path), initial: false);
         ApplyAudioChain(m.SetProperty, path, tracksKnown: false);
         string? perFile = path == null ? null : _fileStates.Get(path)?.Hwdec;
         m.SetProperty("file-local-options/hwdec", perFile ?? S.Hwdec);
@@ -2361,6 +2485,7 @@ public partial class MainWindow : FluentWindow
             {
                 Position = st.Position, AudioDelay = st.AudioDelay, SubDelay = st.SubDelay, Hwdec = st.Hwdec,
                 AudioDelays = st.AudioDelays, SubDelays = st.SubDelays, Passthrough = st.Passthrough,
+                AudioDevice = st.AudioDevice, Downmix = st.Downmix,
                 VideoSync = st.VideoSync, AntiClip = st.AntiClip, Audio = st.Audio, Sub = st.Sub, LastPlayed = DateTime.UtcNow,
             });
         }
@@ -2483,7 +2608,7 @@ public partial class MainWindow : FluentWindow
         items.Add(new MenuEntry("字幕", Sub: subs, Enabled: playing));
         items.Add(Sep);
 
-        // ---- 画面 / 声音的处理方式（后三项按文件记住，优先于全局设置）----
+        // ---- 画面 / 声音的处理方式（解码方式、视频同步、音频设置按文件记住，优先于全局设置）----
         // SDR 视频、纯音频时 HDR 输出没有意义，灰掉（快捷键 H、控制栏按钮也一样）
         bool hdrAllowed = HdrBlockedReason() == null;
         items.Add(new MenuEntry("HDR 输出", Hp("hdr"), "H", Checked: _hdrOn && hdrAllowed, Enabled: hdrAllowed));
@@ -2513,6 +2638,32 @@ public partial class MainWindow : FluentWindow
                 .Select(c => new MenuEntry(c.Name, Hp("vsync", c.Value), Checked: playing && fileSync == c.Value)));
             items.Add(new MenuEntry("视频同步", Sub: sync, Enabled: playing && _refreshChecked));
         }
+        // ---- 音频设置：顺序和全局设置 → 音频一样（输出设备、音频直通、下混、防削波），都默认跟随全局设置，按视频记住 ----
+        var audioSet = new List<MenuEntry>();
+        // 只列出现有的设备：没连接的设备选择先改回系统默认 / 跟随全局设置
+        DropMissingAudioDevices();
+        var devChoices = SettingsWindow.AudioDeviceChoices(m);
+        string? fileDev = FileAudioDevice();
+        var devices = new List<MenuEntry>
+        {
+            new($"跟随全局设置（{AudioDeviceName(GlobalAudioDevice, devChoices)}）", Hp("audiodev", "global"), Checked: playing && fileDev == null),
+            Sep,
+        };
+        devices.AddRange(devChoices.Select(c => new MenuEntry(c.Name, Hp("audiodev", c.Value),
+            Checked: playing && string.Equals(fileDev, c.Value, StringComparison.OrdinalIgnoreCase))));
+        audioSet.Add(new MenuEntry("输出设备", Sub: devices));
+        // 音频直通：直接点击开关（不展开），默认跟随全局设置，按视频记住
+        // 当前音轨的格式不能直通（AAC、FLAC、Opus 等）时灰掉，标出原因
+        string? audioCodec = playing ? CurrentAudioCodec() : null;
+        bool canPassthrough = audioCodec != null && PassthroughCodecSet.Contains(audioCodec);
+        // 设备没接受码流、退回了解码时不显示开启（实际没在直通），仍可点击重试
+        bool passthrough = canPassthrough && EffectivePassthrough(path) && !_ptFallback;
+        string ptTitle = !playing || canPassthrough ? "音频直通"
+            : audioCodec == null ? "音频直通（没有音轨）" : $"音频直通（{audioCodec.ToUpperInvariant()} 不支持）";
+        audioSet.Add(new MenuEntry(ptTitle, Hp("passthrough"), Checked: passthrough, Enabled: canPassthrough));
+        // 下混 / 防削波：直通开着时不起作用（码流不经过本机处理），灰掉；
+        // 退回解码、音轨格式不能直通时就是正常解码，照常可选
+        audioSet.Add(new MenuEntry("多声道下混到立体声", Hp("downmix"), Checked: playing && EffectiveDownmix(path), Enabled: !passthrough));
         string? fileAntiClip = FileAntiClip();
         var antiClip = new List<MenuEntry>
         {
@@ -2521,17 +2672,8 @@ public partial class MainWindow : FluentWindow
         };
         antiClip.AddRange(SettingsWindow.AntiClipChoices
             .Select(c => new MenuEntry(c.Name, Hp("anticlip", c.Value), Checked: playing && fileAntiClip == c.Value)));
-        // 音频直通：直接点击开关（不展开），默认跟随全局设置，按视频记住；开着时防削波不起作用，灰掉
-        // 当前音轨的格式不能直通（AAC、FLAC、Opus 等）时灰掉，标出原因
-        string? audioCodec = playing ? CurrentAudioCodec() : null;
-        bool canPassthrough = audioCodec != null && PassthroughCodecSet.Contains(audioCodec);
-        // 设备没接受码流、退回了解码时不显示开启（实际没在直通），仍可点击重试
-        bool passthrough = canPassthrough && EffectivePassthrough(path) && !_ptFallback;
-        string ptTitle = !playing || canPassthrough ? "音频直通"
-            : audioCodec == null ? "音频直通（没有音轨）" : $"音频直通（{audioCodec.ToUpperInvariant()} 不支持）";
-        items.Add(new MenuEntry(ptTitle, Hp("passthrough"), Checked: passthrough, Enabled: canPassthrough));
-        // 真正在直通时防削波不起作用，灰掉；退回解码、音轨格式不能直通时就是正常解码，照常可选
-        items.Add(new MenuEntry("防削波策略", Sub: antiClip, Enabled: playing && !passthrough));
+        audioSet.Add(new MenuEntry("防削波策略", Sub: antiClip, Enabled: !passthrough));
+        items.Add(new MenuEntry("音频设置", Sub: audioSet, Enabled: playing));
         items.Add(Sep);
 
         // ---- 窗口 ----
@@ -2855,6 +2997,8 @@ public partial class MainWindow : FluentWindow
         var m = _mpv;
         if (m == null) return;
         if (_fullscreen) ToggleFullscreen();
+        // 全局设置里只列出现有的设备：选的设备没连接就先改回系统默认
+        DropMissingAudioDevices();
         var copy = S.Clone();
         var dlg = new SettingsWindow(copy, m, CurrentGdiName(), _hdrOn) { Owner = this };
         bool ok = dlg.ShowDialog() == true;
@@ -2996,7 +3140,7 @@ public partial class MainWindow : FluentWindow
                 Line("声道", $"{P("audio-params/channel-count")} ch  {P("audio-params/hr-channels")}");
                 if (live)
                     Line("输出声道", $"{P("audio-out-params/channel-count")} ch  {P("audio-out-params/hr-channels")}" +
-                        (S.DownmixToStereo ? "  (下混到立体声)" : ""));
+                        (EffectiveDownmix(_currentPath) && !_bitstream ? "  (下混到立体声)" : ""));
                 Line("采样率", $"{P("audio-params/samplerate")} Hz  {P("audio-params/format")}");
                 if (live)
                 {
@@ -3008,8 +3152,9 @@ public partial class MainWindow : FluentWindow
                     Line("音频直通", !canPt ? $"不可用（{(codec == null ? "没有音轨" : codec.ToUpperInvariant() + " 不能直通")}）"
                         : !pt ? "关"
                         : _bitstream ? $"开（{outFmt}，由功放 / 电视解码）"
-                        : _ptFallback ? "无法以码流输出，已改为正常解码（右键 → 音频直通 可以再试一次）"
+                        : _ptFallback ? "无法以码流输出，已改为正常解码（右键 → 音频设置 → 音频直通 可以再试一次）"
                         : "正在打开…");
+                    Line("下混到立体声", pt && _bitstream ? "不起作用（音频直通）" : EffectiveDownmix(_currentPath) ? "开" : "关");
                     Line("防削波", pt && _bitstream ? "不起作用（音频直通）"
                         : EffectiveAntiClip(_currentPath) == "dynaudnorm" ? "拉平音量（dynaudnorm）+ 限幅" : "仅限幅（alimiter）");
                 }
