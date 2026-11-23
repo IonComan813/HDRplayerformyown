@@ -228,11 +228,10 @@ public partial class SettingsWindow : FluentWindow
     private StackPanel BuildAudioPage()
     {
         var p = NewPage("音频");
-        // 选的设备现在没连接：保留这个选择（设备回来就又用它），只标出来；这期间播放器用系统默认设备
+        // 只列出现有的设备；选的设备没连接时回退到系统默认（第一项），不把它留在列表里
         var devices = AudioDeviceChoices(_mpv);
-        if (!string.IsNullOrEmpty(_s.AudioDevice) && !devices.Any(d => string.Equals(d.Value, _s.AudioDevice, StringComparison.OrdinalIgnoreCase)))
-            devices = devices.Append((_s.AudioDevice, $"{_s.AudioDevice}（未连接，暂用系统默认设备）")).ToArray();
-        AddCombo(p, "输出设备", null, devices, _s.AudioDevice, v => _s.AudioDevice = v);
+        string curDev = devices.FirstOrDefault(d => string.Equals(d.Value, _s.AudioDevice, StringComparison.OrdinalIgnoreCase)).Value ?? "auto";
+        AddCombo(p, "输出设备", null, devices, curDev, v => _s.AudioDevice = v);
         AddToggle(p, "音频直通",
             "AC3 / E-AC3 / DTS / DTS-HD / TrueHD 不在本机解码，拆封装后原样以 HDMI 码流发送给功放或电视解码。" +
             "直通时下混和防削波不起作用（仍可以设置，对不直通的视频生效），音量也由功放 / 电视控制；" +
